@@ -39,7 +39,7 @@ fi
 echo "Database migration completed successfully."
 
 # If ADE is enabled, add the --ade flag to the command
-CMD="letta server --host $HOST --port $PORT"
+CMD="letta server --host $HOST --port $PORT --debug"
 if [ "${SECURE:-false}" = "true" ]; then
     CMD="$CMD --secure"
 fi
