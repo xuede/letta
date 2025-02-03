@@ -50,7 +50,7 @@ BASE_TOOLS = ["send_message", "conversation_search", "archival_memory_insert", "
 # Base memory tools CAN be edited, and are added by default by the server
 BASE_MEMORY_TOOLS = ["core_memory_append", "core_memory_replace"]
 # Multi agent tools
-MULTI_AGENT_TOOLS = ["send_message_to_specific_agent", "send_message_to_agents_matching_all_tags"]
+MULTI_AGENT_TOOLS = ["send_message_to_agent_and_wait_for_reply", "send_message_to_agents_matching_all_tags", "send_message_to_agent_async"]
 MULTI_AGENT_SEND_MESSAGE_MAX_RETRIES = 3
 MULTI_AGENT_SEND_MESSAGE_TIMEOUT = 20 * 60
 
@@ -150,6 +150,7 @@ CORE_MEMORY_BLOCK_CHAR_LIMIT: int = 5000
 
 # Function return limits
 FUNCTION_RETURN_CHAR_LIMIT = 6000  # ~300 words
+BASE_FUNCTION_RETURN_CHAR_LIMIT = 1000000  # very high (we rely on implementation)
 
 MAX_PAUSE_HEARTBEATS = 360  # in min
 

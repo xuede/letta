@@ -6,7 +6,11 @@ import requests
 
 from letta.constants import CLI_WARNING_PREFIX
 from letta.errors import LettaConfigurationError, RateLimitExceededError
-from letta.llm_api.anthropic import anthropic_bedrock_chat_completions_request, anthropic_chat_completions_request
+from letta.llm_api.anthropic import (
+    anthropic_bedrock_chat_completions_request,
+    anthropic_chat_completions_process_stream,
+    anthropic_chat_completions_request,
+)
 from letta.llm_api.aws_bedrock import has_valid_aws_credentials
 from letta.llm_api.azure_openai import azure_openai_chat_completions_request
 from letta.llm_api.google_ai import convert_tools_to_google_ai_format, google_ai_chat_completions_request
@@ -52,7 +56,9 @@ def retry_with_exponential_backoff(
         while True:
             try:
                 return func(*args, **kwargs)
-
+            except KeyboardInterrupt:
+                # Stop retrying if user hits Ctrl-C
+                raise KeyboardInterrupt("User intentionally stopped thread. Stopping...")
             except requests.exceptions.HTTPError as http_err:
 
                 if not hasattr(http_err, "response") or not http_err.response:
@@ -137,6 +143,11 @@ def create(
         if model_settings.openai_api_key is None and llm_config.model_endpoint == "https://api.openai.com/v1":
             # only is a problem if we are *not* using an openai proxy
             raise LettaConfigurationError(message="OpenAI key is missing from letta config file", missing_fields=["openai_api_key"])
+        elif model_settings.openai_api_key is None:
+            # the openai python client requires a dummy API key
+            api_key = "DUMMY_API_KEY"
+        else:
+            api_key = model_settings.openai_api_key
 
         if function_call is None and functions is not None and len(functions) > 0:
             # force function calling for reliability, see https://platform.openai.com/docs/api-reference/chat/create#chat-create-tool_choice
@@ -153,8 +164,8 @@ def create(
                 stream_interface, AgentRefreshStreamingInterface
             ), type(stream_interface)
             response = openai_chat_completions_process_stream(
-                url=llm_config.model_endpoint,  # https://api.openai.com/v1 -> https://api.openai.com/v1/chat/completions
-                api_key=model_settings.openai_api_key,
+                url=llm_config.model_endpoint,
+                api_key=api_key,
                 chat_completion_request=data,
                 stream_interface=stream_interface,
             )
@@ -164,8 +175,8 @@ def create(
                 stream_interface.stream_start()
             try:
                 response = openai_chat_completions_request(
-                    url=llm_config.model_endpoint,  # https://api.openai.com/v1 -> https://api.openai.com/v1/chat/completions
-                    api_key=model_settings.openai_api_key,
+                    url=llm_config.model_endpoint,
+                    api_key=api_key,
                     chat_completion_request=data,
                 )
             finally:
@@ -243,27 +254,38 @@ def create(
         )
 
     elif llm_config.model_endpoint_type == "anthropic":
-        if stream:
-            raise NotImplementedError(f"Streaming not yet implemented for {llm_config.model_endpoint_type}")
         if not use_tool_naming:
             raise NotImplementedError("Only tool calling supported on Anthropic API requests")
 
+        # Force tool calling
         tool_call = None
         if force_tool_call is not None:
             tool_call = {"type": "function", "function": {"name": force_tool_call}}
             assert functions is not None
 
+        chat_completion_request = ChatCompletionRequest(
+            model=llm_config.model,
+            messages=[cast_message_to_subtype(m.to_openai_dict()) for m in messages],
+            tools=([{"type": "function", "function": f} for f in functions] if functions else None),
+            tool_choice=tool_call,
+            max_tokens=1024,  # TODO make dynamic
+            temperature=llm_config.temperature,
+            stream=stream,
+        )
+
+        # Handle streaming
+        if stream:  # Client requested token streaming
+            assert isinstance(stream_interface, (AgentChunkStreamingInterface, AgentRefreshStreamingInterface)), type(stream_interface)
+
+            response = anthropic_chat_completions_process_stream(
+                chat_completion_request=chat_completion_request,
+                stream_interface=stream_interface,
+            )
+            return response
+
+        # Client did not request token streaming (expect a blocking backend response)
         return anthropic_chat_completions_request(
-            data=ChatCompletionRequest(
-                model=llm_config.model,
-                messages=[cast_message_to_subtype(m.to_openai_dict()) for m in messages],
-                tools=[{"type": "function", "function": f} for f in functions] if functions else None,
-                tool_choice=tool_call,
-                # user=str(user_id),
-                # NOTE: max_tokens is required for Anthropic API
-                max_tokens=1024,  # TODO make dynamic
-                temperature=llm_config.temperature,
-            ),
+            data=chat_completion_request,
         )
 
     # elif llm_config.model_endpoint_type == "cohere":
@@ -330,6 +352,7 @@ def create(
         try:
             # groq uses the openai chat completions API, so this component should be reusable
             response = openai_chat_completions_request(
+                url=llm_config.model_endpoint,
                 api_key=model_settings.groq_api_key,
                 chat_completion_request=data,
             )

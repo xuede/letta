@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, List, Optional
 from sqlalchemy import JSON, Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from letta.constants import MULTI_AGENT_TOOLS
 from letta.orm.block import Block
 from letta.orm.custom_columns import EmbeddingConfigColumn, LLMConfigColumn, ToolRulesColumn
 from letta.orm.message import Message
@@ -15,7 +16,7 @@ from letta.schemas.agent import AgentType
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import Memory
-from letta.schemas.tool_rule import ToolRule
+from letta.schemas.tool_rule import TerminalToolRule, ToolRule
 
 if TYPE_CHECKING:
     from letta.orm.agents_tags import AgentsTags
@@ -55,6 +56,9 @@ class Agent(SqlalchemyBase, OrganizationMixin):
     embedding_config: Mapped[Optional[EmbeddingConfig]] = mapped_column(
         EmbeddingConfigColumn, doc="the embedding configuration object for this agent."
     )
+    project_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, doc="The id of the project the agent belongs to.")
+    template_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, doc="The id of the template the agent belongs to.")
+    base_template_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, doc="The base template id of the agent.")
 
     # Tool rules
     tool_rules: Mapped[Optional[List[ToolRule]]] = mapped_column(ToolRulesColumn, doc="the tool rules for this agent.")
@@ -114,6 +118,16 @@ class Agent(SqlalchemyBase, OrganizationMixin):
 
     def to_pydantic(self) -> PydanticAgentState:
         """converts to the basic pydantic model counterpart"""
+        # add default rule for having send_message be a terminal tool
+        tool_rules = self.tool_rules
+        if not tool_rules:
+            tool_rules = [
+                TerminalToolRule(tool_name="send_message"),
+            ]
+
+            for tool_name in MULTI_AGENT_TOOLS:
+                tool_rules.append(TerminalToolRule(tool_name=tool_name))
+
         state = {
             "id": self.id,
             "organization_id": self.organization_id,
@@ -123,7 +137,7 @@ class Agent(SqlalchemyBase, OrganizationMixin):
             "tools": self.tools,
             "sources": [source.to_pydantic() for source in self.sources],
             "tags": [t.tag for t in self.tags],
-            "tool_rules": self.tool_rules,
+            "tool_rules": tool_rules,
             "system": self.system,
             "agent_type": self.agent_type,
             "llm_config": self.llm_config,
@@ -135,5 +149,9 @@ class Agent(SqlalchemyBase, OrganizationMixin):
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "tool_exec_environment_variables": self.tool_exec_environment_variables,
+            "project_id": self.project_id,
+            "template_id": self.template_id,
+            "base_template_id": self.base_template_id,
         }
+
         return self.__pydantic_model__(**state)

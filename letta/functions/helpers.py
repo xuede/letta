@@ -1,15 +1,25 @@
+import asyncio
 import json
-from typing import Any, Optional, Union
+import threading
+from random import uniform
+from typing import Any, List, Optional, Union
 
 import humps
 from composio.constants import DEFAULT_ENTITY_ID
 from pydantic import BaseModel
 
-from letta.constants import COMPOSIO_ENTITY_ENV_VAR_KEY, DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
-from letta.schemas.enums import MessageRole
+from letta.constants import (
+    COMPOSIO_ENTITY_ENV_VAR_KEY,
+    DEFAULT_MESSAGE_TOOL,
+    DEFAULT_MESSAGE_TOOL_KWARG,
+    MULTI_AGENT_SEND_MESSAGE_MAX_RETRIES,
+    MULTI_AGENT_SEND_MESSAGE_TIMEOUT,
+)
+from letta.orm.errors import NoResultFound
 from letta.schemas.letta_message import AssistantMessage, ReasoningMessage, ToolCallMessage
 from letta.schemas.letta_response import LettaResponse
 from letta.schemas.message import MessageCreate
+from letta.server.rest_api.utils import get_letta_server
 
 
 # TODO: This is kind of hacky, as this is used to search up the action later on composio's side
@@ -239,36 +249,90 @@ def generate_import_code(module_attr_map: Optional[dict]):
 
 
 def parse_letta_response_for_assistant_message(
+    target_agent_id: str,
     letta_response: LettaResponse,
     assistant_message_tool_name: str = DEFAULT_MESSAGE_TOOL,
     assistant_message_tool_kwarg: str = DEFAULT_MESSAGE_TOOL_KWARG,
 ) -> Optional[str]:
-    reasoning_message = ""
+    messages = []
+    # This is not ideal, but we would like to return something rather than nothing
+    fallback_reasoning = []
     for m in letta_response.messages:
         if isinstance(m, AssistantMessage):
-            return m.content
+            messages.append(m.content)
         elif isinstance(m, ToolCallMessage) and m.tool_call.name == assistant_message_tool_name:
             try:
-                return json.loads(m.tool_call.arguments)[assistant_message_tool_kwarg]
+                messages.append(json.loads(m.tool_call.arguments)[assistant_message_tool_kwarg])
             except Exception:  # TODO: Make this more specific
                 continue
         elif isinstance(m, ReasoningMessage):
-            # This is not ideal, but we would like to return something rather than nothing
-            reasoning_message += f"{m.reasoning}\n"
+            fallback_reasoning.append(m.reasoning)
 
-    return None
+    if messages:
+        messages_str = "\n".join(messages)
+        return f"Agent {target_agent_id} said: '{messages_str}'"
+    else:
+        messages_str = "\n".join(fallback_reasoning)
+        return f"Agent {target_agent_id}'s inner thoughts: '{messages_str}'"
 
 
-import asyncio
-from random import uniform
-from typing import Optional
+def execute_send_message_to_agent(
+    sender_agent: "Agent",
+    messages: List[MessageCreate],
+    other_agent_id: str,
+    log_prefix: str,
+) -> Optional[str]:
+    """
+    Helper function to send a message to a specific Letta agent.
+
+    Args:
+        sender_agent ("Agent"): The sender agent object.
+        message (str): The message to send.
+        other_agent_id (str): The identifier of the target Letta agent.
+        log_prefix (str): Logging prefix for retries.
+
+    Returns:
+        Optional[str]: The response from the Letta agent if required by the caller.
+    """
+    server = get_letta_server()
+
+    # Ensure the target agent is in the same org
+    try:
+        server.agent_manager.get_agent_by_id(agent_id=other_agent_id, actor=sender_agent.user)
+    except NoResultFound:
+        raise ValueError(
+            f"The passed-in agent_id {other_agent_id} either does not exist, "
+            f"or does not belong to the same org ({sender_agent.user.organization_id})."
+        )
+
+    # Async logic to send a message with retries and timeout
+    async def async_send():
+        return await async_send_message_with_retries(
+            server=server,
+            sender_agent=sender_agent,
+            target_agent_id=other_agent_id,
+            messages=messages,
+            max_retries=MULTI_AGENT_SEND_MESSAGE_MAX_RETRIES,
+            timeout=MULTI_AGENT_SEND_MESSAGE_TIMEOUT,
+            logging_prefix=log_prefix,
+        )
+
+    # Run in the current event loop or create one if needed
+    try:
+        return asyncio.run(async_send())
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            return loop.run_until_complete(async_send())
+        else:
+            raise
 
 
 async def async_send_message_with_retries(
     server,
     sender_agent: "Agent",
     target_agent_id: str,
-    message_text: str,
+    messages: List[MessageCreate],
     max_retries: int,
     timeout: int,
     logging_prefix: Optional[str] = None,
@@ -290,7 +354,6 @@ async def async_send_message_with_retries(
     logging_prefix = logging_prefix or "[async_send_message_with_retries]"
     for attempt in range(1, max_retries + 1):
         try:
-            messages = [MessageCreate(role=MessageRole.user, content=message_text, name=sender_agent.agent_state.name)]
             # Wrap in a timeout
             response = await asyncio.wait_for(
                 server.send_message_to_agent(
@@ -308,17 +371,19 @@ async def async_send_message_with_retries(
 
             # Extract assistant message
             assistant_message = parse_letta_response_for_assistant_message(
+                target_agent_id,
                 response,
                 assistant_message_tool_name=DEFAULT_MESSAGE_TOOL,
                 assistant_message_tool_kwarg=DEFAULT_MESSAGE_TOOL_KWARG,
             )
             if assistant_message:
-                msg = f"Agent {target_agent_id} said '{assistant_message}'"
-                sender_agent.logger.info(f"{logging_prefix} - {msg}")
-                return msg
+                sender_agent.logger.info(f"{logging_prefix} - {assistant_message}")
+                return assistant_message
             else:
                 msg = f"(No response from agent {target_agent_id})"
                 sender_agent.logger.info(f"{logging_prefix} - {msg}")
+                sender_agent.logger.info(f"{logging_prefix} - raw response: {response.model_dump_json(indent=4)}")
+                sender_agent.logger.info(f"{logging_prefix} - parsed assistant message: {assistant_message}")
                 return msg
         except asyncio.TimeoutError:
             error_msg = f"(Timeout on attempt {attempt}/{max_retries} for agent {target_agent_id})"
@@ -334,4 +399,88 @@ async def async_send_message_with_retries(
             await asyncio.sleep(backoff)
         else:
             sender_agent.logger.error(f"{logging_prefix} - Fatal error during agent to agent send_message: {error_msg}")
-            return error_msg
+            raise Exception(error_msg)
+
+
+def fire_and_forget_send_to_agent(
+    sender_agent: "Agent",
+    messages: List[MessageCreate],
+    other_agent_id: str,
+    log_prefix: str,
+    use_retries: bool = False,
+) -> None:
+    """
+    Fire-and-forget send of messages to a specific agent.
+    Returns immediately in the calling thread, never blocks.
+
+    Args:
+        sender_agent (Agent): The sender agent object.
+        server: The Letta server instance
+        messages (List[MessageCreate]): The messages to send.
+        other_agent_id (str): The ID of the target agent.
+        log_prefix (str): Prefix for logging.
+        use_retries (bool): If True, uses async_send_message_with_retries;
+                            if False, calls server.send_message_to_agent directly.
+    """
+    server = get_letta_server()
+
+    # 1) Validate the target agent (raises ValueError if not in same org)
+    try:
+        server.agent_manager.get_agent_by_id(agent_id=other_agent_id, actor=sender_agent.user)
+    except NoResultFound:
+        raise ValueError(
+            f"The passed-in agent_id {other_agent_id} either does not exist, "
+            f"or does not belong to the same org ({sender_agent.user.organization_id})."
+        )
+
+    # 2) Define the async coroutine to run
+    async def background_task():
+        try:
+            if use_retries:
+                result = await async_send_message_with_retries(
+                    server=server,
+                    sender_agent=sender_agent,
+                    target_agent_id=other_agent_id,
+                    messages=messages,
+                    max_retries=MULTI_AGENT_SEND_MESSAGE_MAX_RETRIES,
+                    timeout=MULTI_AGENT_SEND_MESSAGE_TIMEOUT,
+                    logging_prefix=log_prefix,
+                )
+                sender_agent.logger.info(f"{log_prefix} fire-and-forget success with retries: {result}")
+            else:
+                # Direct call to server.send_message_to_agent, no retry logic
+                await server.send_message_to_agent(
+                    agent_id=other_agent_id,
+                    actor=sender_agent.user,
+                    messages=messages,
+                    stream_steps=False,
+                    stream_tokens=False,
+                    use_assistant_message=True,
+                    assistant_message_tool_name=DEFAULT_MESSAGE_TOOL,
+                    assistant_message_tool_kwarg=DEFAULT_MESSAGE_TOOL_KWARG,
+                )
+                sender_agent.logger.info(f"{log_prefix} fire-and-forget success (no retries).")
+        except Exception as e:
+            sender_agent.logger.error(f"{log_prefix} fire-and-forget send failed: {e}")
+
+    # 3) Helper to run the coroutine in a brand-new event loop in a separate thread
+    def run_in_background_thread(coro):
+        def runner():
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+
+    # 4) Try to schedule the coroutine in an existing loop, else spawn a thread
+    try:
+        loop = asyncio.get_running_loop()
+        # If we get here, a loop is running; schedule the coroutine in background
+        loop.create_task(background_task())
+    except RuntimeError:
+        # Means no event loop is running in this thread
+        run_in_background_thread(background_task())

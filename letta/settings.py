@@ -92,6 +92,9 @@ class ModelSettings(BaseSettings):
     # vLLM
     vllm_api_base: Optional[str] = None
 
+    # lmstudio
+    lmstudio_base_url: Optional[str] = None
+
     # openllm
     openllm_auth_type: Optional[str] = None
     openllm_api_key: Optional[str] = None
@@ -118,7 +121,7 @@ if "--use-file-pg-uri" in sys.argv:
     try:
         with open(Path.home() / ".letta/pg_uri", "r") as f:
             default_pg_uri = f.read()
-            print("Read pg_uri from ~/.letta/pg_uri")
+            print(f"Read pg_uri from ~/.letta/pg_uri: {default_pg_uri}")
     except FileNotFoundError:
         pass
 

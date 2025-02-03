@@ -2,8 +2,9 @@ import importlib
 import warnings
 from typing import List, Optional
 
-from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS, MULTI_AGENT_TOOLS
+from letta.constants import BASE_FUNCTION_RETURN_CHAR_LIMIT, BASE_MEMORY_TOOLS, BASE_TOOLS, MULTI_AGENT_TOOLS
 from letta.functions.functions import derive_openai_json_schema, load_function_set
+from letta.log import get_logger
 from letta.orm.enums import ToolType
 
 # TODO: Remove this once we translate all of these to the ORM
@@ -13,6 +14,8 @@ from letta.schemas.tool import Tool as PydanticTool
 from letta.schemas.tool import ToolUpdate
 from letta.schemas.user import User as PydanticUser
 from letta.utils import enforce_types, printd
+
+logger = get_logger(__name__)
 
 
 class ToolManager:
@@ -102,7 +105,20 @@ class ToolManager:
                 limit=limit,
                 organization_id=actor.organization_id,
             )
-            return [tool.to_pydantic() for tool in tools]
+
+        # Remove any malformed tools
+        results = []
+        for tool in tools:
+            try:
+                pydantic_tool = tool.to_pydantic()
+                results.append(pydantic_tool)
+            except (ValueError, ModuleNotFoundError, AttributeError) as e:
+                logger.warning(f"Deleting malformed tool with id={tool.id} and name={tool.name}, error was:\n{e}")
+                logger.warning("Deleted tool: ")
+                logger.warning(tool.pretty_print_columns())
+                self.delete_tool_by_id(tool.id, actor=actor)
+
+        return results
 
     @enforce_types
     def update_tool_by_id(self, tool_id: str, tool_update: ToolUpdate, actor: PydanticUser) -> PydanticTool:
@@ -122,6 +138,7 @@ class ToolManager:
                 new_schema = derive_openai_json_schema(source_code=pydantic_tool.source_code)
 
                 tool.json_schema = new_schema
+                tool.name = new_schema["name"]
 
             # Save the updated tool to the database
             return tool.update(db_session=session, actor=actor).to_pydantic()
@@ -183,6 +200,7 @@ class ToolManager:
                             tags=tags,
                             source_type="python",
                             tool_type=tool_type,
+                            return_char_limit=BASE_FUNCTION_RETURN_CHAR_LIMIT,
                         ),
                         actor=actor,
                     )

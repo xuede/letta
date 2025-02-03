@@ -108,9 +108,6 @@ class Agent(BaseAgent):
                 if not isinstance(rule, TerminalToolRule):
                     warnings.warn("Tool rules only work reliably for the latest OpenAI models that support structured outputs.")
                     break
-        # add default rule for having send_message be a terminal tool
-        if agent_state.tool_rules is None:
-            agent_state.tool_rules = []
 
         self.tool_rules_solver = ToolRulesSolver(tool_rules=agent_state.tool_rules)
 
@@ -238,6 +235,7 @@ class Agent(BaseAgent):
                 # TODO: This is only temporary, can remove after we publish a pip package with this object
                 agent_state_copy = self.agent_state.__deepcopy__()
                 agent_state_copy.tools = []
+                agent_state_copy.tool_rules = []
 
                 sandbox_run_result = ToolExecutionSandbox(function_name, function_args, self.user).run(agent_state=agent_state_copy)
                 function_response, updated_agent_state = sandbox_run_result.func_return, sandbox_run_result.agent_state
@@ -466,7 +464,10 @@ class Agent(BaseAgent):
             if isinstance(heartbeat_request, str) and heartbeat_request.lower().strip() == "true":
                 heartbeat_request = True
 
-            if not isinstance(heartbeat_request, bool) or heartbeat_request is None:
+            if heartbeat_request is None:
+                heartbeat_request = False
+
+            if not isinstance(heartbeat_request, bool):
                 self.logger.warning(
                     f"{CLI_WARNING_PREFIX}'request_heartbeat' arg parsed was not a bool or None, type={type(heartbeat_request)}, value={heartbeat_request}"
                 )
@@ -728,6 +729,7 @@ class Agent(BaseAgent):
             # (if yes) Step 4: call the function
             # (if yes) Step 5: send the info on the function call and function response to LLM
             response_message = response.choices[0].message
+
             response_message.model_copy()  # TODO why are we copying here?
             all_response_messages, heartbeat_request, function_failed = self._handle_ai_response(
                 response_message,

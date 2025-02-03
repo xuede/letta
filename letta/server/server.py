@@ -49,6 +49,7 @@ from letta.schemas.providers import (
     GoogleAIProvider,
     GroqProvider,
     LettaProvider,
+    LMStudioOpenAIProvider,
     OllamaProvider,
     OpenAIProvider,
     Provider,
@@ -61,6 +62,7 @@ from letta.schemas.source import Source
 from letta.schemas.tool import Tool
 from letta.schemas.usage import LettaUsageStatistics
 from letta.schemas.user import User
+from letta.server.rest_api.chat_completions_interface import ChatCompletionsStreamingInterface
 from letta.server.rest_api.interface import StreamingServerInterface
 from letta.server.rest_api.utils import sse_async_generator
 from letta.services.agent_manager import AgentManager
@@ -186,8 +188,8 @@ def db_error_handler():
         exit(1)
 
 
-print("Creating engine", settings.letta_pg_uri)
 if settings.letta_pg_uri_no_default:
+    print("Creating postgres engine", settings.letta_pg_uri)
     config.recall_storage_type = "postgres"
     config.recall_storage_uri = settings.letta_pg_uri_no_default
     config.archival_storage_type = "postgres"
@@ -204,7 +206,10 @@ if settings.letta_pg_uri_no_default:
     )
 else:
     # TODO: don't rely on config storage
-    engine = create_engine("sqlite:///" + os.path.join(config.recall_storage_path, "sqlite.db"))
+    engine_path = "sqlite:///" + os.path.join(config.recall_storage_path, "sqlite.db")
+    logger.info("Creating sqlite engine " + engine_path)
+
+    engine = create_engine(engine_path)
 
     # Store the original connect method
     original_connect = engine.connect
@@ -391,6 +396,15 @@ class SyncServer(Server):
                     aws_region=model_settings.aws_region,
                 )
             )
+        # Attempt to enable LM Studio by default
+        if model_settings.lmstudio_base_url:
+            # Auto-append v1 to the base URL
+            lmstudio_url = (
+                model_settings.lmstudio_base_url
+                if model_settings.lmstudio_base_url.endswith("/v1")
+                else model_settings.lmstudio_base_url + "/v1"
+            )
+            self._enabled_providers.append(LMStudioOpenAIProvider(base_url=lmstudio_url))
 
     def load_agent(self, agent_id: str, actor: User, interface: Union[AgentInterface, None] = None) -> Agent:
         """Updated method to load agents from persisted storage"""
@@ -703,7 +717,7 @@ class SyncServer(Server):
         # whether or not to wrap user and system message as MemGPT-style stringified JSON
         wrap_user_message: bool = True,
         wrap_system_message: bool = True,
-        interface: Union[AgentInterface, None] = None,  # needed to getting responses
+        interface: Union[AgentInterface, ChatCompletionsStreamingInterface, None] = None,  # needed to getting responses
         metadata: Optional[dict] = None,  # Pass through metadata to interface
     ) -> LettaUsageStatistics:
         """Send a list of messages to the agent
@@ -719,7 +733,7 @@ class SyncServer(Server):
             for message in messages:
                 assert isinstance(message, MessageCreate)
 
-                # If wrapping is eanbled, wrap with metadata before placing content inside the Message object
+                # If wrapping is enabled, wrap with metadata before placing content inside the Message object
                 if message.role == MessageRole.user and wrap_user_message:
                     message.content = system.package_user_message(user_message=message.content)
                 elif message.role == MessageRole.system and wrap_system_message:
@@ -854,6 +868,7 @@ class SyncServer(Server):
         limit: Optional[int] = 100,
         reverse: Optional[bool] = False,
         return_message_object: bool = True,
+        use_assistant_message: bool = True,
         assistant_message_tool_name: str = constants.DEFAULT_MESSAGE_TOOL,
         assistant_message_tool_kwarg: str = constants.DEFAULT_MESSAGE_TOOL_KWARG,
     ) -> Union[List[Message], List[LettaMessage]]:
@@ -873,14 +888,12 @@ class SyncServer(Server):
         )
 
         if not return_message_object:
-            records = [
-                msg
-                for m in records
-                for msg in m.to_letta_message(
-                    assistant_message_tool_name=assistant_message_tool_name,
-                    assistant_message_tool_kwarg=assistant_message_tool_kwarg,
-                )
-            ]
+            records = Message.to_letta_messages_from_list(
+                messages=records,
+                use_assistant_message=use_assistant_message,
+                assistant_message_tool_name=assistant_message_tool_name,
+                assistant_message_tool_kwarg=assistant_message_tool_kwarg,
+            )
 
         if reverse:
             records = records[::-1]
@@ -1266,12 +1279,14 @@ class SyncServer(Server):
             # This will be attached to the POST SSE request used under-the-hood
             letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
 
-            # Disable token streaming if not OpenAI
+            # Disable token streaming if not OpenAI or Anthropic
             # TODO: cleanup this logic
             llm_config = letta_agent.agent_state.llm_config
-            if stream_tokens and (llm_config.model_endpoint_type != "openai" or "inference.memgpt.ai" in llm_config.model_endpoint):
+            if stream_tokens and (
+                llm_config.model_endpoint_type not in ["openai", "anthropic"] or "inference.memgpt.ai" in llm_config.model_endpoint
+            ):
                 warnings.warn(
-                    "Token streaming is only supported for models with type 'openai' or `inference.memgpt.ai` in the model_endpoint: agent has endpoint type {llm_config.model_endpoint_type} and {llm_config.model_endpoint}. Setting stream_tokens to False."
+                    f"Token streaming is only supported for models with type 'openai' or 'anthropic' in the model_endpoint: agent has endpoint type {llm_config.model_endpoint_type} and {llm_config.model_endpoint}. Setting stream_tokens to False."
                 )
                 stream_tokens = False
 
