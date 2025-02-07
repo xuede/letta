@@ -198,7 +198,7 @@ def print_tool(server: SyncServer, default_user, default_organization):
 @pytest.fixture
 def composio_github_star_tool(server, default_user):
     tool_create = ToolCreate.from_composio(action_name="GITHUB_STAR_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER")
-    tool = server.tool_manager.create_or_update_composio_tool(pydantic_tool=PydanticTool(**tool_create.model_dump()), actor=default_user)
+    tool = server.tool_manager.create_or_update_composio_tool(tool_create=tool_create, actor=default_user)
     yield tool
 
 
@@ -3128,6 +3128,7 @@ def test_job_usage_stats_add_and_get(server: SyncServer, default_job, default_us
     step_manager.log_step(
         provider_name="openai",
         model="gpt-4",
+        model_endpoint="https://api.openai.com/v1",
         context_window_limit=8192,
         job_id=default_job.id,
         usage=UsageStatistics(
@@ -3169,6 +3170,7 @@ def test_job_usage_stats_add_multiple(server: SyncServer, default_job, default_u
     step_manager.log_step(
         provider_name="openai",
         model="gpt-4",
+        model_endpoint="https://api.openai.com/v1",
         context_window_limit=8192,
         job_id=default_job.id,
         usage=UsageStatistics(
@@ -3183,6 +3185,7 @@ def test_job_usage_stats_add_multiple(server: SyncServer, default_job, default_u
     step_manager.log_step(
         provider_name="openai",
         model="gpt-4",
+        model_endpoint="https://api.openai.com/v1",
         context_window_limit=8192,
         job_id=default_job.id,
         usage=UsageStatistics(
@@ -3219,6 +3222,7 @@ def test_job_usage_stats_add_nonexistent_job(server: SyncServer, default_user):
         step_manager.log_step(
             provider_name="openai",
             model="gpt-4",
+            model_endpoint="https://api.openai.com/v1",
             context_window_limit=8192,
             job_id="nonexistent_job",
             usage=UsageStatistics(
