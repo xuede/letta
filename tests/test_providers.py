@@ -4,7 +4,9 @@ from letta.schemas.providers import (
     AnthropicBedrockProvider,
     AnthropicProvider,
     AzureProvider,
+    DeepSeekProvider,
     GoogleAIProvider,
+    GoogleVertexProvider,
     GroqProvider,
     MistralProvider,
     OllamaProvider,
@@ -18,6 +20,14 @@ def test_openai():
     api_key = os.getenv("OPENAI_API_KEY")
     assert api_key is not None
     provider = OpenAIProvider(api_key=api_key, base_url=model_settings.openai_api_base)
+    models = provider.list_llm_models()
+    print(models)
+
+
+def test_deepseek():
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    assert api_key is not None
+    provider = DeepSeekProvider(api_key=api_key)
     models = provider.list_llm_models()
     print(models)
 
@@ -64,6 +74,16 @@ def test_googleai():
     print(models)
 
     provider.list_embedding_models()
+
+
+def test_google_vertex():
+    provider = GoogleVertexProvider(google_cloud_project=os.getenv("GCP_PROJECT_ID"), google_cloud_location=os.getenv("GCP_REGION"))
+    models = provider.list_llm_models()
+    print(models)
+    print([m.model for m in models])
+
+    embedding_models = provider.list_embedding_models()
+    print([m.embedding_model for m in embedding_models])
 
 
 def test_mistral():

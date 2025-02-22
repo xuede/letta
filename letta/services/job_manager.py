@@ -5,6 +5,7 @@ from typing import List, Literal, Optional, Union
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from letta.helpers.datetime_helpers import get_utc_time
 from letta.orm.enums import JobType
 from letta.orm.errors import NoResultFound
 from letta.orm.job import Job as JobModel
@@ -20,7 +21,7 @@ from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.run import Run as PydanticRun
 from letta.schemas.usage import LettaUsageStatistics
 from letta.schemas.user import User as PydanticUser
-from letta.utils import enforce_types, get_utc_time
+from letta.utils import enforce_types
 
 
 class JobManager:
@@ -28,7 +29,7 @@ class JobManager:
 
     def __init__(self):
         # Fetching the db_context similarly as in OrganizationManager
-        from letta.server.server import db_context
+        from letta.server.db import db_context
 
         self.session_maker = db_context
 

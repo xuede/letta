@@ -3,12 +3,13 @@ import time
 import traceback
 import warnings
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 from openai.types.beta.function_tool import FunctionTool as OpenAITool
 
 from letta.constants import (
     CLI_WARNING_PREFIX,
+    COMPOSIO_ENTITY_ENV_VAR_KEY,
     ERROR_MESSAGE_PREFIX,
     FIRST_MESSAGE_ATTEMPTS,
     FUNC_FAILED_HEARTBEAT_MESSAGE,
@@ -20,7 +21,11 @@ from letta.constants import (
 from letta.errors import ContextWindowExceededError
 from letta.functions.ast_parsers import coerce_dict_args_by_annotations, get_function_annotations_from_source
 from letta.functions.functions import get_function_from_module
+from letta.functions.helpers import execute_composio_action, generate_composio_action_from_func_name
 from letta.helpers import ToolRulesSolver
+from letta.helpers.composio_helpers import get_composio_api_key
+from letta.helpers.datetime_helpers import get_utc_time
+from letta.helpers.json_helpers import json_dumps, json_loads
 from letta.interface import AgentInterface
 from letta.llm_api.helpers import calculate_summarizer_cutoff, get_token_counts_for_messages, is_context_overflow_error
 from letta.llm_api.llm_api_tools import create
@@ -51,16 +56,16 @@ from letta.services.passage_manager import PassageManager
 from letta.services.provider_manager import ProviderManager
 from letta.services.step_manager import StepManager
 from letta.services.tool_execution_sandbox import ToolExecutionSandbox
+from letta.services.tool_manager import ToolManager
 from letta.settings import summarizer_settings
 from letta.streaming_interface import StreamingRefreshCLIInterface
 from letta.system import get_heartbeat, get_token_limit_warning, package_function_response, package_summarize_message, package_user_message
+from letta.tracing import trace_method
 from letta.utils import (
     count_tokens,
     get_friendly_error_msg,
     get_tool_call_id,
-    get_utc_time,
-    json_dumps,
-    json_loads,
+    log_telemetry,
     parse_json,
     printd,
     validate_function_response,
@@ -201,7 +206,7 @@ class Agent(BaseAgent):
 
     def execute_tool_and_persist_state(
         self, function_name: str, function_args: dict, target_letta_tool: Tool
-    ) -> tuple[str, Optional[SandboxRunResult]]:
+    ) -> tuple[Any, Optional[SandboxRunResult]]:
         """
         Execute tool modifications and persist the state of the agent.
         Note: only some agent state modifications will be persisted, such as data in the AgentState ORM and block data
@@ -227,6 +232,18 @@ class Agent(BaseAgent):
                 function_args["agent_state"] = agent_state_copy  # need to attach self to arg since it's dynamically linked
                 function_response = callable_func(**function_args)
                 self.update_memory_if_changed(agent_state_copy.memory)
+            elif target_letta_tool.tool_type == ToolType.EXTERNAL_COMPOSIO:
+                action_name = generate_composio_action_from_func_name(target_letta_tool.name)
+                # Get entity ID from the agent_state
+                entity_id = None
+                for env_var in self.agent_state.tool_exec_environment_variables:
+                    if env_var.key == COMPOSIO_ENTITY_ENV_VAR_KEY:
+                        entity_id = env_var.value
+                # Get composio_api_key
+                composio_api_key = get_composio_api_key(actor=self.user, logger=self.logger)
+                function_response = execute_composio_action(
+                    action_name=action_name, args=function_args, api_key=composio_api_key, entity_id=entity_id
+                )
             else:
                 # Parse the source code to extract function annotations
                 annotations = get_function_annotations_from_source(target_letta_tool.source_code, function_name)
@@ -260,6 +277,7 @@ class Agent(BaseAgent):
         error_msg: str,
         tool_call_id: str,
         function_name: str,
+        function_args: dict,
         function_response: str,
         messages: List[Message],
         include_function_failed_message: bool = False,
@@ -292,6 +310,7 @@ class Agent(BaseAgent):
         # Return updated messages
         return messages
 
+    @trace_method("Get AI Reply")
     def _get_ai_reply(
         self,
         message_sequence: List[Message],
@@ -303,9 +322,10 @@ class Agent(BaseAgent):
         max_delay: float = 10.0,  # max delay between retries
         step_count: Optional[int] = None,
         last_function_failed: bool = False,
+        put_inner_thoughts_first: bool = True,
     ) -> ChatCompletionResponse:
         """Get response from LLM API with robust retry mechanism."""
-
+        log_telemetry(self.logger, "_get_ai_reply start")
         allowed_tool_names = self.tool_rules_solver.get_allowed_tool_names(last_function_response=self.last_function_response)
         agent_state_tool_jsons = [t.json_schema for t in self.agent_state.tools]
 
@@ -336,6 +356,7 @@ class Agent(BaseAgent):
 
         for attempt in range(1, empty_response_retry_limit + 1):
             try:
+                log_telemetry(self.logger, "_get_ai_reply create start")
                 response = create(
                     llm_config=self.agent_state.llm_config,
                     messages=message_sequence,
@@ -347,7 +368,9 @@ class Agent(BaseAgent):
                     force_tool_call=force_tool_call,
                     stream=stream,
                     stream_interface=self.interface,
+                    put_inner_thoughts_first=put_inner_thoughts_first,
                 )
+                log_telemetry(self.logger, "_get_ai_reply create finish")
 
                 # These bottom two are retryable
                 if len(response.choices) == 0 or response.choices[0] is None:
@@ -359,12 +382,13 @@ class Agent(BaseAgent):
                         raise RuntimeError("Finish reason was length (maximum context length)")
                     else:
                         raise ValueError(f"Bad finish reason from API: {response.choices[0].finish_reason}")
-
+                log_telemetry(self.logger, "_handle_ai_response finish")
                 return response
 
             except ValueError as ve:
                 if attempt >= empty_response_retry_limit:
                     warnings.warn(f"Retry limit reached. Final error: {ve}")
+                    log_telemetry(self.logger, "_handle_ai_response finish ValueError")
                     raise Exception(f"Retries exhausted and no valid response received. Final error: {ve}")
                 else:
                     delay = min(backoff_factor * (2 ** (attempt - 1)), max_delay)
@@ -373,10 +397,13 @@ class Agent(BaseAgent):
 
             except Exception as e:
                 # For non-retryable errors, exit immediately
+                log_telemetry(self.logger, "_handle_ai_response finish generic Exception")
                 raise e
 
+        log_telemetry(self.logger, "_handle_ai_response finish catch-all exception")
         raise Exception("Retries exhausted and no valid response received.")
 
+    @trace_method("Handle AI Response")
     def _handle_ai_response(
         self,
         response_message: ChatCompletionMessage,  # TODO should we eventually move the Message creation outside of this function?
@@ -387,13 +414,14 @@ class Agent(BaseAgent):
         response_message_id: Optional[str] = None,
     ) -> Tuple[List[Message], bool, bool]:
         """Handles parsing and function execution"""
-
+        log_telemetry(self.logger, "_handle_ai_response start")
         # Hacky failsafe for now to make sure we didn't implement the streaming Message ID creation incorrectly
         if response_message_id is not None:
             assert response_message_id.startswith("message-"), response_message_id
 
         messages = []  # append these to the history when done
         function_name = None
+        function_args = {}
 
         # Step 2: check if LLM wanted to call a function
         if response_message.function_call or (response_message.tool_calls is not None and len(response_message.tool_calls) > 0):
@@ -445,8 +473,6 @@ class Agent(BaseAgent):
             function_call = (
                 response_message.function_call if response_message.function_call is not None else response_message.tool_calls[0].function
             )
-
-            # Get the name of the function
             function_name = function_call.name
             self.logger.info(f"Request to call function {function_name} with tool_call_id: {tool_call_id}")
 
@@ -454,22 +480,32 @@ class Agent(BaseAgent):
             target_letta_tool = None
             for t in self.agent_state.tools:
                 if t.name == function_name:
-                    target_letta_tool = t
+                    # This force refreshes the target_letta_tool from the database
+                    # We only do this on name match to confirm that the agent state contains a specific tool with the right name
+                    target_letta_tool = ToolManager().get_tool_by_name(tool_name=function_name, actor=self.user)
+                    break
 
             if not target_letta_tool:
                 error_msg = f"No function named {function_name}"
                 function_response = "None"  # more like "never ran?"
-                messages = self._handle_function_error_response(error_msg, tool_call_id, function_name, function_response, messages)
+                messages = self._handle_function_error_response(
+                    error_msg, tool_call_id, function_name, function_args, function_response, messages
+                )
                 return messages, False, True  # force a heartbeat to allow agent to handle error
 
             # Failure case 2: function name is OK, but function args are bad JSON
             try:
                 raw_function_args = function_call.arguments
                 function_args = parse_json(raw_function_args)
-            except Exception:
+                if not isinstance(function_args, dict):
+                    raise ValueError(f"Function arguments are not a dictionary: {function_args} (raw={raw_function_args})")
+            except Exception as e:
+                print(e)
                 error_msg = f"Error parsing JSON for function '{function_name}' arguments: {function_call.arguments}"
                 function_response = "None"  # more like "never ran?"
-                messages = self._handle_function_error_response(error_msg, tool_call_id, function_name, function_response, messages)
+                messages = self._handle_function_error_response(
+                    error_msg, tool_call_id, function_name, function_args, function_response, messages
+                )
                 return messages, False, True  # force a heartbeat to allow agent to handle error
 
             # Check if inner thoughts is in the function call arguments (possible apparently if you are using Azure)
@@ -502,11 +538,17 @@ class Agent(BaseAgent):
             self.interface.function_message(f"Running {function_name}({function_args})", msg_obj=messages[-1])
             try:
                 # handle tool execution (sandbox) and state updates
+                log_telemetry(
+                    self.logger, "_handle_ai_response execute tool start", function_name=function_name, function_args=function_args
+                )
                 function_response, sandbox_run_result = self.execute_tool_and_persist_state(function_name, function_args, target_letta_tool)
+                log_telemetry(
+                    self.logger, "_handle_ai_response execute tool finish", function_name=function_name, function_args=function_args
+                )
 
                 if sandbox_run_result and sandbox_run_result.status == "error":
                     messages = self._handle_function_error_response(
-                        function_response, tool_call_id, function_name, function_response, messages
+                        function_response, tool_call_id, function_name, function_args, function_response, messages
                     )
                     return messages, False, True  # force a heartbeat to allow agent to handle error
 
@@ -535,7 +577,7 @@ class Agent(BaseAgent):
                 error_msg_user = f"{error_msg}\n{traceback.format_exc()}"
                 self.logger.error(error_msg_user)
                 messages = self._handle_function_error_response(
-                    error_msg, tool_call_id, function_name, function_response, messages, include_function_failed_message=True
+                    error_msg, tool_call_id, function_name, function_args, function_response, messages, include_function_failed_message=True
                 )
                 return messages, False, True  # force a heartbeat to allow agent to handle error
 
@@ -543,7 +585,7 @@ class Agent(BaseAgent):
             if function_response_string.startswith(ERROR_MESSAGE_PREFIX):
                 error_msg = function_response_string
                 messages = self._handle_function_error_response(
-                    error_msg, tool_call_id, function_name, function_response, messages, include_function_failed_message=True
+                    error_msg, tool_call_id, function_name, function_args, function_response, messages, include_function_failed_message=True
                 )
                 return messages, False, True  # force a heartbeat to allow agent to handle error
 
@@ -593,14 +635,22 @@ class Agent(BaseAgent):
         elif self.tool_rules_solver.is_terminal_tool(function_name):
             heartbeat_request = False
 
+        # if continue tool rule, then  must request a heartbeat
+        # TODO: dont even include heartbeats in the args
+        if self.tool_rules_solver.is_continue_tool(function_name):
+            heartbeat_request = True
+
+        log_telemetry(self.logger, "_handle_ai_response finish")
         return messages, heartbeat_request, function_failed
 
+    @trace_method("Agent Step")
     def step(
         self,
         messages: Union[Message, List[Message]],
         # additional args
         chaining: bool = True,
         max_chaining_steps: Optional[int] = None,
+        put_inner_thoughts_first: bool = True,
         **kwargs,
     ) -> LettaUsageStatistics:
         """Run Agent.step in a loop, handling chaining via heartbeat requests and function failures"""
@@ -615,6 +665,7 @@ class Agent(BaseAgent):
             kwargs["last_function_failed"] = function_failed
             step_response = self.inner_step(
                 messages=next_input_message,
+                put_inner_thoughts_first=put_inner_thoughts_first,
                 **kwargs,
             )
 
@@ -680,6 +731,9 @@ class Agent(BaseAgent):
             else:
                 break
 
+        if self.agent_state.message_buffer_autoclear:
+            self.agent_manager.trim_all_in_context_messages_except_system(self.agent_state.id, actor=self.user)
+
         return LettaUsageStatistics(**total_usage.model_dump(), step_count=step_count)
 
     def inner_step(
@@ -693,9 +747,9 @@ class Agent(BaseAgent):
         metadata: Optional[dict] = None,
         summarize_attempt_count: int = 0,
         last_function_failed: bool = False,
+        put_inner_thoughts_first: bool = True,
     ) -> AgentStepResponse:
         """Runs a single step in the agent loop (generates at most one LLM call)"""
-
         try:
 
             # Extract job_id from metadata if present
@@ -728,6 +782,7 @@ class Agent(BaseAgent):
                 stream=stream,
                 step_count=step_count,
                 last_function_failed=last_function_failed,
+                put_inner_thoughts_first=put_inner_thoughts_first,
             )
             if not response:
                 # EDGE CASE: Function call failed AND there's no tools left for agent to call -> return early

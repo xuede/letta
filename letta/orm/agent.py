@@ -1,11 +1,12 @@
 import uuid
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import JSON, Index, String
+from sqlalchemy import JSON, Boolean, Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from letta.orm.block import Block
 from letta.orm.custom_columns import EmbeddingConfigColumn, LLMConfigColumn, ToolRulesColumn
+from letta.orm.identity import Identity
 from letta.orm.message import Message
 from letta.orm.mixins import OrganizationMixin
 from letta.orm.organization import Organization
@@ -15,10 +16,11 @@ from letta.schemas.agent import AgentType
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import Memory
-from letta.schemas.tool_rule import TerminalToolRule, ToolRule
+from letta.schemas.tool_rule import ToolRule
 
 if TYPE_CHECKING:
     from letta.orm.agents_tags import AgentsTags
+    from letta.orm.identity import Identity
     from letta.orm.organization import Organization
     from letta.orm.source import Source
     from letta.orm.tool import Tool
@@ -61,6 +63,11 @@ class Agent(SqlalchemyBase, OrganizationMixin):
 
     # Tool rules
     tool_rules: Mapped[Optional[List[ToolRule]]] = mapped_column(ToolRulesColumn, doc="the tool rules for this agent.")
+
+    # Stateless
+    message_buffer_autoclear: Mapped[bool] = mapped_column(
+        Boolean, doc="If set to True, the agent will not remember previous messages. Not recommended unless you have an advanced use case."
+    )
 
     # relationships
     organization: Mapped["Organization"] = relationship("Organization", back_populates="agents")
@@ -114,14 +121,18 @@ class Agent(SqlalchemyBase, OrganizationMixin):
         viewonly=True,  # Ensures SQLAlchemy doesn't attempt to manage this relationship
         doc="All passages derived created by this agent.",
     )
+    identities: Mapped[List["Identity"]] = relationship(
+        "Identity",
+        secondary="identities_agents",
+        lazy="selectin",
+        back_populates="agents",
+        passive_deletes=True,
+    )
 
     def to_pydantic(self) -> PydanticAgentState:
         """converts to the basic pydantic model counterpart"""
         # add default rule for having send_message be a terminal tool
         tool_rules = self.tool_rules
-        if not tool_rules:
-            tool_rules = [TerminalToolRule(tool_name="send_message"), TerminalToolRule(tool_name="send_message_to_agent_async")]
-
         state = {
             "id": self.id,
             "organization_id": self.organization_id,
@@ -146,6 +157,8 @@ class Agent(SqlalchemyBase, OrganizationMixin):
             "project_id": self.project_id,
             "template_id": self.template_id,
             "base_template_id": self.base_template_id,
+            "identity_ids": [identity.id for identity in self.identities],
+            "message_buffer_autoclear": self.message_buffer_autoclear,
         }
 
         return self.__pydantic_model__(**state)

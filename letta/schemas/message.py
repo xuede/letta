@@ -12,6 +12,8 @@ from openai.types.chat.chat_completion_message_tool_call import Function as Open
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG, TOOL_CALL_ID_MAX_LEN
+from letta.helpers.datetime_helpers import get_utc_time, is_utc_datetime
+from letta.helpers.json_helpers import json_dumps
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG
 from letta.schemas.enums import MessageContentType, MessageRole
 from letta.schemas.letta_base import OrmMetadataBase
@@ -28,7 +30,6 @@ from letta.schemas.letta_message import (
     UserMessage,
 )
 from letta.system import unpack_message
-from letta.utils import get_utc_time, is_utc_datetime, json_dumps
 
 
 def add_inner_thoughts_to_tool_call(
@@ -542,7 +543,11 @@ class Message(BaseMessage):
 
         return openai_message
 
-    def to_anthropic_dict(self, inner_thoughts_xml_tag="thinking") -> dict:
+    def to_anthropic_dict(
+        self,
+        inner_thoughts_xml_tag="thinking",
+        put_inner_thoughts_in_kwargs: bool = False,
+    ) -> dict:
         """
         Convert to an Anthropic message dictionary
 
@@ -566,19 +571,12 @@ class Message(BaseMessage):
                 "role": "user",
             }
 
-            # Optional field, do not include if null
-            if self.name is not None:
-                anthropic_message["name"] = self.name
-
         elif self.role == "user":
             assert all([v is not None for v in [self.text, self.role]]), vars(self)
             anthropic_message = {
                 "content": self.text,
                 "role": self.role,
             }
-            # Optional field, do not include if null
-            if self.name is not None:
-                anthropic_message["name"] = self.name
 
         elif self.role == "assistant":
             assert self.tool_calls is not None or self.text is not None
@@ -586,31 +584,39 @@ class Message(BaseMessage):
                 "role": self.role,
             }
             content = []
-            if self.text is not None:
+            # COT / reasoning / thinking
+            if self.text is not None and not put_inner_thoughts_in_kwargs:
                 content.append(
                     {
                         "type": "text",
                         "text": add_xml_tag(string=self.text, xml_tag=inner_thoughts_xml_tag),
                     }
                 )
+            # Tool calling
             if self.tool_calls is not None:
                 for tool_call in self.tool_calls:
+
+                    if put_inner_thoughts_in_kwargs:
+                        tool_call_input = add_inner_thoughts_to_tool_call(
+                            tool_call,
+                            inner_thoughts=self.text,
+                            inner_thoughts_key=INNER_THOUGHTS_KWARG,
+                        ).model_dump()
+                    else:
+                        tool_call_input = json.loads(tool_call.function.arguments)
+
                     content.append(
                         {
                             "type": "tool_use",
                             "id": tool_call.id,
                             "name": tool_call.function.name,
-                            "input": json.loads(tool_call.function.arguments),
+                            "input": tool_call_input,
                         }
                     )
 
             # If the only content was text, unpack it back into a singleton
-            # TODO
+            # TODO support multi-modal
             anthropic_message["content"] = content
-
-            # Optional fields, do not include if null
-            if self.name is not None:
-                anthropic_message["name"] = self.name
 
         elif self.role == "tool":
             # NOTE: Anthropic uses role "user" for "tool" responses
@@ -641,7 +647,7 @@ class Message(BaseMessage):
         #     role: str ('user' or 'model')
 
         if self.role != "tool" and self.name is not None:
-            raise UserWarning(f"Using Google AI with non-null 'name' field ({self.name}) not yet supported.")
+            warnings.warn(f"Using Google AI with non-null 'name' field ({self.name}) not yet supported.")
 
         if self.role == "system":
             # NOTE: Gemini API doesn't have a 'system' role, use 'user' instead

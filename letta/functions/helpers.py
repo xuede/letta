@@ -17,6 +17,7 @@ from letta.schemas.message import Message, MessageCreate
 from letta.schemas.user import User
 from letta.server.rest_api.utils import get_letta_server
 from letta.settings import settings
+from letta.utils import log_telemetry
 
 
 # TODO: This is kind of hacky, as this is used to search up the action later on composio's side
@@ -51,24 +52,53 @@ def generate_composio_tool_wrapper(action_name: str) -> tuple[str, str]:
     # Generate func name
     func_name = generate_func_name_from_composio_action(action_name)
 
-    wrapper_function_str = f"""
+    wrapper_function_str = f"""\
 def {func_name}(**kwargs):
-    from composio_langchain import ComposioToolSet
-    import os
-
-    entity_id = os.getenv('{COMPOSIO_ENTITY_ENV_VAR_KEY}', '{DEFAULT_ENTITY_ID}')
-    composio_toolset = ComposioToolSet(entity_id=entity_id)
-    response = composio_toolset.execute_action(action='{action_name}', params=kwargs)
-
-    if response["error"]:
-        raise RuntimeError(response["error"])
-    return response["data"]
-    """
+    raise RuntimeError("Something went wrong - we should never be using the persisted source code for Composio. Please reach out to Letta team")
+"""
 
     # Compile safety check
-    assert_code_gen_compilable(wrapper_function_str)
+    assert_code_gen_compilable(wrapper_function_str.strip())
 
-    return func_name, wrapper_function_str
+    return func_name, wrapper_function_str.strip()
+
+
+def execute_composio_action(
+    action_name: str, args: dict, api_key: Optional[str] = None, entity_id: Optional[str] = None
+) -> tuple[str, str]:
+    import os
+
+    from composio.exceptions import (
+        ApiKeyNotProvidedError,
+        ComposioSDKError,
+        ConnectedAccountNotFoundError,
+        EnumMetadataNotFound,
+        EnumStringNotFound,
+    )
+    from composio_langchain import ComposioToolSet
+
+    entity_id = entity_id or os.getenv(COMPOSIO_ENTITY_ENV_VAR_KEY, DEFAULT_ENTITY_ID)
+    try:
+        composio_toolset = ComposioToolSet(api_key=api_key, entity_id=entity_id)
+        response = composio_toolset.execute_action(action=action_name, params=args)
+    except ApiKeyNotProvidedError:
+        raise RuntimeError(
+            f"Composio API key is missing for action '{action_name}'. "
+            "Please set the sandbox environment variables either through the ADE or the API."
+        )
+    except ConnectedAccountNotFoundError:
+        raise RuntimeError(f"No connected account was found for action '{action_name}'. " "Please link an account and try again.")
+    except EnumStringNotFound as e:
+        raise RuntimeError(f"Invalid value provided for action '{action_name}': " + str(e) + ". Please check the action parameters.")
+    except EnumMetadataNotFound as e:
+        raise RuntimeError(f"Invalid value provided for action '{action_name}': " + str(e) + ". Please check the action parameters.")
+    except ComposioSDKError as e:
+        raise RuntimeError(f"An unexpected error occurred in Composio SDK while executing action '{action_name}': " + str(e))
+
+    if response["error"]:
+        raise RuntimeError(f"Error while executing action '{action_name}': " + str(response["error"]))
+
+    return response["data"]
 
 
 def generate_langchain_tool_wrapper(
@@ -341,10 +371,16 @@ async def async_send_message_with_retries(
     timeout: int,
     logging_prefix: Optional[str] = None,
 ) -> str:
-
     logging_prefix = logging_prefix or "[async_send_message_with_retries]"
+    log_telemetry(sender_agent.logger, f"async_send_message_with_retries start", target_agent_id=target_agent_id)
+
     for attempt in range(1, max_retries + 1):
         try:
+            log_telemetry(
+                sender_agent.logger,
+                f"async_send_message_with_retries -> asyncio wait for send_message_to_agent_no_stream start",
+                target_agent_id=target_agent_id,
+            )
             response = await asyncio.wait_for(
                 send_message_to_agent_no_stream(
                     server=server,
@@ -354,15 +390,24 @@ async def async_send_message_with_retries(
                 ),
                 timeout=timeout,
             )
+            log_telemetry(
+                sender_agent.logger,
+                f"async_send_message_with_retries -> asyncio wait for send_message_to_agent_no_stream finish",
+                target_agent_id=target_agent_id,
+            )
 
             # Then parse out the assistant message
             assistant_message = parse_letta_response_for_assistant_message(target_agent_id, response)
             if assistant_message:
                 sender_agent.logger.info(f"{logging_prefix} - {assistant_message}")
+                log_telemetry(
+                    sender_agent.logger, f"async_send_message_with_retries finish with assistant message", target_agent_id=target_agent_id
+                )
                 return assistant_message
             else:
                 msg = f"(No response from agent {target_agent_id})"
                 sender_agent.logger.info(f"{logging_prefix} - {msg}")
+                log_telemetry(sender_agent.logger, f"async_send_message_with_retries finish no response", target_agent_id=target_agent_id)
                 return msg
 
         except asyncio.TimeoutError:
@@ -380,6 +425,12 @@ async def async_send_message_with_retries(
             await asyncio.sleep(backoff)
         else:
             sender_agent.logger.error(f"{logging_prefix} - Fatal error: {error_msg}")
+            log_telemetry(
+                sender_agent.logger,
+                f"async_send_message_with_retries finish fatal error",
+                target_agent_id=target_agent_id,
+                error_msg=error_msg,
+            )
             raise Exception(error_msg)
 
 
@@ -468,6 +519,7 @@ def fire_and_forget_send_to_agent(
 
 
 async def _send_message_to_agents_matching_all_tags_async(sender_agent: "Agent", message: str, tags: List[str]) -> List[str]:
+    log_telemetry(sender_agent.logger, "_send_message_to_agents_matching_all_tags_async start", message=message, tags=tags)
     server = get_letta_server()
 
     augmented_message = (
@@ -477,7 +529,9 @@ async def _send_message_to_agents_matching_all_tags_async(sender_agent: "Agent",
     )
 
     # Retrieve up to 100 matching agents
+    log_telemetry(sender_agent.logger, "_send_message_to_agents_matching_all_tags_async listing agents start", message=message, tags=tags)
     matching_agents = server.agent_manager.list_agents(actor=sender_agent.user, tags=tags, match_all_tags=True, limit=100)
+    log_telemetry(sender_agent.logger, "_send_message_to_agents_matching_all_tags_async  listing agents finish", message=message, tags=tags)
 
     # Create a system message
     messages = [MessageCreate(role=MessageRole.system, content=augmented_message, name=sender_agent.agent_state.name)]
@@ -504,4 +558,6 @@ async def _send_message_to_agents_matching_all_tags_async(sender_agent: "Agent",
             final.append(str(r))
         else:
             final.append(r)
+
+    log_telemetry(sender_agent.logger, "_send_message_to_agents_matching_all_tags_async finish", message=message, tags=tags)
     return final

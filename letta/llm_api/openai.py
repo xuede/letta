@@ -7,6 +7,7 @@ from openai import OpenAI
 from letta.llm_api.helpers import add_inner_thoughts_to_functions, convert_to_structured_output, make_post_request
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG, INNER_THOUGHTS_KWARG_DESCRIPTION, INNER_THOUGHTS_KWARG_DESCRIPTION_GO_FIRST
 from letta.local_llm.utils import num_tokens_from_functions, num_tokens_from_messages
+from letta.log import get_logger
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message as _Message
 from letta.schemas.message import MessageRole as _MessageRole
@@ -26,7 +27,7 @@ from letta.schemas.openai.embedding_response import EmbeddingResponse
 from letta.streaming_interface import AgentChunkStreamingInterface, AgentRefreshStreamingInterface
 from letta.utils import get_tool_call_id, smart_urljoin
 
-OPENAI_SSE_DONE = "[DONE]"
+logger = get_logger(__name__)
 
 
 def openai_get_model_list(
@@ -93,7 +94,7 @@ def build_openai_chat_completions_request(
     functions: Optional[list],
     function_call: Optional[str],
     use_tool_naming: bool,
-    max_tokens: Optional[int],
+    put_inner_thoughts_first: bool = True,
 ) -> ChatCompletionRequest:
     if functions and llm_config.put_inner_thoughts_in_kwargs:
         # Special case for LM Studio backend since it needs extra guidance to force out the thoughts first
@@ -105,6 +106,7 @@ def build_openai_chat_completions_request(
             functions=functions,
             inner_thoughts_key=INNER_THOUGHTS_KWARG,
             inner_thoughts_description=inner_thoughts_desc,
+            put_inner_thoughts_first=put_inner_thoughts_first,
         )
 
     openai_message_list = [
@@ -130,7 +132,7 @@ def build_openai_chat_completions_request(
             tools=[Tool(type="function", function=f) for f in functions] if functions else None,
             tool_choice=tool_choice,
             user=str(user_id),
-            max_completion_tokens=max_tokens,
+            max_completion_tokens=llm_config.max_tokens,
             temperature=llm_config.temperature,
         )
     else:
@@ -140,7 +142,7 @@ def build_openai_chat_completions_request(
             functions=functions,
             function_call=function_call,
             user=str(user_id),
-            max_completion_tokens=max_tokens,
+            max_completion_tokens=llm_config.max_tokens,
             temperature=llm_config.temperature,
         )
         # https://platform.openai.com/docs/guides/text-generation/json-mode
@@ -166,6 +168,11 @@ def openai_chat_completions_process_stream(
     create_message_id: bool = True,
     create_message_datetime: bool = True,
     override_tool_call_id: bool = True,
+    # if we expect reasoning content in the response,
+    # then we should emit reasoning_content as "inner_thoughts"
+    # however, we don't necessarily want to put these
+    # expect_reasoning_content: bool = False,
+    expect_reasoning_content: bool = True,
 ) -> ChatCompletionResponse:
     """Process a streaming completion response, and return a ChatCompletionRequest at the end.
 
@@ -250,6 +257,7 @@ def openai_chat_completions_process_stream(
                         chat_completion_chunk,
                         message_id=chat_completion_response.id if create_message_id else chat_completion_chunk.id,
                         message_date=chat_completion_response.created if create_message_datetime else chat_completion_chunk.created,
+                        expect_reasoning_content=expect_reasoning_content,
                     )
                 elif isinstance(stream_interface, AgentRefreshStreamingInterface):
                     stream_interface.process_refresh(chat_completion_response)
@@ -289,6 +297,13 @@ def openai_chat_completions_process_stream(
                         accum_message.content = content_delta
                     else:
                         accum_message.content += content_delta
+
+                if expect_reasoning_content and message_delta.reasoning_content is not None:
+                    reasoning_content_delta = message_delta.reasoning_content
+                    if accum_message.reasoning_content is None:
+                        accum_message.reasoning_content = reasoning_content_delta
+                    else:
+                        accum_message.reasoning_content += reasoning_content_delta
 
                 # TODO(charles) make sure this works for parallel tool calling?
                 if message_delta.tool_calls is not None:
@@ -354,9 +369,10 @@ def openai_chat_completions_process_stream(
     except Exception as e:
         if stream_interface:
             stream_interface.stream_end()
-        print(f"Parsing ChatCompletion stream failed with error:\n{str(e)}")
+        logger.error(f"Parsing ChatCompletion stream failed with error:\n{str(e)}")
         raise e
     finally:
+        logger.info(f"Finally ending streaming interface.")
         if stream_interface:
             stream_interface.stream_end()
 
@@ -376,7 +392,7 @@ def openai_chat_completions_process_stream(
     chat_completion_response.usage.completion_tokens = n_chunks
     chat_completion_response.usage.total_tokens = prompt_tokens + n_chunks
 
-    assert len(chat_completion_response.choices) > 0, chat_completion_response
+    assert len(chat_completion_response.choices) > 0, f"No response from provider {chat_completion_response}"
 
     # printd(chat_completion_response)
     return chat_completion_response

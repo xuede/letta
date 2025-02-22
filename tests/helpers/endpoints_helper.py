@@ -15,6 +15,7 @@ from letta.config import LettaConfig
 from letta.constants import DEFAULT_HUMAN, DEFAULT_PERSONA
 from letta.embeddings import embedding_model
 from letta.errors import InvalidInnerMonologueError, InvalidToolCallError, MissingInnerMonologueError, MissingToolCallError
+from letta.helpers.json_helpers import json_dumps
 from letta.llm_api.llm_api_tools import create
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG
 from letta.schemas.agent import AgentState
@@ -24,7 +25,7 @@ from letta.schemas.letta_response import LettaResponse
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import ChatMemory
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse, Choice, FunctionCall, Message
-from letta.utils import get_human_text, get_persona_text, json_dumps
+from letta.utils import get_human_text, get_persona_text
 from tests.helpers.utils import cleanup
 
 # Generate uuid for agent name for this example
@@ -51,6 +52,7 @@ def setup_agent(
     tool_rules: Optional[List[BaseToolRule]] = None,
     agent_uuid: str = agent_uuid,
     include_base_tools: bool = True,
+    include_base_tool_rules: bool = True,
 ) -> AgentState:
     config_data = json.load(open(filename, "r"))
     llm_config = LLMConfig(**config_data)
@@ -71,6 +73,7 @@ def setup_agent(
         tool_ids=tool_ids,
         tool_rules=tool_rules,
         include_base_tools=include_base_tools,
+        include_base_tool_rules=include_base_tool_rules,
     )
 
     return agent_state
@@ -82,7 +85,7 @@ def setup_agent(
 # ======================================================================================================================
 
 
-def check_first_response_is_valid_for_llm_endpoint(filename: str) -> ChatCompletionResponse:
+def check_first_response_is_valid_for_llm_endpoint(filename: str, validate_inner_monologue_contents: bool = True) -> ChatCompletionResponse:
     """
     Checks that the first response is valid:
 
@@ -125,7 +128,11 @@ def check_first_response_is_valid_for_llm_endpoint(filename: str) -> ChatComplet
     assert_contains_valid_function_call(choice.message, validator_func)
 
     # Assert that the message has an inner monologue
-    assert_contains_correct_inner_monologue(choice, agent_state.llm_config.put_inner_thoughts_in_kwargs)
+    assert_contains_correct_inner_monologue(
+        choice,
+        agent_state.llm_config.put_inner_thoughts_in_kwargs,
+        validate_inner_monologue_contents=validate_inner_monologue_contents,
+    )
 
     return response
 
@@ -469,7 +476,11 @@ def assert_inner_monologue_is_valid(message: Message) -> None:
             raise InvalidInnerMonologueError(messages=[message], explanation=f"{phrase} is in monologue")
 
 
-def assert_contains_correct_inner_monologue(choice: Choice, inner_thoughts_in_kwargs: bool) -> None:
+def assert_contains_correct_inner_monologue(
+    choice: Choice,
+    inner_thoughts_in_kwargs: bool,
+    validate_inner_monologue_contents: bool = True,
+) -> None:
     """
     Helper function to check that the inner monologue exists and is valid.
     """
@@ -482,4 +493,5 @@ def assert_contains_correct_inner_monologue(choice: Choice, inner_thoughts_in_kw
     if not monologue or monologue is None or monologue == "":
         raise MissingInnerMonologueError(messages=[message])
 
-    assert_inner_monologue_is_valid(message)
+    if validate_inner_monologue_contents:
+        assert_inner_monologue_is_valid(message)

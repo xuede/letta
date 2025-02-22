@@ -73,6 +73,7 @@ class AbstractClient(object):
         metadata: Optional[Dict] = {"human:": DEFAULT_HUMAN, "persona": DEFAULT_PERSONA},
         description: Optional[str] = None,
         tags: Optional[List[str]] = None,
+        message_buffer_autoclear: bool = False,
     ) -> AgentState:
         raise NotImplementedError
 
@@ -540,6 +541,7 @@ class RESTClient(AbstractClient):
         description: Optional[str] = None,
         initial_message_sequence: Optional[List[Message]] = None,
         tags: Optional[List[str]] = None,
+        message_buffer_autoclear: bool = False,
     ) -> AgentState:
         """Create an agent
 
@@ -600,6 +602,7 @@ class RESTClient(AbstractClient):
             "initial_message_sequence": initial_message_sequence,
             "tags": tags,
             "include_base_tools": include_base_tools,
+            "message_buffer_autoclear": message_buffer_autoclear,
         }
 
         # Only add name if it's not None
@@ -2348,11 +2351,13 @@ class LocalClient(AbstractClient):
         tool_rules: Optional[List[BaseToolRule]] = None,
         include_base_tools: Optional[bool] = True,
         include_multi_agent_tools: bool = False,
+        include_base_tool_rules: bool = True,
         # metadata
         metadata: Optional[Dict] = {"human:": DEFAULT_HUMAN, "persona": DEFAULT_PERSONA},
         description: Optional[str] = None,
         initial_message_sequence: Optional[List[Message]] = None,
         tags: Optional[List[str]] = None,
+        message_buffer_autoclear: bool = False,
     ) -> AgentState:
         """Create an agent
 
@@ -2398,12 +2403,14 @@ class LocalClient(AbstractClient):
             "tool_rules": tool_rules,
             "include_base_tools": include_base_tools,
             "include_multi_agent_tools": include_multi_agent_tools,
+            "include_base_tool_rules": include_base_tool_rules,
             "system": system,
             "agent_type": agent_type,
             "llm_config": llm_config if llm_config else self._default_llm_config,
             "embedding_config": embedding_config if embedding_config else self._default_embedding_config,
             "initial_message_sequence": initial_message_sequence,
             "tags": tags,
+            "message_buffer_autoclear": message_buffer_autoclear,
         }
 
         # Only add name if it's not None

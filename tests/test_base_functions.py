@@ -1,17 +1,9 @@
-import json
-
 import pytest
 
 import letta.functions.function_sets.base as base_functions
 from letta import LocalClient, create_client
-from letta.functions.functions import derive_openai_json_schema, parse_source_code
 from letta.schemas.embedding_config import EmbeddingConfig
-from letta.schemas.letta_message import SystemMessage, ToolReturnMessage
 from letta.schemas.llm_config import LLMConfig
-from letta.schemas.memory import ChatMemory
-from letta.schemas.tool import Tool
-from tests.helpers.utils import retry_until_success
-from tests.utils import wait_for_incoming_message
 
 
 @pytest.fixture(scope="function")
@@ -33,47 +25,6 @@ def agent_obj(client: LocalClient):
     yield agent_obj
 
     # client.delete_agent(agent_obj.agent_state.id)
-
-
-@pytest.fixture(scope="function")
-def other_agent_obj(client: LocalClient):
-    """Create another test agent that we can call functions on"""
-    agent_state = client.create_agent(include_multi_agent_tools=False)
-
-    other_agent_obj = client.server.load_agent(agent_id=agent_state.id, actor=client.user)
-    yield other_agent_obj
-
-    client.delete_agent(other_agent_obj.agent_state.id)
-
-
-@pytest.fixture
-def roll_dice_tool(client):
-    def roll_dice():
-        """
-        Rolls a 6 sided die.
-
-        Returns:
-            str: The roll result.
-        """
-        return "Rolled a 5!"
-
-    # Set up tool details
-    source_code = parse_source_code(roll_dice)
-    source_type = "python"
-    description = "test_description"
-    tags = ["test"]
-
-    tool = Tool(description=description, tags=tags, source_code=source_code, source_type=source_type)
-    derived_json_schema = derive_openai_json_schema(source_code=tool.source_code, name=tool.name)
-
-    derived_name = derived_json_schema["name"]
-    tool.json_schema = derived_json_schema
-    tool.name = derived_name
-
-    tool = client.server.tool_manager.create_or_update_tool(tool, actor=client.user)
-
-    # Yield the created tool
-    yield tool
 
 
 def query_in_search_results(search_results, query):
@@ -180,7 +131,9 @@ def test_send_message_to_agent(client, agent_obj, other_agent_obj):
             found = True
             break
 
-    print(f"In context messages of the sender agent (without system):\n\n{"\n".join([m.text for m in in_context_messages[1:]])}")
+    # Compute the joined string first
+    joined_messages = "\n".join([m.text for m in in_context_messages[1:]])
+    print(f"In context messages of the sender agent (without system):\n\n{joined_messages}")
     if not found:
         raise Exception(f"Was not able to find an instance of the target snippet: {target_snippet}")
 

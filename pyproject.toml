@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "letta"
-version = "0.6.23"
+version = "0.6.30"
 packages = [
     {include = "letta"},
 ]
@@ -27,7 +27,6 @@ prettytable = "^3.9.0"
 pgvector = { version = "^0.2.3", optional = true }
 pre-commit = {version = "^3.5.0", optional = true }
 pg8000 = {version = "^1.30.3", optional = true}
-websockets = {version = "^12.0", optional = true}
 docstring-parser = ">=0.16,<0.17"
 httpx = "^0.28.0"
 numpy = "^1.26.2"
@@ -59,8 +58,8 @@ nltk = "^3.8.1"
 jinja2 = "^3.1.5"
 locust = {version = "^2.31.5", optional = true}
 wikipedia = {version = "^1.4.0", optional = true}
-composio-langchain = "^0.6.19"
-composio-core = "^0.6.19"
+composio-langchain = "^0.7.2"
+composio-core = "^0.7.2"
 alembic = "^1.13.3"
 pyhumps = "^3.8.0"
 psycopg2 = {version = "^2.9.10", optional = true}
@@ -79,7 +78,15 @@ e2b-code-interpreter = {version = "^1.0.3", optional = true}
 anthropic = "^0.43.0"
 letta_client = "^0.1.23"
 openai = "^1.60.0"
+opentelemetry-api = "1.30.0"
+opentelemetry-sdk = "1.30.0"
+opentelemetry-instrumentation-requests = "0.51b0"
+opentelemetry-exporter-otlp = "1.30.0"
+google-genai = {version = "^1.1.0", optional = true}
+faker = "^36.1.0"
 colorama = "^0.4.6"
+marshmallow-sqlalchemy = "^1.4.1"
+boto3 = {version = "^1.36.24", optional = true}
 
 
 [tool.poetry.extras]
@@ -90,8 +97,10 @@ qdrant = ["qdrant-client"]
 cloud-tool-sandbox = ["e2b-code-interpreter"]
 external-tools = ["docker", "langchain", "wikipedia", "langchain-community"]
 tests = ["wikipedia"]
-all = ["pgvector", "pg8000", "psycopg2-binary", "psycopg2", "pytest", "pytest-asyncio", "pexpect", "black", "pre-commit", "datasets", "pyright", "pytest-order", "autoflake", "isort", "websockets", "fastapi", "uvicorn", "docker", "langchain", "wikipedia", "langchain-community", "locust"]
 bedrock = ["boto3"]
+google = ["google-genai"]
+telemetry = ["opentelemetry-api", "opentelemetry-sdk", "opentelemetry-instrumentation-requests", "opentelemetry-exporter-otlp"]
+all = ["pgvector", "pg8000", "psycopg2-binary", "psycopg2", "pytest", "pytest-asyncio", "pexpect", "black", "pre-commit", "datasets", "pyright", "pytest-order", "autoflake", "isort", "websockets", "fastapi", "uvicorn", "docker", "langchain", "wikipedia", "langchain-community", "locust", "boto3", "google-genai", "opentelemetry-api", "opentelemetry-sdk", "opentelemetry-instrumentation-requests", "opentelemetry-exporter-otlp"]
 
 [tool.poetry.group.dev.dependencies]
 black = "^24.4.2"
