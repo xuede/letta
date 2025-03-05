@@ -50,6 +50,8 @@ class ModelSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    global_max_context_window_limit: int = 32000
+
     # env_prefix='my_prefix_'
 
     # when we use /completions APIs (instead of /chat/completions), we need to specify a model wrapper
@@ -62,6 +64,9 @@ class ModelSettings(BaseSettings):
 
     # deepseek
     deepseek_api_key: Optional[str] = None
+
+    # xAI / Grok
+    xai_api_key: Optional[str] = None
 
     # groq
     groq_api_key: Optional[str] = None

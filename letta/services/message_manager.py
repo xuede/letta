@@ -2,6 +2,7 @@ from typing import List, Optional
 
 from sqlalchemy import and_, or_
 
+from letta.log import get_logger
 from letta.orm.agent import Agent as AgentModel
 from letta.orm.errors import NoResultFound
 from letta.orm.message import Message as MessageModel
@@ -10,6 +11,8 @@ from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.message import MessageUpdate
 from letta.schemas.user import User as PydanticUser
 from letta.utils import enforce_types
+
+logger = get_logger(__name__)
 
 
 class MessageManager:
@@ -37,13 +40,13 @@ class MessageManager:
             results = MessageModel.list(db_session=session, id=message_ids, organization_id=actor.organization_id, limit=len(message_ids))
 
             if len(results) != len(message_ids):
-                raise NoResultFound(
+                logger.warning(
                     f"Expected {len(message_ids)} messages, but found {len(results)}. Missing ids={set(message_ids) - set([r.id for r in results])}"
                 )
 
             # Sort results directly based on message_ids
             result_dict = {msg.id: msg.to_pydantic() for msg in results}
-            return [result_dict[msg_id] for msg_id in message_ids]
+            return list(filter(lambda x: x is not None, [result_dict.get(msg_id, None) for msg_id in message_ids]))
 
     @enforce_types
     def create_message(self, pydantic_msg: PydanticMessage, actor: PydanticUser) -> PydanticMessage:

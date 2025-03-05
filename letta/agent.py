@@ -60,16 +60,8 @@ from letta.services.tool_manager import ToolManager
 from letta.settings import summarizer_settings
 from letta.streaming_interface import StreamingRefreshCLIInterface
 from letta.system import get_heartbeat, get_token_limit_warning, package_function_response, package_summarize_message, package_user_message
-from letta.tracing import trace_method
-from letta.utils import (
-    count_tokens,
-    get_friendly_error_msg,
-    get_tool_call_id,
-    log_telemetry,
-    parse_json,
-    printd,
-    validate_function_response,
-)
+from letta.tracing import log_event, trace_method
+from letta.utils import count_tokens, get_friendly_error_msg, get_tool_call_id, log_telemetry, parse_json, validate_function_response
 
 logger = get_logger(__name__)
 
@@ -245,10 +237,13 @@ class Agent(BaseAgent):
                     action_name=action_name, args=function_args, api_key=composio_api_key, entity_id=entity_id
                 )
             else:
-                # Parse the source code to extract function annotations
-                annotations = get_function_annotations_from_source(target_letta_tool.source_code, function_name)
-                # Coerce the function arguments to the correct types based on the annotations
-                function_args = coerce_dict_args_by_annotations(function_args, annotations)
+                try:
+                    # Parse the source code to extract function annotations
+                    annotations = get_function_annotations_from_source(target_letta_tool.source_code, function_name)
+                    # Coerce the function arguments to the correct types based on the annotations
+                    function_args = coerce_dict_args_by_annotations(function_args, annotations)
+                except ValueError as e:
+                    self.logger.debug(f"Error coercing function arguments: {e}")
 
                 # execute tool in a sandbox
                 # TODO: allow agent_state to specify which sandbox to execute tools in
@@ -257,7 +252,9 @@ class Agent(BaseAgent):
                 agent_state_copy.tools = []
                 agent_state_copy.tool_rules = []
 
-                sandbox_run_result = ToolExecutionSandbox(function_name, function_args, self.user).run(agent_state=agent_state_copy)
+                sandbox_run_result = ToolExecutionSandbox(function_name, function_args, self.user, tool_object=target_letta_tool).run(
+                    agent_state=agent_state_copy
+                )
                 function_response, updated_agent_state = sandbox_run_result.func_return, sandbox_run_result.agent_state
                 assert orig_memory_str == self.agent_state.memory.compile(), "Memory should not be modified in a sandbox tool"
                 if updated_agent_state is not None:
@@ -310,7 +307,7 @@ class Agent(BaseAgent):
         # Return updated messages
         return messages
 
-    @trace_method("Get AI Reply")
+    @trace_method
     def _get_ai_reply(
         self,
         message_sequence: List[Message],
@@ -403,7 +400,7 @@ class Agent(BaseAgent):
         log_telemetry(self.logger, "_handle_ai_response finish catch-all exception")
         raise Exception("Retries exhausted and no valid response received.")
 
-    @trace_method("Handle AI Response")
+    @trace_method
     def _handle_ai_response(
         self,
         response_message: ChatCompletionMessage,  # TODO should we eventually move the Message creation outside of this function?
@@ -541,7 +538,24 @@ class Agent(BaseAgent):
                 log_telemetry(
                     self.logger, "_handle_ai_response execute tool start", function_name=function_name, function_args=function_args
                 )
+                log_event(
+                    "tool_call_initiated",
+                    attributes={
+                        "function_name": function_name,
+                        "target_letta_tool": target_letta_tool.model_dump(),
+                        **{f"function_args.{k}": v for k, v in function_args.items()},
+                    },
+                )
+
                 function_response, sandbox_run_result = self.execute_tool_and_persist_state(function_name, function_args, target_letta_tool)
+
+                log_event(
+                    "tool_call_ended",
+                    attributes={
+                        "function_response": function_response,
+                        "sandbox_run_result": sandbox_run_result.model_dump() if sandbox_run_result else None,
+                    },
+                )
                 log_telemetry(
                     self.logger, "_handle_ai_response execute tool finish", function_name=function_name, function_args=function_args
                 )
@@ -643,7 +657,7 @@ class Agent(BaseAgent):
         log_telemetry(self.logger, "_handle_ai_response finish")
         return messages, heartbeat_request, function_failed
 
-    @trace_method("Agent Step")
+    @trace_method
     def step(
         self,
         messages: Union[Message, List[Message]],
@@ -827,17 +841,24 @@ class Agent(BaseAgent):
                 )
 
             if current_total_tokens > summarizer_settings.memory_warning_threshold * int(self.agent_state.llm_config.context_window):
-                printd(
+                logger.warning(
                     f"{CLI_WARNING_PREFIX}last response total_tokens ({current_total_tokens}) > {summarizer_settings.memory_warning_threshold * int(self.agent_state.llm_config.context_window)}"
                 )
 
+                log_event(
+                    name="memory_pressure_warning",
+                    attributes={
+                        "current_total_tokens": current_total_tokens,
+                        "context_window_limit": self.agent_state.llm_config.context_window,
+                    },
+                )
                 # Only deliver the alert if we haven't already (this period)
                 if not self.agent_alerted_about_memory_pressure:
                     active_memory_warning = True
                     self.agent_alerted_about_memory_pressure = True  # it's up to the outer loop to handle this
 
             else:
-                printd(
+                logger.info(
                     f"last response total_tokens ({current_total_tokens}) < {summarizer_settings.memory_warning_threshold * int(self.agent_state.llm_config.context_window)}"
                 )
 
@@ -886,6 +907,16 @@ class Agent(BaseAgent):
             # If we got a context alert, try trimming the messages length, then try again
             if is_context_overflow_error(e):
                 in_context_messages = self.agent_manager.get_in_context_messages(agent_id=self.agent_state.id, actor=self.user)
+
+                # TODO: this is a patch to resolve immediate issues, should be removed once the summarizer is fixes
+                if self.agent_state.message_buffer_autoclear:
+                    # no calling the summarizer in this case
+                    logger.error(
+                        f"step() failed with an exception that looks like a context window overflow, but message buffer is set to autoclear, so skipping: '{str(e)}'"
+                    )
+                    raise e
+
+                summarize_attempt_count += 1
 
                 if summarize_attempt_count <= summarizer_settings.max_summarizer_retries:
                     logger.warning(
@@ -1022,9 +1053,18 @@ class Agent(BaseAgent):
         self.agent_alerted_about_memory_pressure = False
         curr_in_context_messages = self.agent_manager.get_in_context_messages(agent_id=self.agent_state.id, actor=self.user)
 
+        current_token_count = sum(get_token_counts_for_messages(curr_in_context_messages))
         logger.info(f"Ran summarizer, messages length {prior_len} -> {len(curr_in_context_messages)}")
-        logger.info(
-            f"Summarizer brought down total token count from {sum(token_counts)} -> {sum(get_token_counts_for_messages(curr_in_context_messages))}"
+        logger.info(f"Summarizer brought down total token count from {sum(token_counts)} -> {current_token_count}")
+        log_event(
+            name="summarization",
+            attributes={
+                "prior_length": prior_len,
+                "current_length": len(curr_in_context_messages),
+                "prior_token_count": sum(token_counts),
+                "current_token_count": current_token_count,
+                "context_window_limit": self.agent_state.llm_config.context_window,
+            },
         )
 
     def add_function(self, function_name: str) -> str:

@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from sqlalchemy import Select, and_, func, literal, or_, select, union_all
 
-from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS, MAX_EMBEDDING_DIM, MULTI_AGENT_TOOLS
+from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS, DATA_SOURCE_ATTACH_ALERT, MAX_EMBEDDING_DIM, MULTI_AGENT_TOOLS
 from letta.embeddings import embedding_model
 from letta.helpers.datetime_helpers import get_utc_time
 from letta.log import get_logger
@@ -21,8 +21,10 @@ from letta.orm.sqlite_functions import adapt_array
 from letta.schemas.agent import AgentState as PydanticAgentState
 from letta.schemas.agent import AgentType, CreateAgent, UpdateAgent
 from letta.schemas.block import Block as PydanticBlock
+from letta.schemas.block import BlockUpdate
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.llm_config import LLMConfig
+from letta.schemas.memory import Memory
 from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.message import MessageCreate
 from letta.schemas.passage import Passage as PydanticPassage
@@ -33,6 +35,7 @@ from letta.schemas.tool_rule import TerminalToolRule as PydanticTerminalToolRule
 from letta.schemas.tool_rule import ToolRule as PydanticToolRule
 from letta.schemas.user import User as PydanticUser
 from letta.serialize_schemas import SerializedAgentSchema
+from letta.serialize_schemas.tool import SerializedToolSchema
 from letta.services.block_manager import BlockManager
 from letta.services.helpers.agent_manager_helper import (
     _process_relationship,
@@ -48,6 +51,7 @@ from letta.services.message_manager import MessageManager
 from letta.services.source_manager import SourceManager
 from letta.services.tool_manager import ToolManager
 from letta.settings import settings
+from letta.tracing import trace_method
 from letta.utils import enforce_types, united_diff
 
 logger = get_logger(__name__)
@@ -70,6 +74,7 @@ class AgentManager:
     # ======================================================================================================================
     # Basic CRUD operations
     # ======================================================================================================================
+    @trace_method
     @enforce_types
     def create_agent(
         self,
@@ -366,6 +371,7 @@ class AgentManager:
             agent = AgentModel.read(db_session=session, name=agent_name, actor=actor)
             return agent.to_pydantic()
 
+    @trace_method
     @enforce_types
     def delete_agent(self, agent_id: str, actor: PydanticUser) -> None:
         """
@@ -389,18 +395,28 @@ class AgentManager:
         with self.session_maker() as session:
             # Retrieve the agent
             agent = AgentModel.read(db_session=session, identifier=agent_id, actor=actor)
-            schema = SerializedAgentSchema(session=session)
+            schema = SerializedAgentSchema(session=session, actor=actor)
             return schema.dump(agent)
 
     @enforce_types
-    def deserialize(self, serialized_agent: dict, actor: PydanticUser) -> PydanticAgentState:
-        # TODO: Use actor to override fields
+    def deserialize(self, serialized_agent: dict, actor: PydanticUser, mark_as_copy: bool = True) -> PydanticAgentState:
+        tool_data_list = serialized_agent.pop("tools", [])
+
         with self.session_maker() as session:
-            schema = SerializedAgentSchema(session=session)
+            schema = SerializedAgentSchema(session=session, actor=actor)
             agent = schema.load(serialized_agent, session=session)
-            agent.organization_id = actor.organization_id
-            agent = agent.create(session, actor=actor)
-            return agent.to_pydantic()
+            if mark_as_copy:
+                agent.name += "_copy"
+            agent.create(session, actor=actor)
+            pydantic_agent = agent.to_pydantic()
+
+        # Need to do this separately as there's some fancy upsert logic that SqlAlchemy cannot handle
+        for tool_data in tool_data_list:
+            pydantic_tool = SerializedToolSchema(actor=actor).load(tool_data, transient=True).to_pydantic()
+            pydantic_tool = self.tool_manager.create_or_update_tool(pydantic_tool, actor=actor)
+            pydantic_agent = self.attach_tool(agent_id=pydantic_agent.id, tool_id=pydantic_tool.id, actor=actor)
+
+        return pydantic_agent
 
     # ======================================================================================================================
     # Per Agent Environment Variable Management
@@ -527,42 +543,43 @@ class AgentManager:
                 model=agent_state.llm_config.model,
                 openai_message_dict={"role": "system", "content": new_system_message_str},
             )
+            # TODO: This seems kind of silly, why not just update the message?
             message = self.message_manager.create_message(message, actor=actor)
             message_ids = [message.id] + agent_state.message_ids[1:]  # swap index 0 (system)
-            return self._set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
+            return self.set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
         else:
             return agent_state
 
     @enforce_types
-    def _set_in_context_messages(self, agent_id: str, message_ids: List[str], actor: PydanticUser) -> PydanticAgentState:
+    def set_in_context_messages(self, agent_id: str, message_ids: List[str], actor: PydanticUser) -> PydanticAgentState:
         return self.update_agent(agent_id=agent_id, agent_update=UpdateAgent(message_ids=message_ids), actor=actor)
 
     @enforce_types
     def trim_older_in_context_messages(self, num: int, agent_id: str, actor: PydanticUser) -> PydanticAgentState:
         message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids
         new_messages = [message_ids[0]] + message_ids[num:]  # 0 is system message
-        return self._set_in_context_messages(agent_id=agent_id, message_ids=new_messages, actor=actor)
+        return self.set_in_context_messages(agent_id=agent_id, message_ids=new_messages, actor=actor)
 
     @enforce_types
     def trim_all_in_context_messages_except_system(self, agent_id: str, actor: PydanticUser) -> PydanticAgentState:
         message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids
         # TODO: How do we know this?
         new_messages = [message_ids[0]]  # 0 is system message
-        return self._set_in_context_messages(agent_id=agent_id, message_ids=new_messages, actor=actor)
+        return self.set_in_context_messages(agent_id=agent_id, message_ids=new_messages, actor=actor)
 
     @enforce_types
     def prepend_to_in_context_messages(self, messages: List[PydanticMessage], agent_id: str, actor: PydanticUser) -> PydanticAgentState:
         message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids
         new_messages = self.message_manager.create_many_messages(messages, actor=actor)
         message_ids = [message_ids[0]] + [m.id for m in new_messages] + message_ids[1:]
-        return self._set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
+        return self.set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
 
     @enforce_types
     def append_to_in_context_messages(self, messages: List[PydanticMessage], agent_id: str, actor: PydanticUser) -> PydanticAgentState:
         messages = self.message_manager.create_many_messages(messages, actor=actor)
         message_ids = self.get_agent_by_id(agent_id=agent_id, actor=actor).message_ids or []
         message_ids += [m.id for m in messages]
-        return self._set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
+        return self.set_in_context_messages(agent_id=agent_id, message_ids=message_ids, actor=actor)
 
     @enforce_types
     def reset_messages(self, agent_id: str, actor: PydanticUser, add_default_initial_messages: bool = False) -> PydanticAgentState:
@@ -613,6 +630,40 @@ class AgentManager:
             )
             return self.append_to_in_context_messages([system_message], agent_id=agent_state.id, actor=actor)
 
+    # TODO: I moved this from agent.py - replace all mentions of this with the agent_manager version
+    @enforce_types
+    def update_memory_if_changed(self, agent_id: str, new_memory: Memory, actor: PydanticUser) -> PydanticAgentState:
+        """
+        Update internal memory object and system prompt if there have been modifications.
+
+        Args:
+            new_memory (Memory): the new memory object to compare to the current memory object
+
+        Returns:
+            modified (bool): whether the memory was updated
+        """
+        agent_state = self.get_agent_by_id(agent_id=agent_id, actor=actor)
+        if agent_state.memory.compile() != new_memory.compile():
+            # update the blocks (LRW) in the DB
+            for label in agent_state.memory.list_block_labels():
+                updated_value = new_memory.get_block(label).value
+                if updated_value != agent_state.memory.get_block(label).value:
+                    # update the block if it's changed
+                    block_id = agent_state.memory.get_block(label).id
+                    block = self.block_manager.update_block(block_id=block_id, block_update=BlockUpdate(value=updated_value), actor=actor)
+
+            # refresh memory from DB (using block ids)
+            agent_state.memory = Memory(
+                blocks=[self.block_manager.get_block_by_id(block.id, actor=actor) for block in agent_state.memory.get_blocks()]
+            )
+
+            # NOTE: don't do this since re-buildin the memory is handled at the start of the step
+            # rebuild memory - this records the last edited timestamp of the memory
+            # TODO: pass in update timestamp from block edit time
+            agent_state = self.rebuild_system_prompt(agent_id=agent_id, actor=actor)
+
+        return agent_state
+
     # ======================================================================================================================
     # Source Management
     # ======================================================================================================================
@@ -630,6 +681,7 @@ class AgentManager:
             ValueError: If either agent or source doesn't exist
             IntegrityError: If the source is already attached to the agent
         """
+
         with self.session_maker() as session:
             # Verify both agent and source exist and user has permission to access them
             agent = AgentModel.read(db_session=session, identifier=agent_id, actor=actor)
@@ -647,7 +699,27 @@ class AgentManager:
 
             # Commit the changes
             agent.update(session, actor=actor)
-            return agent.to_pydantic()
+
+        # Add system messsage alert to agent
+        self.append_system_message(
+            agent_id=agent_id,
+            content=DATA_SOURCE_ATTACH_ALERT,
+            actor=actor,
+        )
+
+        return agent.to_pydantic()
+
+    @enforce_types
+    def append_system_message(self, agent_id: str, content: str, actor: PydanticUser):
+
+        # get the agent
+        agent = self.get_agent_by_id(agent_id=agent_id, actor=actor)
+        message = PydanticMessage.dict_to_message(
+            agent_id=agent.id, user_id=actor.id, model=agent.llm_config.model, openai_message_dict={"role": "system", "content": content}
+        )
+
+        # update agent in-context message IDs
+        self.append_to_in_context_messages(messages=[message], agent_id=agent_id, actor=actor)
 
     @enforce_types
     def list_attached_sources(self, agent_id: str, actor: PydanticUser) -> List[PydanticSource]:

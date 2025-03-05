@@ -8,7 +8,7 @@ from openai.types.chat.chat_completion_message_tool_call import Function as Open
 from sqlalchemy.exc import IntegrityError
 
 from letta.config import LettaConfig
-from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS, MULTI_AGENT_TOOLS
+from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS, LETTA_TOOL_EXECUTION_DIR, MULTI_AGENT_TOOLS
 from letta.embeddings import embedding_model
 from letta.functions.functions import derive_openai_json_schema, parse_source_code
 from letta.orm import Base
@@ -2150,6 +2150,30 @@ def test_delete_source(server: SyncServer, default_user):
     assert len(sources) == 0
 
 
+def test_delete_attached_source(server: SyncServer, sarah_agent, default_user):
+    """Test deleting a source."""
+    source_pydantic = PydanticSource(
+        name="To Delete", description="This source will be deleted.", embedding_config=DEFAULT_EMBEDDING_CONFIG
+    )
+    source = server.source_manager.create_source(source=source_pydantic, actor=default_user)
+
+    server.agent_manager.attach_source(agent_id=sarah_agent.id, source_id=source.id, actor=default_user)
+
+    # Delete the source
+    deleted_source = server.source_manager.delete_source(source_id=source.id, actor=default_user)
+
+    # Assertions to verify deletion
+    assert deleted_source.id == source.id
+
+    # Verify that the source no longer appears in list_sources
+    sources = server.source_manager.list_sources(actor=default_user)
+    assert len(sources) == 0
+
+    # Verify that agent is not deleted
+    agent = server.agent_manager.get_agent_by_id(sarah_agent.id, actor=default_user)
+    assert agent is not None
+
+
 def test_list_sources(server: SyncServer, default_user):
     """Test listing sources with pagination."""
     # Create multiple sources
@@ -2316,7 +2340,7 @@ def test_create_local_sandbox_config_defaults(server: SyncServer, default_user):
     # Assertions
     assert created_config.type == SandboxType.LOCAL
     assert created_config.get_local_config() == sandbox_config_create.config
-    assert created_config.get_local_config().sandbox_dir in {"~/.letta", tool_settings.local_sandbox_dir}
+    assert created_config.get_local_config().sandbox_dir in {LETTA_TOOL_EXECUTION_DIR, tool_settings.local_sandbox_dir}
     assert created_config.organization_id == default_user.organization_id
 
 
@@ -3099,6 +3123,10 @@ def test_job_usage_stats_add_and_get(server: SyncServer, default_job, default_us
     assert usage_stats.prompt_tokens == 50
     assert usage_stats.total_tokens == 150
 
+    # get steps
+    steps = job_manager.get_job_steps(job_id=default_job.id, actor=default_user)
+    assert len(steps) == 1
+
 
 def test_job_usage_stats_get_no_stats(server: SyncServer, default_job, default_user):
     """Test getting usage statistics for a job with no stats."""
@@ -3111,6 +3139,10 @@ def test_job_usage_stats_get_no_stats(server: SyncServer, default_job, default_u
     assert usage_stats.completion_tokens == 0
     assert usage_stats.prompt_tokens == 0
     assert usage_stats.total_tokens == 0
+
+    # get steps
+    steps = job_manager.get_job_steps(job_id=default_job.id, actor=default_user)
+    assert len(steps) == 0
 
 
 def test_job_usage_stats_add_multiple(server: SyncServer, default_job, default_user):
@@ -3156,6 +3188,10 @@ def test_job_usage_stats_add_multiple(server: SyncServer, default_job, default_u
     assert usage_stats.prompt_tokens == 150
     assert usage_stats.total_tokens == 450
     assert usage_stats.step_count == 2
+
+    # get steps
+    steps = job_manager.get_job_steps(job_id=default_job.id, actor=default_user)
+    assert len(steps) == 2
 
 
 def test_job_usage_stats_get_nonexistent_job(server: SyncServer, default_user):
