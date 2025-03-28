@@ -7,6 +7,7 @@ from letta.constants import DEFAULT_EMBEDDING_CHUNK_SIZE
 from letta.schemas.block import CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.environment_variables import AgentEnvironmentVariable
+from letta.schemas.group import Group
 from letta.schemas.letta_base import OrmMetadataBase
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import Memory
@@ -90,6 +91,8 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
         description="If set to True, the agent will not remember previous messages (though the agent will still retain state via core memory blocks and archival/recall memory). Not recommended unless you have an advanced use case.",
     )
 
+    multi_agent_group: Optional[Group] = Field(None, description="The multi-agent group that this agent manages")
+
     def get_agent_env_vars_as_dict(self) -> Dict[str, str]:
         # Get environment variables for this agent specifically
         per_agent_env_vars = {}
@@ -144,6 +147,14 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
     )
     context_window_limit: Optional[int] = Field(None, description="The context window limit used by the agent.")
     embedding_chunk_size: Optional[int] = Field(DEFAULT_EMBEDDING_CHUNK_SIZE, description="The embedding chunk size used by the agent.")
+    max_tokens: Optional[int] = Field(
+        None,
+        description="The maximum number of tokens to generate, including reasoning step. If not set, the model will use its default value.",
+    )
+    max_reasoning_tokens: Optional[int] = Field(
+        None, description="The maximum number of tokens to generate for reasoning step. If not set, the model will use its default value."
+    )
+    enable_reasoner: Optional[bool] = Field(False, description="Whether to enable internal extended thinking step for a reasoner model.")
     from_template: Optional[str] = Field(None, description="The template id used to configure the agent")
     template: bool = Field(False, description="Whether the agent is a template")
     project: Optional[str] = Field(
@@ -232,6 +243,14 @@ class UpdateAgent(BaseModel):
     message_buffer_autoclear: Optional[bool] = Field(
         None,
         description="If set to True, the agent will not remember previous messages (though the agent will still retain state via core memory blocks and archival/recall memory). Not recommended unless you have an advanced use case.",
+    )
+    model: Optional[str] = Field(
+        None,
+        description="The LLM configuration handle used by the agent, specified in the format "
+        "provider/model-name, as an alternative to specifying llm_config.",
+    )
+    embedding: Optional[str] = Field(
+        None, description="The embedding configuration handle used by the agent, specified in the format provider/model-name."
     )
 
     class Config:

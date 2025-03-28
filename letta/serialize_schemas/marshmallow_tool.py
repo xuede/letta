@@ -1,6 +1,6 @@
 from letta.orm import Tool
 from letta.schemas.tool import Tool as PydanticTool
-from letta.serialize_schemas.base import BaseSchema
+from letta.serialize_schemas.marshmallow_base import BaseSchema
 
 
 class SerializedToolSchema(BaseSchema):
@@ -12,4 +12,4 @@ class SerializedToolSchema(BaseSchema):
 
     class Meta(BaseSchema.Meta):
         model = Tool
-        exclude = BaseSchema.Meta.exclude
+        exclude = BaseSchema.Meta.exclude + ("is_deleted",)

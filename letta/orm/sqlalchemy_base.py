@@ -69,7 +69,7 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         join_model: Optional[Base] = None,
         join_conditions: Optional[Union[Tuple, List]] = None,
         identifier_keys: Optional[List[str]] = None,
-        identifier_id: Optional[str] = None,
+        identity_id: Optional[str] = None,
         **kwargs,
     ) -> List["SqlalchemyBase"]:
         """
@@ -139,18 +139,18 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
                 else:
                     # Match ANY tag - use join and filter
                     query = (
-                        query.join(cls.tags).filter(cls.tags.property.mapper.class_.tag.in_(tags)).group_by(cls.id)
+                        query.join(cls.tags).filter(cls.tags.property.mapper.class_.tag.in_(tags)).distinct(cls.id).order_by(cls.id)
                     )  # Deduplicate results
 
-                # Group by primary key and all necessary columns to avoid JSON comparison
-                query = query.group_by(cls.id)
+                # select distinct primary key
+                query = query.distinct(cls.id).order_by(cls.id)
 
             if identifier_keys and hasattr(cls, "identities"):
                 query = query.join(cls.identities).filter(cls.identities.property.mapper.class_.identifier_key.in_(identifier_keys))
 
-            # given the identifier_id, we can find within the agents table any agents that have the identifier_id in their identity_ids
-            if identifier_id and hasattr(cls, "identities"):
-                query = query.join(cls.identities).filter(cls.identities.property.mapper.class_.id == identifier_id)
+            # given the identity_id, we can find within the agents table any agents that have the identity_id in their identity_ids
+            if identity_id and hasattr(cls, "identities"):
+                query = query.join(cls.identities).filter(cls.identities.property.mapper.class_.id == identity_id)
 
             # Apply filtering logic from kwargs
             for key, value in kwargs.items():
@@ -286,7 +286,45 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         Raises:
             NoResultFound: if the object is not found
         """
-        logger.debug(f"Reading {cls.__name__} with ID: {identifier} with actor={actor}")
+        # this is ok because read_multiple will check if the
+        identifiers = [] if identifier is None else [identifier]
+        found = cls.read_multiple(db_session, identifiers, actor, access, access_type, **kwargs)
+        if len(found) == 0:
+            # for backwards compatibility.
+            conditions = []
+            if identifier:
+                conditions.append(f"id={identifier}")
+            if actor:
+                conditions.append(f"access level in {access} for {actor}")
+            if hasattr(cls, "is_deleted"):
+                conditions.append("is_deleted=False")
+            raise NoResultFound(f"{cls.__name__} not found with {', '.join(conditions if conditions else ['no conditions'])}")
+        return found[0]
+
+    @classmethod
+    @handle_db_timeout
+    def read_multiple(
+        cls,
+        db_session: "Session",
+        identifiers: List[str] = [],
+        actor: Optional["User"] = None,
+        access: Optional[List[Literal["read", "write", "admin"]]] = ["read"],
+        access_type: AccessType = AccessType.ORGANIZATION,
+        **kwargs,
+    ) -> List["SqlalchemyBase"]:
+        """The primary accessor for ORM record(s)
+        Args:
+            db_session: the database session to use when retrieving the record
+            identifiers: a list of identifiers of the records to read, can be the id string or the UUID object for backwards compatibility
+            actor: if specified, results will be scoped only to records the user is able to access
+            access: if actor is specified, records will be filtered to the minimum permission level for the actor
+            kwargs: additional arguments to pass to the read, used for more complex objects
+        Returns:
+            The matching object
+        Raises:
+            NoResultFound: if the object is not found
+        """
+        logger.debug(f"Reading {cls.__name__} with ID(s): {identifiers} with actor={actor}")
 
         # Start the query
         query = select(cls)
@@ -294,9 +332,9 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         query_conditions = []
 
         # If an identifier is provided, add it to the query conditions
-        if identifier is not None:
-            query = query.where(cls.id == identifier)
-            query_conditions.append(f"id='{identifier}'")
+        if len(identifiers) > 0:
+            query = query.where(cls.id.in_(identifiers))
+            query_conditions.append(f"id='{identifiers}'")
 
         if kwargs:
             query = query.filter_by(**kwargs)
@@ -309,12 +347,27 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         if hasattr(cls, "is_deleted"):
             query = query.where(cls.is_deleted == False)
             query_conditions.append("is_deleted=False")
-        if found := db_session.execute(query).scalar():
-            return found
+
+        results = db_session.execute(query).scalars().all()
+        if results:  # if empty list a.k.a. no results
+            if len(identifiers) > 0:
+                # find which identifiers were not found
+                # only when identifier length is greater than 0 (so it was used in the actual query)
+                identifier_set = set(identifiers)
+                results_set = set(map(lambda obj: obj.id, results))
+
+                # we log a warning message if any of the queried IDs were not found.
+                # TODO: should we error out instead?
+                if identifier_set != results_set:
+                    # Construct a detailed error message based on query conditions
+                    conditions_str = ", ".join(query_conditions) if query_conditions else "no specific conditions"
+                    logger.debug(f"{cls.__name__} not found with {conditions_str}. Queried ids: {identifier_set}, Found ids: {results_set}")
+            return results
 
         # Construct a detailed error message based on query conditions
         conditions_str = ", ".join(query_conditions) if query_conditions else "no specific conditions"
-        raise NoResultFound(f"{cls.__name__} not found with {conditions_str}")
+        logger.debug(f"{cls.__name__} not found with {conditions_str}")
+        return []
 
     @handle_db_timeout
     def create(self, db_session: "Session", actor: Optional["User"] = None) -> "SqlalchemyBase":
@@ -330,6 +383,50 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
                 return self
         except (DBAPIError, IntegrityError) as e:
             self._handle_dbapi_error(e)
+
+    @classmethod
+    @handle_db_timeout
+    def batch_create(cls, items: List["SqlalchemyBase"], db_session: "Session", actor: Optional["User"] = None) -> List["SqlalchemyBase"]:
+        """
+        Create multiple records in a single transaction for better performance.
+
+        Args:
+            items: List of model instances to create
+            db_session: SQLAlchemy session
+            actor: Optional user performing the action
+
+        Returns:
+            List of created model instances
+        """
+        logger.debug(f"Batch creating {len(items)} {cls.__name__} items with actor={actor}")
+
+        if not items:
+            return []
+
+        # Set created/updated by fields if actor is provided
+        if actor:
+            for item in items:
+                item._set_created_and_updated_by_fields(actor.id)
+
+        try:
+            with db_session as session:
+                session.add_all(items)
+                session.flush()  # Flush to generate IDs but don't commit yet
+
+                # Collect IDs to fetch the complete objects after commit
+                item_ids = [item.id for item in items]
+
+                session.commit()
+
+                # Re-query the objects to get them with relationships loaded
+                query = select(cls).where(cls.id.in_(item_ids))
+                if hasattr(cls, "created_at"):
+                    query = query.order_by(cls.created_at)
+
+                return list(session.execute(query).scalars())
+
+        except (DBAPIError, IntegrityError) as e:
+            cls._handle_dbapi_error(e)
 
     @handle_db_timeout
     def delete(self, db_session: "Session", actor: Optional["User"] = None) -> "SqlalchemyBase":
@@ -508,10 +605,13 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         raise NotImplementedError("Sqlalchemy models must declare a __pydantic_model__ property to be convertable.")
 
     def to_pydantic(self) -> "BaseModel":
-        """converts to the basic pydantic model counterpart"""
-        model = self.__pydantic_model__.model_validate(self)
-        if hasattr(self, "metadata_"):
-            model.metadata = self.metadata_
+        """Converts the SQLAlchemy model to its corresponding Pydantic model."""
+        model = self.__pydantic_model__.model_validate(self, from_attributes=True)
+
+        # Explicitly map metadata_ to metadata in Pydantic model
+        if hasattr(self, "metadata_") and hasattr(model, "metadata_"):
+            setattr(model, "metadata_", self.metadata_)  # Ensures correct assignment
+
         return model
 
     def pretty_print_columns(self) -> str:

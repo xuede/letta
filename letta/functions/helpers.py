@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 import threading
 from random import uniform
 from typing import Any, Dict, List, Optional, Type, Union
@@ -17,7 +19,6 @@ from letta.schemas.message import Message, MessageCreate
 from letta.schemas.user import User
 from letta.server.rest_api.utils import get_letta_server
 from letta.settings import settings
-from letta.utils import log_telemetry
 
 
 # TODO: This is kind of hacky, as this is used to search up the action later on composio's side
@@ -46,6 +47,20 @@ def generate_composio_action_from_func_name(func_name: str) -> str:
         composio action name
     """
     return func_name.upper()
+
+
+# TODO needed?
+def generate_mcp_tool_wrapper(mcp_tool_name: str) -> tuple[str, str]:
+
+    wrapper_function_str = f"""\
+def {mcp_tool_name}(**kwargs):
+    raise RuntimeError("Something went wrong - we should never be using the persisted source code for MCP. Please reach out to Letta team")
+"""
+
+    # Compile safety check
+    assert_code_gen_compilable(wrapper_function_str.strip())
+
+    return mcp_tool_name, wrapper_function_str.strip()
 
 
 def generate_composio_tool_wrapper(action_name: str) -> tuple[str, str]:
@@ -79,7 +94,7 @@ def execute_composio_action(
 
     entity_id = entity_id or os.getenv(COMPOSIO_ENTITY_ENV_VAR_KEY, DEFAULT_ENTITY_ID)
     try:
-        composio_toolset = ComposioToolSet(api_key=api_key, entity_id=entity_id)
+        composio_toolset = ComposioToolSet(api_key=api_key, entity_id=entity_id, lock=False)
         response = composio_toolset.execute_action(action=action_name, params=args)
     except ApiKeyNotProvidedError:
         raise RuntimeError(
@@ -372,15 +387,9 @@ async def async_send_message_with_retries(
     logging_prefix: Optional[str] = None,
 ) -> str:
     logging_prefix = logging_prefix or "[async_send_message_with_retries]"
-    log_telemetry(sender_agent.logger, f"async_send_message_with_retries start", target_agent_id=target_agent_id)
 
     for attempt in range(1, max_retries + 1):
         try:
-            log_telemetry(
-                sender_agent.logger,
-                f"async_send_message_with_retries -> asyncio wait for send_message_to_agent_no_stream start",
-                target_agent_id=target_agent_id,
-            )
             response = await asyncio.wait_for(
                 send_message_to_agent_no_stream(
                     server=server,
@@ -390,24 +399,15 @@ async def async_send_message_with_retries(
                 ),
                 timeout=timeout,
             )
-            log_telemetry(
-                sender_agent.logger,
-                f"async_send_message_with_retries -> asyncio wait for send_message_to_agent_no_stream finish",
-                target_agent_id=target_agent_id,
-            )
 
             # Then parse out the assistant message
             assistant_message = parse_letta_response_for_assistant_message(target_agent_id, response)
             if assistant_message:
                 sender_agent.logger.info(f"{logging_prefix} - {assistant_message}")
-                log_telemetry(
-                    sender_agent.logger, f"async_send_message_with_retries finish with assistant message", target_agent_id=target_agent_id
-                )
                 return assistant_message
             else:
                 msg = f"(No response from agent {target_agent_id})"
                 sender_agent.logger.info(f"{logging_prefix} - {msg}")
-                log_telemetry(sender_agent.logger, f"async_send_message_with_retries finish no response", target_agent_id=target_agent_id)
                 return msg
 
         except asyncio.TimeoutError:
@@ -425,12 +425,6 @@ async def async_send_message_with_retries(
             await asyncio.sleep(backoff)
         else:
             sender_agent.logger.error(f"{logging_prefix} - Fatal error: {error_msg}")
-            log_telemetry(
-                sender_agent.logger,
-                f"async_send_message_with_retries finish fatal error",
-                target_agent_id=target_agent_id,
-                error_msg=error_msg,
-            )
             raise Exception(error_msg)
 
 
@@ -518,8 +512,32 @@ def fire_and_forget_send_to_agent(
         run_in_background_thread(background_task())
 
 
-async def _send_message_to_agents_matching_all_tags_async(sender_agent: "Agent", message: str, tags: List[str]) -> List[str]:
-    log_telemetry(sender_agent.logger, "_send_message_to_agents_matching_all_tags_async start", message=message, tags=tags)
+async def _send_message_to_agents_matching_tags_async(
+    sender_agent: "Agent", server: "SyncServer", messages: List[MessageCreate], matching_agents: List["AgentState"]
+) -> List[str]:
+    async def _send_single(agent_state):
+        return await async_send_message_with_retries(
+            server=server,
+            sender_agent=sender_agent,
+            target_agent_id=agent_state.id,
+            messages=messages,
+            max_retries=3,
+            timeout=settings.multi_agent_send_message_timeout,
+        )
+
+    tasks = [asyncio.create_task(_send_single(agent_state)) for agent_state in matching_agents]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    final = []
+    for r in results:
+        if isinstance(r, Exception):
+            final.append(str(r))
+        else:
+            final.append(r)
+
+    return final
+
+
+async def _send_message_to_all_agents_in_group_async(sender_agent: "Agent", message: str) -> List[str]:
     server = get_letta_server()
 
     augmented_message = (
@@ -528,10 +546,8 @@ async def _send_message_to_agents_matching_all_tags_async(sender_agent: "Agent",
         f"{message}"
     )
 
-    # Retrieve up to 100 matching agents
-    log_telemetry(sender_agent.logger, "_send_message_to_agents_matching_all_tags_async listing agents start", message=message, tags=tags)
-    matching_agents = server.agent_manager.list_agents(actor=sender_agent.user, tags=tags, match_all_tags=True, limit=100)
-    log_telemetry(sender_agent.logger, "_send_message_to_agents_matching_all_tags_async  listing agents finish", message=message, tags=tags)
+    worker_agents_ids = sender_agent.agent_state.multi_agent_group.agent_ids
+    worker_agents = [server.agent_manager.get_agent_by_id(agent_id=agent_id, actor=sender_agent.user) for agent_id in worker_agents_ids]
 
     # Create a system message
     messages = [MessageCreate(role=MessageRole.system, content=augmented_message, name=sender_agent.agent_state.name)]
@@ -550,7 +566,7 @@ async def _send_message_to_agents_matching_all_tags_async(sender_agent: "Agent",
                 timeout=settings.multi_agent_send_message_timeout,
             )
 
-    tasks = [asyncio.create_task(_send_single(agent_state)) for agent_state in matching_agents]
+    tasks = [asyncio.create_task(_send_single(agent_state)) for agent_state in worker_agents]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     final = []
     for r in results:
@@ -559,7 +575,6 @@ async def _send_message_to_agents_matching_all_tags_async(sender_agent: "Agent",
         else:
             final.append(r)
 
-    log_telemetry(sender_agent.logger, "_send_message_to_agents_matching_all_tags_async finish", message=message, tags=tags)
     return final
 
 
@@ -638,3 +653,27 @@ def _get_field_type(field_schema: Dict[str, Any], nested_models: Dict[str, Type[
         else:
             return Union[tuple(types)]
     raise ValueError(f"Unable to convert pydantic field schema to type: {field_schema}")
+
+
+def extract_send_message_from_steps_messages(
+    steps_messages: List[List[Message]],
+    agent_send_message_tool_name: str = DEFAULT_MESSAGE_TOOL,
+    agent_send_message_tool_kwarg: str = DEFAULT_MESSAGE_TOOL_KWARG,
+    logger: Optional[logging.Logger] = None,
+) -> List[str]:
+    extracted_messages = []
+
+    for step in steps_messages:
+        for message in step:
+            if message.tool_calls:
+                for tool_call in message.tool_calls:
+                    if tool_call.function.name == agent_send_message_tool_name:
+                        try:
+                            # Parse arguments to extract the "message" field
+                            arguments = json.loads(tool_call.function.arguments)
+                            if agent_send_message_tool_kwarg in arguments:
+                                extracted_messages.append(arguments[agent_send_message_tool_kwarg])
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse arguments for tool call: {tool_call.id}")
+
+    return extracted_messages

@@ -18,7 +18,7 @@ from letta.errors import ContextWindowExceededError, RateLimitExceededError
 from letta.helpers.datetime_helpers import get_utc_time
 from letta.log import get_logger
 from letta.schemas.enums import MessageRole
-from letta.schemas.letta_message import TextContent
+from letta.schemas.letta_message_content import TextContent
 from letta.schemas.message import Message
 from letta.schemas.usage import LettaUsageStatistics
 from letta.schemas.user import User
@@ -80,7 +80,7 @@ async def sse_async_generator(
                     err_msg = f"Expected LettaUsageStatistics, got {type(usage)}"
                     logger.error(err_msg)
                     raise ValueError(err_msg)
-                yield sse_formatter(usage.model_dump())
+                yield sse_formatter(usage.model_dump(exclude={"steps_messages"}))
 
             except ContextWindowExceededError as e:
                 log_error_to_sentry(e)

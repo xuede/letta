@@ -64,6 +64,8 @@ class BlockManager:
         label: Optional[str] = None,
         is_template: Optional[bool] = None,
         template_name: Optional[str] = None,
+        identifier_keys: Optional[List[str]] = None,
+        identity_id: Optional[str] = None,
         id: Optional[str] = None,
         after: Optional[str] = None,
         limit: Optional[int] = 50,
@@ -81,7 +83,14 @@ class BlockManager:
             if id:
                 filters["id"] = id
 
-            blocks = BlockModel.list(db_session=session, after=after, limit=limit, **filters)
+            blocks = BlockModel.list(
+                db_session=session,
+                after=after,
+                limit=limit,
+                identifier_keys=identifier_keys,
+                identity_id=identity_id,
+                **filters,
+            )
 
             return [block.to_pydantic() for block in blocks]
 
@@ -97,12 +106,14 @@ class BlockManager:
 
     @enforce_types
     def get_all_blocks_by_ids(self, block_ids: List[str], actor: Optional[PydanticUser] = None) -> List[PydanticBlock]:
-        # TODO: We can do this much more efficiently by listing, instead of executing individual queries per block_id
-        blocks = []
-        for block_id in block_ids:
-            block = self.get_block_by_id(block_id, actor=actor)
-            blocks.append(block)
-        return blocks
+        """Retrieve blocks by their names."""
+        with self.session_maker() as session:
+            blocks = list(
+                map(lambda obj: obj.to_pydantic(), BlockModel.read_multiple(db_session=session, identifiers=block_ids, actor=actor))
+            )
+            # backwards compatibility. previous implementation added None for every block not found.
+            blocks.extend([None for _ in range(len(block_ids) - len(blocks))])
+            return blocks
 
     @enforce_types
     def add_default_blocks(self, actor: PydanticUser):

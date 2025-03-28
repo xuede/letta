@@ -26,7 +26,11 @@
     "dev": {
       "executor": "@nxlv/python:run-commands",
       "options": {
-        "command": "poetry run letta server",
+        "commands": [
+          "./otel/start-otel-collector.sh",
+          "poetry run letta server"
+        ],
+        "parallel": true,
         "cwd": "apps/core"
       }
     },

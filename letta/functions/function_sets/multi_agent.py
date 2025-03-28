@@ -1,13 +1,19 @@
 import asyncio
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, List
 
 from letta.functions.helpers import (
-    _send_message_to_agents_matching_all_tags_async,
+    _send_message_to_all_agents_in_group_async,
     execute_send_message_to_agent,
+    extract_send_message_from_steps_messages,
     fire_and_forget_send_to_agent,
 )
+from letta.helpers.message_helper import prepare_input_message_create
 from letta.schemas.enums import MessageRole
 from letta.schemas.message import MessageCreate
+from letta.server.rest_api.utils import get_letta_server
+from letta.settings import settings
 
 if TYPE_CHECKING:
     from letta.agent import Agent
@@ -70,18 +76,86 @@ def send_message_to_agent_async(self: "Agent", message: str, other_agent_id: str
     return "Successfully sent message"
 
 
-def send_message_to_agents_matching_all_tags(self: "Agent", message: str, tags: List[str]) -> List[str]:
+def send_message_to_agents_matching_tags(self: "Agent", message: str, match_all: List[str], match_some: List[str]) -> List[str]:
     """
-    Sends a message to all agents within the same organization that match all of the specified tags. Messages are dispatched in parallel for improved performance, with retries to handle transient issues and timeouts to ensure responsiveness. This function enforces a limit of 100 agents and does not support pagination (cursor-based queries). Each agent must match all specified tags (`match_all_tags=True`) to be included.
+    Sends a message to all agents within the same organization that match the specified tag criteria. Agents must possess *all* of the tags in `match_all` and *at least one* of the tags in `match_some` to receive the message.
 
     Args:
         message (str): The content of the message to be sent to each matching agent.
-        tags (List[str]): A list of tags that an agent must possess to receive the message.
+        match_all (List[str]): A list of tags that an agent must possess to receive the message.
+        match_some (List[str]): A list of tags where an agent must have at least one to qualify.
 
     Returns:
-        List[str]: A list of responses from the agents that matched all tags. Each
-        response corresponds to a single agent. Agents that do not respond will not
-        have an entry in the returned list.
+        List[str]: A list of responses from the agents that matched the filtering criteria. Each
+        response corresponds to a single agent. Agents that do not respond will not have an entry
+        in the returned list.
+    """
+    server = get_letta_server()
+    augmented_message = (
+        f"[Incoming message from external Letta agent - to reply to this message, "
+        f"make sure to use the 'send_message' at the end, and the system will notify the sender of your response] "
+        f"{message}"
+    )
+
+    # Find matching agents
+    matching_agents = server.agent_manager.list_agents_matching_tags(actor=self.user, match_all=match_all, match_some=match_some)
+    if not matching_agents:
+        return []
+
+    def process_agent(agent_id: str) -> str:
+        """Loads an agent, formats the message, and executes .step()"""
+        actor = self.user  # Ensure correct actor context
+        agent = server.load_agent(agent_id=agent_id, interface=None, actor=actor)
+
+        # Prepare the message
+        messages = [MessageCreate(role=MessageRole.system, content=augmented_message, name=self.agent_state.name)]
+        input_messages = [prepare_input_message_create(m, agent_id) for m in messages]
+
+        # Run .step() and return the response
+        usage_stats = agent.step(
+            messages=input_messages,
+            chaining=True,
+            max_chaining_steps=None,
+            stream=False,
+            skip_verify=True,
+            metadata=None,
+            put_inner_thoughts_first=True,
+        )
+
+        send_messages = extract_send_message_from_steps_messages(usage_stats.steps_messages, logger=agent.logger)
+        response_data = {
+            "agent_id": agent_id,
+            "response_messages": send_messages if send_messages else ["<no response>"],
+        }
+
+        return json.dumps(response_data, indent=2)
+
+    # Use ThreadPoolExecutor for parallel execution
+    results = []
+    with ThreadPoolExecutor(max_workers=settings.multi_agent_concurrent_sends) as executor:
+        future_to_agent = {executor.submit(process_agent, agent_state.id): agent_state for agent_state in matching_agents}
+
+        for future in as_completed(future_to_agent):
+            try:
+                results.append(future.result())  # Collect results
+            except Exception as e:
+                # Log or handle failure for specific agents if needed
+                self.logger.exception(f"Error processing agent {future_to_agent[future]}: {e}")
+
+    return results
+
+
+def send_message_to_all_agents_in_group(self: "Agent", message: str) -> List[str]:
+    """
+    Sends a message to all agents within the same multi-agent group.
+
+    Args:
+        message (str): The content of the message to be sent to each matching agent.
+
+    Returns:
+        List[str]: A list of responses from the agents that matched the filtering criteria. Each
+        response corresponds to a single agent. Agents that do not respond will not have an entry
+        in the returned list.
     """
 
-    return asyncio.run(_send_message_to_agents_matching_all_tags_async(self, message, tags))
+    return asyncio.run(_send_message_to_all_agents_in_group_async(self, message))

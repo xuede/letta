@@ -662,7 +662,9 @@ def _test_get_messages_letta_format(
             print(f"Error: letta_message_index out of range. Expected more letta_messages for message {i}: {message.role}")
             raise ValueError(f"Mismatch in letta_messages length. Index: {letta_message_index}, Length: {len(letta_messages)}")
 
-        print(f"Processing message {i}: {message.role}, {message.text[:50] if message.text else 'null'}")
+        print(
+            f"Processing message {i}: {message.role}, {message.content[0].text[:50] if message.content and len(message.content) == 1 else 'null'}"
+        )
         while letta_message_index < len(letta_messages):
             letta_message = letta_messages[letta_message_index]
 
@@ -684,14 +686,14 @@ def _test_get_messages_letta_format(
                                 break
                             letta_message = letta_messages[letta_message_index]
 
-                    if message.text:
+                    if message.content[0].text:
                         assert isinstance(letta_message, ReasoningMessage)
                         letta_message_index += 1
                     else:
                         assert message.tool_calls is not None
 
                 else:  # Non-reverse handling
-                    if message.text:
+                    if message.content[0].text:
                         assert isinstance(letta_message, ReasoningMessage)
                         letta_message_index += 1
                         if letta_message_index >= len(letta_messages):
@@ -714,17 +716,17 @@ def _test_get_messages_letta_format(
 
             elif message.role == MessageRole.user:
                 assert isinstance(letta_message, UserMessage)
-                assert unpack_message(message.text) == letta_message.content
+                assert unpack_message(message.content[0].text) == letta_message.content
                 letta_message_index += 1
 
             elif message.role == MessageRole.system:
                 assert isinstance(letta_message, SystemMessage)
-                assert message.text == letta_message.content
+                assert message.content[0].text == letta_message.content
                 letta_message_index += 1
 
             elif message.role == MessageRole.tool:
                 assert isinstance(letta_message, ToolReturnMessage)
-                assert message.text == letta_message.tool_return
+                assert message.content[0].text == letta_message.tool_return
                 letta_message_index += 1
 
             else:
@@ -796,22 +798,25 @@ def ingest(message: str):
 '''
 
 
-def test_tool_run(server, mock_e2b_api_key_none, user, agent_id):
-    """Test that the server can run tools"""
+import pytest
 
+
+def test_tool_run_basic(server, mock_e2b_api_key_none, user):
+    """Test running a simple tool from source"""
     result = server.run_tool_from_source(
         actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE,
         tool_source_type="python",
         tool_args={"message": "Hello, world!"},
-        # tool_name="ingest",
     )
-    print(result)
     assert result.status == "success"
-    assert result.tool_return == "Ingested message Hello, world!", result.tool_return
+    assert result.tool_return == "Ingested message Hello, world!"
     assert not result.stdout
     assert not result.stderr
 
+
+def test_tool_run_with_env_var(server, mock_e2b_api_key_none, user):
+    """Test running a tool that uses an environment variable"""
     result = server.run_tool_from_source(
         actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE_WITH_ENV_VAR,
@@ -819,56 +824,45 @@ def test_tool_run(server, mock_e2b_api_key_none, user, agent_id):
         tool_args={},
         tool_env_vars={"secret": "banana"},
     )
-    print(result)
     assert result.status == "success"
-    assert result.tool_return == "banana", result.tool_return
+    assert result.tool_return == "banana"
     assert not result.stdout
     assert not result.stderr
 
-    result = server.run_tool_from_source(
-        actor=user,
-        tool_source=EXAMPLE_TOOL_SOURCE,
-        tool_source_type="python",
-        tool_args={"message": "Well well well"},
-        # tool_name="ingest",
-    )
-    print(result)
-    assert result.status == "success"
-    assert result.tool_return == "Ingested message Well well well", result.tool_return
-    assert not result.stdout
-    assert not result.stderr
 
+def test_tool_run_invalid_args(server, mock_e2b_api_key_none, user):
+    """Test running a tool with incorrect arguments"""
     result = server.run_tool_from_source(
         actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE,
         tool_source_type="python",
         tool_args={"bad_arg": "oh no"},
-        # tool_name="ingest",
     )
-    print(result)
     assert result.status == "error"
-    assert "Error" in result.tool_return, result.tool_return
-    assert "missing 1 required positional argument" in result.tool_return, result.tool_return
+    assert "Error" in result.tool_return
+    assert "missing 1 required positional argument" in result.tool_return
     assert not result.stdout
     assert result.stderr
     assert "missing 1 required positional argument" in result.stderr[0]
 
-    # Test that we can still pull the tool out by default (pulls that last tool in the source)
+
+def test_tool_run_with_distractor(server, mock_e2b_api_key_none, user):
+    """Test running a tool with a distractor function in the source"""
     result = server.run_tool_from_source(
         actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE_WITH_DISTRACTOR,
         tool_source_type="python",
         tool_args={"message": "Well well well"},
-        # tool_name="ingest",
     )
-    print(result)
     assert result.status == "success"
-    assert result.tool_return == "Ingested message Well well well", result.tool_return
+    assert result.tool_return == "Ingested message Well well well"
     assert result.stdout
     assert "I'm a distractor" in result.stdout[0]
     assert not result.stderr
 
-    # Test that we can pull the tool out by name
+
+def test_tool_run_explicit_tool_name(server, mock_e2b_api_key_none, user):
+    """Test selecting a tool by name when multiple tools exist in the source"""
     result = server.run_tool_from_source(
         actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE_WITH_DISTRACTOR,
@@ -876,14 +870,15 @@ def test_tool_run(server, mock_e2b_api_key_none, user, agent_id):
         tool_args={"message": "Well well well"},
         tool_name="ingest",
     )
-    print(result)
     assert result.status == "success"
-    assert result.tool_return == "Ingested message Well well well", result.tool_return
+    assert result.tool_return == "Ingested message Well well well"
     assert result.stdout
     assert "I'm a distractor" in result.stdout[0]
     assert not result.stderr
 
-    # Test that we can pull a different tool out by name
+
+def test_tool_run_util_function(server, mock_e2b_api_key_none, user):
+    """Test selecting a utility function that does not return anything meaningful"""
     result = server.run_tool_from_source(
         actor=user,
         tool_source=EXAMPLE_TOOL_SOURCE_WITH_DISTRACTOR,
@@ -891,11 +886,41 @@ def test_tool_run(server, mock_e2b_api_key_none, user, agent_id):
         tool_args={},
         tool_name="util_do_nothing",
     )
-    print(result)
     assert result.status == "success"
-    assert result.tool_return == str(None), result.tool_return
+    assert result.tool_return == str(None)
     assert result.stdout
     assert "I'm a distractor" in result.stdout[0]
+    assert not result.stderr
+
+
+def test_tool_run_with_explicit_json_schema(server, mock_e2b_api_key_none, user):
+    """Test overriding the autogenerated JSON schema with an explicit one"""
+    explicit_json_schema = {
+        "name": "ingest",
+        "description": "Blah blah blah.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "The message to ingest into the system."},
+                "request_heartbeat": {
+                    "type": "boolean",
+                    "description": "Request an immediate heartbeat after function execution. Set to `True` if you want to send a follow-up message or run a follow-up function.",
+                },
+            },
+            "required": ["message", "request_heartbeat"],
+        },
+    }
+
+    result = server.run_tool_from_source(
+        actor=user,
+        tool_source=EXAMPLE_TOOL_SOURCE,
+        tool_source_type="python",
+        tool_args={"message": "Custom schema test"},
+        tool_json_schema=explicit_json_schema,
+    )
+    assert result.status == "success"
+    assert result.tool_return == "Ingested message Custom schema test"
+    assert not result.stdout
     assert not result.stderr
 
 
