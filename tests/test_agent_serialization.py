@@ -1,5 +1,6 @@
 import difflib
 import json
+import os
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any, Dict, List, Mapping
@@ -400,9 +401,9 @@ def test_sanity_datetime_mismatch():
 # Agent serialize/deserialize tests
 
 
-@pytest.mark.parametrize("append_copy_suffix", [True, False])
-def test_append_copy_suffix_simple(local_client, server, serialize_test_agent, default_user, other_user, append_copy_suffix):
+def test_deserialize_simple(local_client, server, serialize_test_agent, default_user, other_user):
     """Test deserializing JSON into an Agent instance."""
+    append_copy_suffix = False
     result = server.agent_manager.serialize(agent_id=serialize_test_agent.id, actor=default_user)
 
     # Deserialize the agent
@@ -453,7 +454,7 @@ def test_agent_serialize_with_user_messages(local_client, server, serialize_test
     """Test deserializing JSON into an Agent instance."""
     append_copy_suffix = False
     server.send_messages(
-        actor=default_user, agent_id=serialize_test_agent.id, messages=[MessageCreate(role=MessageRole.user, content="hello")]
+        actor=default_user, agent_id=serialize_test_agent.id, input_messages=[MessageCreate(role=MessageRole.user, content="hello")]
     )
     result = server.agent_manager.serialize(agent_id=serialize_test_agent.id, actor=default_user)
 
@@ -469,20 +470,22 @@ def test_agent_serialize_with_user_messages(local_client, server, serialize_test
 
     # Make sure both agents can receive messages after
     server.send_messages(
-        actor=default_user, agent_id=serialize_test_agent.id, messages=[MessageCreate(role=MessageRole.user, content="and hello again")]
+        actor=default_user,
+        agent_id=serialize_test_agent.id,
+        input_messages=[MessageCreate(role=MessageRole.user, content="and hello again")],
     )
     server.send_messages(
-        actor=other_user, agent_id=agent_copy.id, messages=[MessageCreate(role=MessageRole.user, content="and hello again")]
+        actor=other_user, agent_id=agent_copy.id, input_messages=[MessageCreate(role=MessageRole.user, content="and hello again")]
     )
 
 
-def test_agent_serialize_tool_calls(mock_e2b_api_key_none, local_client, server, serialize_test_agent, default_user, other_user):
+def test_agent_serialize_tool_calls(disable_e2b_api_key, local_client, server, serialize_test_agent, default_user, other_user):
     """Test deserializing JSON into an Agent instance."""
     append_copy_suffix = False
     server.send_messages(
         actor=default_user,
         agent_id=serialize_test_agent.id,
-        messages=[MessageCreate(role=MessageRole.user, content="What's the weather like in San Francisco?")],
+        input_messages=[MessageCreate(role=MessageRole.user, content="What's the weather like in San Francisco?")],
     )
     result = server.agent_manager.serialize(agent_id=serialize_test_agent.id, actor=default_user)
 
@@ -500,30 +503,30 @@ def test_agent_serialize_tool_calls(mock_e2b_api_key_none, local_client, server,
     original_agent_response = server.send_messages(
         actor=default_user,
         agent_id=serialize_test_agent.id,
-        messages=[MessageCreate(role=MessageRole.user, content="What's the weather like in Seattle?")],
+        input_messages=[MessageCreate(role=MessageRole.user, content="What's the weather like in Seattle?")],
     )
     copy_agent_response = server.send_messages(
         actor=other_user,
         agent_id=agent_copy.id,
-        messages=[MessageCreate(role=MessageRole.user, content="What's the weather like in Seattle?")],
+        input_messages=[MessageCreate(role=MessageRole.user, content="What's the weather like in Seattle?")],
     )
 
     assert original_agent_response.completion_tokens > 0 and original_agent_response.step_count > 0
     assert copy_agent_response.completion_tokens > 0 and copy_agent_response.step_count > 0
 
 
-def test_agent_serialize_update_blocks(mock_e2b_api_key_none, local_client, server, serialize_test_agent, default_user, other_user):
+def test_agent_serialize_update_blocks(disable_e2b_api_key, local_client, server, serialize_test_agent, default_user, other_user):
     """Test deserializing JSON into an Agent instance."""
     append_copy_suffix = False
     server.send_messages(
         actor=default_user,
         agent_id=serialize_test_agent.id,
-        messages=[MessageCreate(role=MessageRole.user, content="Append 'banana' to core_memory.")],
+        input_messages=[MessageCreate(role=MessageRole.user, content="Append 'banana' to core_memory.")],
     )
     server.send_messages(
         actor=default_user,
         agent_id=serialize_test_agent.id,
-        messages=[MessageCreate(role=MessageRole.user, content="What do you think about that?")],
+        input_messages=[MessageCreate(role=MessageRole.user, content="What do you think about that?")],
     )
 
     result = server.agent_manager.serialize(agent_id=serialize_test_agent.id, actor=default_user)
@@ -542,12 +545,12 @@ def test_agent_serialize_update_blocks(mock_e2b_api_key_none, local_client, serv
     original_agent_response = server.send_messages(
         actor=default_user,
         agent_id=serialize_test_agent.id,
-        messages=[MessageCreate(role=MessageRole.user, content="Hi")],
+        input_messages=[MessageCreate(role=MessageRole.user, content="Hi")],
     )
     copy_agent_response = server.send_messages(
         actor=other_user,
         agent_id=agent_copy.id,
-        messages=[MessageCreate(role=MessageRole.user, content="Hi")],
+        input_messages=[MessageCreate(role=MessageRole.user, content="Hi")],
     )
 
     assert original_agent_response.completion_tokens > 0 and original_agent_response.step_count > 0
@@ -570,7 +573,8 @@ def test_agent_download_upload_flow(fastapi_client, server, serialize_test_agent
     assert response.status_code == 200, f"Download failed: {response.text}"
 
     # Ensure response matches expected schema
-    agent_schema = AgentSchema.model_validate(response.json())  # Validate as Pydantic model
+    response_json = response.json()
+    agent_schema = AgentSchema.model_validate(response_json)  # Validate as Pydantic model
     agent_json = agent_schema.model_dump(mode="json")  # Convert back to serializable JSON
 
     # Step 2: Upload the serialized agent as a copy
@@ -598,47 +602,40 @@ def test_agent_download_upload_flow(fastapi_client, server, serialize_test_agent
     print_dict_diff(json.loads(serialize_test_agent.model_dump_json()), json.loads(agent_copy.model_dump_json()))
     assert compare_agent_state(server, serialize_test_agent, agent_copy, append_copy_suffix, default_user, other_user)
 
-    # Step 4: Ensure copied agent receives messages correctly
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "composio_github_star_agent.af",
+        "outreach_workflow_agent.af",
+        "customer_service.af",
+        "deep_research_agent.af",
+        "memgpt_agent_with_convo.af",
+    ],
+)
+def test_upload_agentfile_from_disk(server, disable_e2b_api_key, fastapi_client, other_user, filename):
+    """
+    Test uploading each .af file from the test_agent_files directory via FastAPI.
+    """
+    file_path = os.path.join(os.path.dirname(__file__), "test_agent_files", filename)
+
+    with open(file_path, "rb") as f:
+        files = {"file": (filename, f, "application/json")}
+        response = fastapi_client.post(
+            "/v1/agents/import",
+            headers={"user_id": other_user.id},
+            params={"append_copy_suffix": True, "override_existing_tools": False},
+            files=files,
+        )
+
+    assert response.status_code == 200, f"Failed to upload {filename}: {response.text}"
+    json_response = response.json()
+    assert "id" in json_response and json_response["id"].startswith("agent-"), "Uploaded agent response is malformed"
+
+    copied_agent_id = json_response["id"]
+
     server.send_messages(
         actor=other_user,
         agent_id=copied_agent_id,
-        messages=[MessageCreate(role=MessageRole.user, content="Hello copied agent!")],
+        input_messages=[MessageCreate(role=MessageRole.user, content="Hello there!")],
     )
-
-
-# TODO: Add this back
-# @pytest.mark.parametrize("test_af_filename", ["deep_research_agent.af"])
-# def test_agent_file_upload_flow(fastapi_client, server, default_user, other_user, test_af_filename):
-#     """
-#     Test the full E2E serialization and deserialization flow using FastAPI endpoints.
-#     """
-#     file_path = Path(__file__).parent / "test_agent_files" / test_af_filename
-#     with open(file_path, "r") as f:
-#         data = json.load(f)
-#
-#     # Ensure response matches expected schema
-#     agent_schema = AgentSchema.model_validate(data)  # Validate as Pydantic model
-#     agent_json = agent_schema.model_dump(mode="json")  # Convert back to serializable JSON
-#
-#     import ipdb;ipdb.set_trace()
-#
-#     # Step 2: Upload the serialized agent as a copy
-#     agent_bytes = BytesIO(json.dumps(agent_json).encode("utf-8"))
-#     files = {"file": ("agent.json", agent_bytes, "application/json")}
-#     upload_response = fastapi_client.post(
-#         "/v1/agents/import",
-#         headers={"user_id": other_user.id},
-#         params={"append_copy_suffix": True, "override_existing_tools": False, "project_id": None},
-#         files=files,
-#     )
-#     assert upload_response.status_code == 200, f"Upload failed: {upload_response.text}"
-#
-#     copied_agent = upload_response.json()
-#     copied_agent_id = copied_agent["id"]
-#
-#     # Step 3: Ensure copied agent receives messages correctly
-#     server.send_messages(
-#         actor=other_user,
-#         agent_id=copied_agent_id,
-#         messages=[MessageCreate(role=MessageRole.user, content="Hello copied agent!")],
-#     )

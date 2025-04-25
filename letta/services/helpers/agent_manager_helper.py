@@ -21,9 +21,11 @@ from letta.schemas.passage import Passage as PydanticPassage
 from letta.schemas.tool_rule import ToolRule
 from letta.schemas.user import User
 from letta.system import get_initial_boot_messages, get_login_event
+from letta.tracing import trace_method
 
 
 # Static methods
+@trace_method
 def _process_relationship(
     session, agent: AgentModel, relationship_name: str, model_class, item_ids: List[str], allow_partial=False, replace=True
 ):
@@ -89,13 +91,15 @@ def _process_tags(agent: AgentModel, tags: List[str], replace=True):
         agent.tags.extend([tag for tag in new_tags if tag.tag not in existing_tags])
 
 
-def derive_system_message(agent_type: AgentType, system: Optional[str] = None):
+def derive_system_message(agent_type: AgentType, enable_sleeptime: Optional[bool] = None, system: Optional[str] = None):
     if system is None:
         # TODO: don't hardcode
-        if agent_type == AgentType.memgpt_agent:
+        if agent_type == AgentType.memgpt_agent and not enable_sleeptime:
             system = gpt_system.get_system_text("memgpt_chat")
-        elif agent_type == AgentType.offline_memory_agent:
-            system = gpt_system.get_system_text("memgpt_offline_memory")
+        elif agent_type == AgentType.memgpt_agent and enable_sleeptime:
+            system = gpt_system.get_system_text("memgpt_sleeptime_chat")
+        elif agent_type == AgentType.sleeptime_agent:
+            system = gpt_system.get_system_text("sleeptime")
         else:
             raise ValueError(f"Invalid agent type: {agent_type}")
 
@@ -192,10 +196,9 @@ def compile_system_message(
         variables[IN_CONTEXT_MEMORY_KEYWORD] = full_memory_string
 
     if template_format == "f-string":
-
+        memory_variable_string = "{" + IN_CONTEXT_MEMORY_KEYWORD + "}"
         # Catch the special case where the system prompt is unformatted
         if append_icm_if_missing:
-            memory_variable_string = "{" + IN_CONTEXT_MEMORY_KEYWORD + "}"
             if memory_variable_string not in system_prompt:
                 # In this case, append it to the end to make sure memory is still injected
                 # warnings.warn(f"{IN_CONTEXT_MEMORY_KEYWORD} variable was missing from system prompt, appending instead")
@@ -203,7 +206,10 @@ def compile_system_message(
 
         # render the variables using the built-in templater
         try:
-            formatted_prompt = safe_format(system_prompt, variables)
+            if user_defined_variables:
+                formatted_prompt = safe_format(system_prompt, variables)
+            else:
+                formatted_prompt = system_prompt.replace(memory_variable_string, full_memory_string)
         except Exception as e:
             raise ValueError(f"Failed to format system prompt - {str(e)}. System prompt value:\n{system_prompt}")
 
@@ -236,7 +242,9 @@ def initialize_message_sequence(
     first_user_message = get_login_event()  # event letting Letta know the user just logged in
 
     if include_initial_boot_message:
-        if agent_state.llm_config.model is not None and "gpt-3.5" in agent_state.llm_config.model:
+        if agent_state.agent_type == AgentType.sleeptime_agent:
+            initial_boot_messages = []
+        elif agent_state.llm_config.model is not None and "gpt-3.5" in agent_state.llm_config.model:
             initial_boot_messages = get_initial_boot_messages("startup_with_send_message_gpt35")
         else:
             initial_boot_messages = get_initial_boot_messages("startup_with_send_message")

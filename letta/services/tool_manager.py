@@ -2,7 +2,15 @@ import importlib
 import warnings
 from typing import List, Optional
 
-from letta.constants import BASE_FUNCTION_RETURN_CHAR_LIMIT, BASE_MEMORY_TOOLS, BASE_TOOLS, MCP_TOOL_TAG_NAME_PREFIX, MULTI_AGENT_TOOLS
+from letta.constants import (
+    BASE_FUNCTION_RETURN_CHAR_LIMIT,
+    BASE_MEMORY_TOOLS,
+    BASE_SLEEPTIME_TOOLS,
+    BASE_TOOLS,
+    LETTA_TOOL_SET,
+    MCP_TOOL_TAG_NAME_PREFIX,
+    MULTI_AGENT_TOOLS,
+)
 from letta.functions.functions import derive_openai_json_schema, load_function_set
 from letta.log import get_logger
 from letta.orm.enums import ToolType
@@ -46,7 +54,7 @@ class ToolManager:
 
             # If there's anything to update
             if update_data:
-                self.update_tool_by_id(tool.id, ToolUpdate(**update_data), actor)
+                tool = self.update_tool_by_id(tool.id, ToolUpdate(**update_data), actor)
             else:
                 printd(
                     f"`create_or_update_tool` was called with user_id={actor.id}, organization_id={actor.organization_id}, name={pydantic_tool.name}, but found existing tool with nothing to update."
@@ -194,7 +202,7 @@ class ToolManager:
         # create tool in db
         tools = []
         for name, schema in functions_to_schema.items():
-            if name in BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS:
+            if name in LETTA_TOOL_SET:
                 if name in BASE_TOOLS:
                     tool_type = ToolType.LETTA_CORE
                     tags = [tool_type.value]
@@ -204,9 +212,12 @@ class ToolManager:
                 elif name in MULTI_AGENT_TOOLS:
                     tool_type = ToolType.LETTA_MULTI_AGENT_CORE
                     tags = [tool_type.value]
+                elif name in BASE_SLEEPTIME_TOOLS:
+                    tool_type = ToolType.LETTA_SLEEPTIME_CORE
+                    tags = [tool_type.value]
                 else:
                     raise ValueError(
-                        f"Tool name {name} is not in the list of base tool names: {BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS}"
+                        f"Tool name {name} is not in the list of base tool names: {BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS + BASE_SLEEPTIME_TOOLS}"
                     )
 
                 # create to tool

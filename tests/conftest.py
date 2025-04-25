@@ -1,6 +1,9 @@
 import logging
+from datetime import datetime, timezone
+from typing import Generator
 
 import pytest
+from anthropic.types.beta.messages import BetaMessageBatch, BetaMessageBatchRequestCounts
 
 from letta.services.organization_manager import OrganizationManager
 from letta.services.user_manager import UserManager
@@ -12,19 +15,16 @@ def pytest_configure(config):
 
 
 @pytest.fixture
-def mock_e2b_api_key_none():
+def disable_e2b_api_key() -> Generator[None, None, None]:
+    """
+    Temporarily disables the E2B API key by setting `tool_settings.e2b_api_key` to None
+    for the duration of the test. Restores the original value afterward.
+    """
     from letta.settings import tool_settings
 
-    # Store the original value of e2b_api_key
     original_api_key = tool_settings.e2b_api_key
-
-    # Set e2b_api_key to None
     tool_settings.e2b_api_key = None
-
-    # Yield control to the test
     yield
-
-    # Restore the original value of e2b_api_key
     tool_settings.e2b_api_key = original_api_key
 
 
@@ -105,3 +105,25 @@ def print_tool_func():
         return message
 
     yield print_tool
+
+
+@pytest.fixture
+def dummy_beta_message_batch() -> BetaMessageBatch:
+    return BetaMessageBatch(
+        id="msgbatch_013Zva2CMHLNnXjNJJKqJ2EF",
+        archived_at=datetime(2024, 8, 20, 18, 37, 24, 100435, tzinfo=timezone.utc),
+        cancel_initiated_at=datetime(2024, 8, 20, 18, 37, 24, 100435, tzinfo=timezone.utc),
+        created_at=datetime(2024, 8, 20, 18, 37, 24, 100435, tzinfo=timezone.utc),
+        ended_at=datetime(2024, 8, 20, 18, 37, 24, 100435, tzinfo=timezone.utc),
+        expires_at=datetime(2024, 8, 20, 18, 37, 24, 100435, tzinfo=timezone.utc),
+        processing_status="in_progress",
+        request_counts=BetaMessageBatchRequestCounts(
+            canceled=10,
+            errored=30,
+            expired=10,
+            processing=100,
+            succeeded=50,
+        ),
+        results_url="https://api.anthropic.com/v1/messages/batches/msgbatch_013Zva2CMHLNnXjNJJKqJ2EF/results",
+        type="message_batch",
+    )

@@ -5,7 +5,15 @@ from letta.config import LettaConfig
 from letta.orm import Provider, Step
 from letta.schemas.agent import CreateAgent
 from letta.schemas.block import CreateBlock
-from letta.schemas.group import DynamicManager, GroupCreate, GroupUpdate, ManagerType, RoundRobinManager, SupervisorManager
+from letta.schemas.group import (
+    DynamicManager,
+    DynamicManagerUpdate,
+    GroupCreate,
+    GroupUpdate,
+    ManagerType,
+    RoundRobinManagerUpdate,
+    SupervisorManager,
+)
 from letta.schemas.message import MessageCreate
 from letta.server.server import SyncServer
 
@@ -150,7 +158,7 @@ async def test_empty_group(server, actor):
         await server.send_group_message_to_agent(
             group_id=group.id,
             actor=actor,
-            messages=[
+            input_messages=[
                 MessageCreate(
                     role="user",
                     content="what is everyone up to for the holidays?",
@@ -175,7 +183,7 @@ async def test_modify_group_pattern(server, actor, participant_agents, manager_a
         server.group_manager.modify_group(
             group_id=group.id,
             group_update=GroupUpdate(
-                manager_config=DynamicManager(
+                manager_config=DynamicManagerUpdate(
                     manager_type=ManagerType.dynamic,
                     manager_agent_id=manager_agent.id,
                 ),
@@ -184,6 +192,32 @@ async def test_modify_group_pattern(server, actor, participant_agents, manager_a
         )
 
     server.group_manager.delete_group(group_id=group.id, actor=actor)
+
+
+@pytest.mark.asyncio
+async def test_list_agent_groups(server, actor, participant_agents):
+    group_a = server.group_manager.create_group(
+        group=GroupCreate(
+            description="This is a group chat between best friends all like to hang out together. In their free time they like to solve mysteries.",
+            agent_ids=[agent.id for agent in participant_agents],
+        ),
+        actor=actor,
+    )
+    group_b = server.group_manager.create_group(
+        group=GroupCreate(
+            description="This is a group chat between best friends all like to hang out together. In their free time they like to solve mysteries.",
+            agent_ids=[participant_agents[0].id],
+        ),
+        actor=actor,
+    )
+
+    agent_a_groups = server.agent_manager.list_groups(agent_id=participant_agents[0].id, actor=actor)
+    assert sorted([group.id for group in agent_a_groups]) == sorted([group_a.id, group_b.id])
+    agent_b_groups = server.agent_manager.list_groups(agent_id=participant_agents[1].id, actor=actor)
+    assert [group.id for group in agent_b_groups] == [group_a.id]
+
+    server.group_manager.delete_group(group_id=group_a.id, actor=actor)
+    server.group_manager.delete_group(group_id=group_b.id, actor=actor)
 
 
 @pytest.mark.asyncio
@@ -212,7 +246,7 @@ async def test_round_robin(server, actor, participant_agents):
         response = await server.send_group_message_to_agent(
             group_id=group.id,
             actor=actor,
-            messages=[
+            input_messages=[
                 MessageCreate(
                     role="user",
                     content="what is everyone up to for the holidays?",
@@ -249,7 +283,7 @@ async def test_round_robin(server, actor, participant_agents):
             group_id=group.id,
             group_update=GroupUpdate(
                 agent_ids=[agent.id for agent in participant_agents][::-1],
-                manager_config=RoundRobinManager(
+                manager_config=RoundRobinManagerUpdate(
                     max_turns=max_turns,
                 ),
             ),
@@ -267,7 +301,7 @@ async def test_round_robin(server, actor, participant_agents):
         response = await server.send_group_message_to_agent(
             group_id=group.id,
             actor=actor,
-            messages=[
+            input_messages=[
                 MessageCreate(
                     role="user",
                     content="what is everyone up to for the holidays?",
@@ -333,7 +367,7 @@ async def test_supervisor(server, actor, participant_agents):
         response = await server.send_group_message_to_agent(
             group_id=group.id,
             actor=actor,
-            messages=[
+            input_messages=[
                 MessageCreate(
                     role="user",
                     content="ask everyone what they like to do for fun and then come up with an activity for everyone to do together.",
@@ -415,7 +449,7 @@ async def test_dynamic_group_chat(server, actor, manager_agent, participant_agen
         response = await server.send_group_message_to_agent(
             group_id=group.id,
             actor=actor,
-            messages=[
+            input_messages=[
                 MessageCreate(role="user", content="what is everyone up to for the holidays?"),
             ],
             stream_steps=False,

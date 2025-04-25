@@ -3,7 +3,7 @@ import time
 import traceback
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from openai.types.beta.function_tool import FunctionTool as OpenAITool
 
@@ -17,6 +17,7 @@ from letta.constants import (
     LETTA_MULTI_AGENT_TOOL_MODULE_NAME,
     LLM_MAX_TOKENS,
     REQ_HEARTBEAT_MESSAGE,
+    SEND_MESSAGE_TOOL_NAME,
 )
 from letta.errors import ContextWindowExceededError
 from letta.functions.ast_parsers import coerce_dict_args_by_annotations, get_function_annotations_from_source
@@ -27,6 +28,7 @@ from letta.helpers import ToolRulesSolver
 from letta.helpers.composio_helpers import get_composio_api_key
 from letta.helpers.datetime_helpers import get_utc_time
 from letta.helpers.json_helpers import json_dumps, json_loads
+from letta.helpers.message_helper import prepare_input_message_create
 from letta.interface import AgentInterface
 from letta.llm_api.helpers import calculate_summarizer_cutoff, get_token_counts_for_messages, is_context_overflow_error
 from letta.llm_api.llm_api_tools import create
@@ -36,18 +38,19 @@ from letta.log import get_logger
 from letta.memory import summarize_messages
 from letta.orm import User
 from letta.orm.enums import ToolType
-from letta.schemas.agent import AgentState, AgentStepResponse, UpdateAgent
+from letta.schemas.agent import AgentState, AgentStepResponse, UpdateAgent, get_prompt_template_for_agent_type
 from letta.schemas.block import BlockUpdate
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import MessageRole
 from letta.schemas.letta_message_content import TextContent
 from letta.schemas.memory import ContextWindowOverview, Memory
-from letta.schemas.message import Message, ToolReturn
+from letta.schemas.message import Message, MessageCreate, ToolReturn
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse
 from letta.schemas.openai.chat_completion_response import Message as ChatCompletionMessage
 from letta.schemas.openai.chat_completion_response import UsageStatistics
-from letta.schemas.sandbox_config import SandboxRunResult
+from letta.schemas.response_format import ResponseFormatType
 from letta.schemas.tool import Tool
+from letta.schemas.tool_execution_result import ToolExecutionResult
 from letta.schemas.tool_rule import TerminalToolRule
 from letta.schemas.usage import LettaUsageStatistics
 from letta.services.agent_manager import AgentManager
@@ -78,7 +81,7 @@ class BaseAgent(ABC):
     @abstractmethod
     def step(
         self,
-        messages: Union[Message, List[Message]],
+        input_messages: List[MessageCreate],
     ) -> LettaUsageStatistics:
         """
         Top-level event message handler for the agent.
@@ -106,18 +109,18 @@ class Agent(BaseAgent):
         self.user = user
 
         # initialize a tool rules solver
-        if agent_state.tool_rules:
-            # if there are tool rules, print out a warning
-            for rule in agent_state.tool_rules:
-                if not isinstance(rule, TerminalToolRule):
-                    warnings.warn("Tool rules only work reliably for the latest OpenAI models that support structured outputs.")
-                    break
-
         self.tool_rules_solver = ToolRulesSolver(tool_rules=agent_state.tool_rules)
 
         # gpt-4, gpt-3.5-turbo, ...
         self.model = self.agent_state.llm_config.model
         self.supports_structured_output = check_supports_structured_output(model=self.model, tool_rules=agent_state.tool_rules)
+
+        # if there are tool rules, print out a warning
+        if not self.supports_structured_output and agent_state.tool_rules:
+            for rule in agent_state.tool_rules:
+                if not isinstance(rule, TerminalToolRule):
+                    warnings.warn("Tool rules only work reliably for model backends that support structured outputs (e.g. OpenAI gpt-4o).")
+                    break
 
         # state managers
         self.block_manager = BlockManager()
@@ -130,6 +133,7 @@ class Agent(BaseAgent):
         # Different interfaces can handle events differently
         # e.g., print in CLI vs send a discord message with a discord bot
         self.interface = interface
+        self.chunk_index = 0
 
         # Create the persistence manager object based on the AgentState info
         self.message_manager = MessageManager()
@@ -199,7 +203,8 @@ class Agent(BaseAgent):
 
             # refresh memory from DB (using block ids)
             self.agent_state.memory = Memory(
-                blocks=[self.block_manager.get_block_by_id(block.id, actor=self.user) for block in self.agent_state.memory.get_blocks()]
+                blocks=[self.block_manager.get_block_by_id(block.id, actor=self.user) for block in self.agent_state.memory.get_blocks()],
+                prompt_template=get_prompt_template_for_agent_type(self.agent_state.agent_type),
             )
 
             # NOTE: don't do this since re-buildin the memory is handled at the start of the step
@@ -231,27 +236,49 @@ class Agent(BaseAgent):
 
         # Extend conversation with function response
         function_response = package_function_response(False, error_msg)
-        new_message = Message.dict_to_message(
+        new_message = Message(
             agent_id=self.agent_state.id,
-            user_id=self.agent_state.created_by_id,
+            # Base info OpenAI-style
             model=self.model,
-            openai_message_dict={
-                "role": "tool",
-                "name": function_name,
-                "content": function_response,
-                "tool_call_id": tool_call_id,
-            },
-            name=self.agent_state.name,
+            role="tool",
+            name=function_name,  # NOTE: when role is 'tool', the 'name' is the function name, not agent name
+            content=[TextContent(text=function_response)],
+            tool_call_id=tool_call_id,
+            # Letta extras
             tool_returns=tool_returns,
             group_id=group_id,
         )
         messages.append(new_message)
-        self.interface.function_message(f"Error: {error_msg}", msg_obj=new_message)
+        self.interface.function_message(f"Error: {error_msg}", msg_obj=new_message, chunk_index=self.chunk_index)
+        self.chunk_index += 1
         if include_function_failed_message:
-            self.interface.function_message(f"Ran {function_name}({function_args})", msg_obj=new_message)
+            self.interface.function_message(f"Ran {function_name}({function_args})", msg_obj=new_message, chunk_index=self.chunk_index)
+            self.chunk_index += 1
 
         # Return updated messages
         return messages
+
+    def _runtime_override_tool_json_schema(
+        self,
+        functions_list: List[Dict | None],
+    ) -> List[Dict | None]:
+        """Override the tool JSON schema at runtime for a particular tool if conditions are met."""
+
+        # Currently just injects `send_message` with a `response_format` if provided to the agent.
+        if self.agent_state.response_format and self.agent_state.response_format.type != ResponseFormatType.text:
+            for func in functions_list:
+                if func["name"] == SEND_MESSAGE_TOOL_NAME:
+                    if self.agent_state.response_format.type == ResponseFormatType.json_schema:
+                        func["parameters"]["properties"]["message"] = self.agent_state.response_format.json_schema["schema"]
+                    if self.agent_state.response_format.type == ResponseFormatType.json_object:
+                        func["parameters"]["properties"]["message"] = {
+                            "type": "object",
+                            "description": "Message contents. All unicode (including emojis) are supported.",
+                            "additionalProperties": True,
+                            "properties": {},
+                        }
+                    break
+        return functions_list
 
     @trace_method
     def _get_ai_reply(
@@ -266,26 +293,25 @@ class Agent(BaseAgent):
         step_count: Optional[int] = None,
         last_function_failed: bool = False,
         put_inner_thoughts_first: bool = True,
-    ) -> ChatCompletionResponse:
+    ) -> ChatCompletionResponse | None:
         """Get response from LLM API with robust retry mechanism."""
         log_telemetry(self.logger, "_get_ai_reply start")
         available_tools = set([t.name for t in self.agent_state.tools])
-        allowed_tool_names = self.tool_rules_solver.get_allowed_tool_names(
-            available_tools=available_tools, last_function_response=self.last_function_response
-        )
         agent_state_tool_jsons = [t.json_schema for t in self.agent_state.tools]
 
-        allowed_functions = (
-            agent_state_tool_jsons
-            if not allowed_tool_names
-            else [func for func in agent_state_tool_jsons if func["name"] in allowed_tool_names]
-        )
+        # Get allowed tools or allow all if none are allowed
+        allowed_tool_names = self.tool_rules_solver.get_allowed_tool_names(
+            available_tools=available_tools, last_function_response=self.last_function_response
+        ) or list(available_tools)
 
         # Don't allow a tool to be called if it failed last time
         if last_function_failed and self.tool_rules_solver.tool_call_history:
-            allowed_functions = [f for f in allowed_functions if f["name"] != self.tool_rules_solver.tool_call_history[-1]]
-            if not allowed_functions:
+            allowed_tool_names = [f for f in allowed_tool_names if f != self.tool_rules_solver.tool_call_history[-1]]
+            if not allowed_tool_names:
                 return None
+
+        allowed_functions = [func for func in agent_state_tool_jsons if func["name"] in allowed_tool_names]
+        allowed_functions = self._runtime_override_tool_json_schema(allowed_functions)
 
         # For the first message, force the initial tool if one is specified
         force_tool_call = None
@@ -295,6 +321,7 @@ class Agent(BaseAgent):
             and not self.supports_structured_output
             and len(self.tool_rules_solver.init_tool_rules) > 0
         ):
+            # TODO: This just seems wrong? What if there are more than 1 init tool rules?
             force_tool_call = self.tool_rules_solver.init_tool_rules[0].tool_name
         # Force a tool call if exactly one tool is specified
         elif step_count is not None and step_count > 0 and len(allowed_tool_names) == 1:
@@ -305,17 +332,16 @@ class Agent(BaseAgent):
                 log_telemetry(self.logger, "_get_ai_reply create start")
                 # New LLM client flow
                 llm_client = LLMClient.create(
-                    llm_config=self.agent_state.llm_config,
+                    provider=self.agent_state.llm_config.model_endpoint_type,
                     put_inner_thoughts_first=put_inner_thoughts_first,
                 )
 
                 if llm_client and not stream:
                     response = llm_client.send_llm_request(
                         messages=message_sequence,
+                        llm_config=self.agent_state.llm_config,
                         tools=allowed_functions,
-                        tool_call=function_call,
                         stream=stream,
-                        first_message=first_message,
                         force_tool_call=force_tool_call,
                     )
                 else:
@@ -347,7 +373,6 @@ class Agent(BaseAgent):
                     else:
                         raise ValueError(f"Bad finish reason from API: {response.choices[0].finish_reason}")
                 log_telemetry(self.logger, "_handle_ai_response finish")
-                return response
 
             except ValueError as ve:
                 if attempt >= empty_response_retry_limit:
@@ -358,11 +383,21 @@ class Agent(BaseAgent):
                     delay = min(backoff_factor * (2 ** (attempt - 1)), max_delay)
                     warnings.warn(f"Attempt {attempt} failed: {ve}. Retrying in {delay} seconds...")
                     time.sleep(delay)
+                    continue
 
             except Exception as e:
                 # For non-retryable errors, exit immediately
                 log_telemetry(self.logger, "_handle_ai_response finish generic Exception")
                 raise e
+
+            # check if we are going over the context window: this allows for articifial constraints
+            if response.usage.total_tokens > self.agent_state.llm_config.context_window:
+                # trigger summarization
+                log_telemetry(self.logger, "_get_ai_reply summarize_messages_inplace")
+                self.summarize_messages_inplace()
+
+            # return the response
+            return response
 
         log_telemetry(self.logger, "_handle_ai_response finish catch-all exception")
         raise Exception("Retries exhausted and no valid response received.")
@@ -408,7 +443,7 @@ class Agent(BaseAgent):
                 tool_call_id = response_message.tool_calls[0].id
                 assert tool_call_id is not None  # should be defined
 
-            # only necessary to add the tool_cal_id to a function call (antipattern)
+            # only necessary to add the tool_call_id to a function call (antipattern)
             # response_message_dict = response_message.model_dump()
             # response_message_dict["tool_call_id"] = tool_call_id
 
@@ -419,7 +454,6 @@ class Agent(BaseAgent):
                 Message.dict_to_message(
                     id=response_message_id,
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict=response_message.model_dump(),
                     name=self.agent_state.name,
@@ -431,7 +465,8 @@ class Agent(BaseAgent):
             nonnull_content = False
             if response_message.content or response_message.reasoning_content or response_message.redacted_reasoning_content:
                 # The content if then internal monologue, not chat
-                self.interface.internal_monologue(response_message.content, msg_obj=messages[-1])
+                self.interface.internal_monologue(response_message.content, msg_obj=messages[-1], chunk_index=self.chunk_index)
+                self.chunk_index += 1
                 # Flag to avoid printing a duplicate if inner thoughts get popped from the function call
                 nonnull_content = True
 
@@ -480,7 +515,8 @@ class Agent(BaseAgent):
                 response_message.content = function_args.pop("inner_thoughts")
             # The content if then internal monologue, not chat
             if response_message.content and not nonnull_content:
-                self.interface.internal_monologue(response_message.content, msg_obj=messages[-1])
+                self.interface.internal_monologue(response_message.content, msg_obj=messages[-1], chunk_index=self.chunk_index)
+                self.chunk_index += 1
 
             # (Still parsing function args)
             # Handle requests for immediate heartbeat
@@ -502,7 +538,12 @@ class Agent(BaseAgent):
             # Failure case 3: function failed during execution
             # NOTE: the msg_obj associated with the "Running " message is the prior assistant message, not the function/tool role message
             #       this is because the function/tool role message is only created once the function/tool has executed/returned
-            self.interface.function_message(f"Running {function_name}({function_args})", msg_obj=messages[-1])
+
+            # handle cases where we return a json message
+            if "message" in function_args:
+                function_args["message"] = str(function_args.get("message", ""))
+            self.interface.function_message(f"Running {function_name}({function_args})", msg_obj=messages[-1], chunk_index=self.chunk_index)
+            self.chunk_index += 1
             try:
                 # handle tool execution (sandbox) and state updates
                 log_telemetry(
@@ -517,22 +558,23 @@ class Agent(BaseAgent):
                     },
                 )
 
-                function_response, sandbox_run_result = self.execute_tool_and_persist_state(function_name, function_args, target_letta_tool)
+                tool_execution_result = self.execute_tool_and_persist_state(function_name, function_args, target_letta_tool)
+                function_response = tool_execution_result.func_return
 
                 log_event(
                     "tool_call_ended",
                     attributes={
                         "function_response": function_response,
-                        "sandbox_run_result": sandbox_run_result.model_dump() if sandbox_run_result else None,
+                        "tool_execution_result": tool_execution_result.model_dump(),
                     },
                 )
                 log_telemetry(
                     self.logger, "_handle_ai_response execute tool finish", function_name=function_name, function_args=function_args
                 )
 
-                if sandbox_run_result and sandbox_run_result.status == "error":
+                if tool_execution_result and tool_execution_result.status == "error":
                     tool_return = ToolReturn(
-                        status=sandbox_run_result.status, stdout=sandbox_run_result.stdout, stderr=sandbox_run_result.stderr
+                        status=tool_execution_result.status, stdout=tool_execution_result.stdout, stderr=tool_execution_result.stderr
                     )
                     messages = self._handle_function_error_response(
                         function_response,
@@ -586,14 +628,10 @@ class Agent(BaseAgent):
             # Step 4: check if function response is an error
             if function_response_string.startswith(ERROR_MESSAGE_PREFIX):
                 error_msg = function_response_string
-                tool_return = (
-                    ToolReturn(
-                        status=sandbox_run_result.status,
-                        stdout=sandbox_run_result.stdout,
-                        stderr=sandbox_run_result.stderr,
-                    )
-                    if sandbox_run_result
-                    else None
+                tool_return = ToolReturn(
+                    status=tool_execution_result.status,
+                    stdout=tool_execution_result.stdout,
+                    stderr=tool_execution_result.stderr,
                 )
                 messages = self._handle_function_error_response(
                     error_msg,
@@ -610,33 +648,29 @@ class Agent(BaseAgent):
 
             # If no failures happened along the way: ...
             # Step 5: send the info on the function call and function response to GPT
-            tool_return = (
-                ToolReturn(
-                    status=sandbox_run_result.status,
-                    stdout=sandbox_run_result.stdout,
-                    stderr=sandbox_run_result.stderr,
-                )
-                if sandbox_run_result
-                else None
+            tool_return = ToolReturn(
+                status=tool_execution_result.status,
+                stdout=tool_execution_result.stdout,
+                stderr=tool_execution_result.stderr,
             )
             messages.append(
-                Message.dict_to_message(
+                Message(
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.created_by_id,
+                    # Base info OpenAI-style
                     model=self.model,
-                    openai_message_dict={
-                        "role": "tool",
-                        "name": function_name,
-                        "content": function_response,
-                        "tool_call_id": tool_call_id,
-                    },
-                    name=self.agent_state.name,
-                    tool_returns=[tool_return] if sandbox_run_result else None,
+                    role="tool",
+                    name=function_name,  # NOTE: when role is 'tool', the 'name' is the function name, not agent name
+                    content=[TextContent(text=function_response)],
+                    tool_call_id=tool_call_id,
+                    # Letta extras
+                    tool_returns=[tool_return],
                     group_id=group_id,
                 )
             )  # extend conversation with function response
-            self.interface.function_message(f"Ran {function_name}({function_args})", msg_obj=messages[-1])
-            self.interface.function_message(f"Success: {function_response_string}", msg_obj=messages[-1])
+            self.interface.function_message(f"Ran {function_name}({function_args})", msg_obj=messages[-1], chunk_index=self.chunk_index)
+            self.chunk_index += 1
+            self.interface.function_message(f"Success: {function_response_string}", msg_obj=messages[-1], chunk_index=self.chunk_index)
+            self.chunk_index += 1
             self.last_function_response = function_response
 
         else:
@@ -645,14 +679,14 @@ class Agent(BaseAgent):
                 Message.dict_to_message(
                     id=response_message_id,
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict=response_message.model_dump(),
                     name=self.agent_state.name,
                     group_id=group_id,
                 )
             )  # extend conversation with assistant's reply
-            self.interface.internal_monologue(response_message.content, msg_obj=messages[-1])
+            self.interface.internal_monologue(response_message.content, msg_obj=messages[-1], chunk_index=self.chunk_index)
+            self.chunk_index += 1
             heartbeat_request = False
             function_failed = False
 
@@ -679,7 +713,7 @@ class Agent(BaseAgent):
     @trace_method
     def step(
         self,
-        messages: Union[Message, List[Message]],
+        input_messages: List[MessageCreate],
         # additional args
         chaining: bool = True,
         max_chaining_steps: Optional[int] = None,
@@ -692,7 +726,9 @@ class Agent(BaseAgent):
         # But just to be safe
         self.tool_rules_solver.clear_tool_history()
 
-        next_input_message = messages if isinstance(messages, list) else [messages]
+        # Convert MessageCreate objects to Message objects
+        message_objects = [prepare_input_message_create(m, self.agent_state.id, True, True) for m in input_messages]
+        next_input_messages = message_objects
         counter = 0
         total_usage = UsageStatistics()
         step_count = 0
@@ -703,7 +739,7 @@ class Agent(BaseAgent):
             kwargs["step_count"] = step_count
             kwargs["last_function_failed"] = function_failed
             step_response = self.inner_step(
-                messages=next_input_message,
+                messages=next_input_messages,
                 put_inner_thoughts_first=put_inner_thoughts_first,
                 **kwargs,
             )
@@ -733,39 +769,42 @@ class Agent(BaseAgent):
             # Chain handlers
             elif token_warning and summarizer_settings.send_memory_warning_message:
                 assert self.agent_state.created_by_id is not None
-                next_input_message = Message.dict_to_message(
-                    agent_id=self.agent_state.id,
-                    user_id=self.agent_state.created_by_id,
-                    model=self.model,
-                    openai_message_dict={
-                        "role": "user",  # TODO: change to system?
-                        "content": get_token_limit_warning(),
-                    },
-                )
+                next_input_messages = [
+                    Message.dict_to_message(
+                        agent_id=self.agent_state.id,
+                        model=self.model,
+                        openai_message_dict={
+                            "role": "user",  # TODO: change to system?
+                            "content": get_token_limit_warning(),
+                        },
+                    ),
+                ]
                 continue  # always chain
             elif function_failed:
                 assert self.agent_state.created_by_id is not None
-                next_input_message = Message.dict_to_message(
-                    agent_id=self.agent_state.id,
-                    user_id=self.agent_state.created_by_id,
-                    model=self.model,
-                    openai_message_dict={
-                        "role": "user",  # TODO: change to system?
-                        "content": get_heartbeat(FUNC_FAILED_HEARTBEAT_MESSAGE),
-                    },
-                )
+                next_input_messages = [
+                    Message.dict_to_message(
+                        agent_id=self.agent_state.id,
+                        model=self.model,
+                        openai_message_dict={
+                            "role": "user",  # TODO: change to system?
+                            "content": get_heartbeat(FUNC_FAILED_HEARTBEAT_MESSAGE),
+                        },
+                    )
+                ]
                 continue  # always chain
             elif heartbeat_request:
                 assert self.agent_state.created_by_id is not None
-                next_input_message = Message.dict_to_message(
-                    agent_id=self.agent_state.id,
-                    user_id=self.agent_state.created_by_id,
-                    model=self.model,
-                    openai_message_dict={
-                        "role": "user",  # TODO: change to system?
-                        "content": get_heartbeat(REQ_HEARTBEAT_MESSAGE),
-                    },
-                )
+                next_input_messages = [
+                    Message.dict_to_message(
+                        agent_id=self.agent_state.id,
+                        model=self.model,
+                        openai_message_dict={
+                            "role": "user",  # TODO: change to system?
+                            "content": get_heartbeat(REQ_HEARTBEAT_MESSAGE),
+                        },
+                    )
+                ]
                 continue  # always chain
             # Letta no-op / yield
             else:
@@ -779,7 +818,7 @@ class Agent(BaseAgent):
 
     def inner_step(
         self,
-        messages: Union[Message, List[Message]],
+        messages: List[Message],
         first_message: bool = False,
         first_message_retry_limit: int = FIRST_MESSAGE_ATTEMPTS,
         skip_verify: bool = False,
@@ -799,16 +838,14 @@ class Agent(BaseAgent):
             # Step 0: update core memory
             # only pulling latest block data if shared memory is being used
             current_persisted_memory = Memory(
-                blocks=[self.block_manager.get_block_by_id(block.id, actor=self.user) for block in self.agent_state.memory.get_blocks()]
+                blocks=[self.block_manager.get_block_by_id(block.id, actor=self.user) for block in self.agent_state.memory.get_blocks()],
+                prompt_template=get_prompt_template_for_agent_type(self.agent_state.agent_type),
             )  # read blocks from DB
             self.update_memory_if_changed(current_persisted_memory)
 
             # Step 1: add user message
-            if isinstance(messages, Message):
-                messages = [messages]
-
             if not all(isinstance(m, Message) for m in messages):
-                raise ValueError(f"messages should be a Message or a list of Message, got {type(messages)}")
+                raise ValueError(f"messages should be a list of Message, got {[type(m) for m in messages]}")
 
             in_context_messages = self.agent_manager.get_in_context_messages(agent_id=self.agent_state.id, actor=self.user)
             input_message_sequence = in_context_messages + messages
@@ -1015,7 +1052,6 @@ class Agent(BaseAgent):
         assert self.agent_state.created_by_id is not None, "User ID is not set"
         user_message = Message.dict_to_message(
             agent_id=self.agent_state.id,
-            user_id=self.agent_state.created_by_id,
             model=self.model,
             openai_message_dict=openai_message_dict,
             # created_at=timestamp,
@@ -1075,7 +1111,6 @@ class Agent(BaseAgent):
             messages=[
                 Message.dict_to_message(
                     agent_id=self.agent_state.id,
-                    user_id=self.agent_state.created_by_id,
                     model=self.model,
                     openai_message_dict=packed_summary_message,
                 )
@@ -1221,9 +1256,7 @@ class Agent(BaseAgent):
         return context_window_breakdown.context_window_size_current
 
     # TODO: Refactor into separate class v.s. large if/elses here
-    def execute_tool_and_persist_state(
-        self, function_name: str, function_args: dict, target_letta_tool: Tool
-    ) -> tuple[Any, Optional[SandboxRunResult]]:
+    def execute_tool_and_persist_state(self, function_name: str, function_args: dict, target_letta_tool: Tool) -> ToolExecutionResult:
         """
         Execute tool modifications and persist the state of the agent.
         Note: only some agent state modifications will be persisted, such as data in the AgentState ORM and block data
@@ -1243,7 +1276,7 @@ class Agent(BaseAgent):
                 callable_func = get_function_from_module(LETTA_MULTI_AGENT_TOOL_MODULE_NAME, function_name)
                 function_args["self"] = self  # need to attach self to arg since it's dynamically linked
                 function_response = callable_func(**function_args)
-            elif target_letta_tool.tool_type == ToolType.LETTA_MEMORY_CORE:
+            elif target_letta_tool.tool_type == ToolType.LETTA_MEMORY_CORE or target_letta_tool.tool_type == ToolType.LETTA_SLEEPTIME_CORE:
                 callable_func = get_function_from_module(LETTA_CORE_TOOL_MODULE_NAME, function_name)
                 agent_state_copy = self.agent_state.__deepcopy__()
                 function_args["agent_state"] = agent_state_copy  # need to attach self to arg since it's dynamically linked
@@ -1285,8 +1318,10 @@ class Agent(BaseAgent):
                     )
 
                 function_response, is_error = mcp_client.execute_tool(tool_name=function_name, tool_args=function_args)
-                sandbox_run_result = SandboxRunResult(status="error" if is_error else "success")
-                return function_response, sandbox_run_result
+                return ToolExecutionResult(
+                    status="error" if is_error else "success",
+                    func_return=function_response,
+                )
             else:
                 try:
                     # Parse the source code to extract function annotations
@@ -1303,23 +1338,29 @@ class Agent(BaseAgent):
                 agent_state_copy.tools = []
                 agent_state_copy.tool_rules = []
 
-                sandbox_run_result = ToolExecutionSandbox(function_name, function_args, self.user, tool_object=target_letta_tool).run(
+                tool_execution_result = ToolExecutionSandbox(function_name, function_args, self.user, tool_object=target_letta_tool).run(
                     agent_state=agent_state_copy
                 )
-                function_response, updated_agent_state = sandbox_run_result.func_return, sandbox_run_result.agent_state
                 assert orig_memory_str == self.agent_state.memory.compile(), "Memory should not be modified in a sandbox tool"
-                if updated_agent_state is not None:
-                    self.update_memory_if_changed(updated_agent_state.memory)
-                return function_response, sandbox_run_result
+                if tool_execution_result.agent_state is not None:
+                    self.update_memory_if_changed(tool_execution_result.agent_state.memory)
+                return tool_execution_result
         except Exception as e:
             # Need to catch error here, or else trunction wont happen
             # TODO: modify to function execution error
             function_response = get_friendly_error_msg(
                 function_name=function_name, exception_name=type(e).__name__, exception_message=str(e)
             )
-            return function_response, SandboxRunResult(status="error")
+            return ToolExecutionResult(
+                status="error",
+                func_return=function_response,
+                stderr=[traceback.format_exc()],
+            )
 
-        return function_response, None
+        return ToolExecutionResult(
+            status="success",
+            func_return=function_response,
+        )
 
 
 def save_agent(agent: Agent):

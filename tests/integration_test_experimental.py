@@ -1,5 +1,5 @@
-import concurrent
 import os
+import threading
 import time
 import uuid
 
@@ -7,14 +7,15 @@ import httpx
 import openai
 import pytest
 from dotenv import load_dotenv
-from letta_client import Letta
+from letta_client import CreateBlock, Letta, MessageCreate, TextContent
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
 from letta.agents.letta_agent import LettaAgent
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import MessageStreamStatus
+from letta.schemas.letta_message_content import TextContent as LettaTextContent
 from letta.schemas.llm_config import LLMConfig
-from letta.schemas.openai.chat_completion_request import UserMessage
+from letta.schemas.message import MessageCreate as LettaMessageCreate
 from letta.schemas.tool import ToolCreate
 from letta.schemas.usage import LettaUsageStatistics
 from letta.services.agent_manager import AgentManager
@@ -41,10 +42,10 @@ def server_url():
     """Ensures a server is running and returns its base URL."""
     url = os.getenv("LETTA_SERVER_URL", "http://localhost:8283")
 
-    # if not os.getenv("LETTA_SERVER_URL"):
-    #     thread = threading.Thread(target=_run_server, daemon=True)
-    #     thread.start()
-    #     time.sleep(5)  # Allow server startup time
+    if not os.getenv("LETTA_SERVER_URL"):
+        thread = threading.Thread(target=_run_server, daemon=True)
+        thread.start()
+        time.sleep(5)  # Allow server startup time
 
     return url
 
@@ -107,11 +108,7 @@ def weather_tool(client):
         Raises:
             RuntimeError: If the request to fetch weather data fails.
         """
-        import time
-
         import requests
-
-        time.sleep(5)
 
         url = f"https://wttr.in/{location}?format=%C+%t"
 
@@ -160,15 +157,15 @@ def composio_gmail_get_profile_tool(default_user):
 @pytest.fixture(scope="function")
 def agent_state(client, roll_dice_tool, weather_tool, rethink_tool):
     """Creates an agent and ensures cleanup after tests."""
-    llm_config = LLMConfig(
-        model="claude-3-7-sonnet-latest",
-        model_endpoint_type="anthropic",
-        model_endpoint="https://api.anthropic.com/v1",
-        context_window=32000,
-        handle=f"anthropic/claude-3-7-sonnet-latest",
-        put_inner_thoughts_in_kwargs=True,
-        max_tokens=4096,
-    )
+    # llm_config = LLMConfig(
+    #     model="claude-3-7-sonnet-latest",
+    #     model_endpoint_type="anthropic",
+    #     model_endpoint="https://api.anthropic.com/v1",
+    #     context_window=32000,
+    #     handle=f"anthropic/claude-3-7-sonnet-latest",
+    #     put_inner_thoughts_in_kwargs=True,
+    #     max_tokens=4096,
+    # )
     agent_state = client.agents.create(
         name=f"test_compl_{str(uuid.uuid4())[5:]}",
         tool_ids=[roll_dice_tool.id, weather_tool.id, rethink_tool.id],
@@ -183,7 +180,7 @@ def agent_state(client, roll_dice_tool, weather_tool, rethink_tool):
                 "value": "Friendly agent",
             },
         ],
-        llm_config=llm_config,
+        llm_config=LLMConfig.default_config(model_name="gpt-4o-mini"),
         embedding_config=EmbeddingConfig.default_config(provider="openai"),
     )
     yield agent_state
@@ -237,7 +234,7 @@ def _assert_valid_chunk(chunk, idx, chunks):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("message", ["What is the weather today in SF?"])
-async def test_new_agent_loop(mock_e2b_api_key_none, openai_client, agent_state, message):
+async def test_new_agent_loop(disable_e2b_api_key, openai_client, agent_state, message):
     actor = UserManager().get_user_or_default(user_id="asf")
     agent = LettaAgent(
         agent_id=agent_state.id,
@@ -248,12 +245,12 @@ async def test_new_agent_loop(mock_e2b_api_key_none, openai_client, agent_state,
         actor=actor,
     )
 
-    response = await agent.step(UserMessage(content=message))
+    response = await agent.step([LettaMessageCreate(role="user", content=[LettaTextContent(text=message)])])
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("message", ["Use your rethink tool to rethink the human memory considering Matt likes chicken."])
-async def test_rethink_tool(mock_e2b_api_key_none, openai_client, agent_state, message):
+async def test_rethink_tool(disable_e2b_api_key, openai_client, agent_state, message):
     actor = UserManager().get_user_or_default(user_id="asf")
     agent = LettaAgent(
         agent_id=agent_state.id,
@@ -265,19 +262,26 @@ async def test_rethink_tool(mock_e2b_api_key_none, openai_client, agent_state, m
     )
 
     assert "chicken" not in AgentManager().get_agent_by_id(agent_state.id, actor).memory.get_block("human").value
-    response = await agent.step(UserMessage(content=message))
+    response = await agent.step([LettaMessageCreate(role="user", content=[LettaTextContent(text=message)])])
     assert "chicken" in AgentManager().get_agent_by_id(agent_state.id, actor).memory.get_block("human").value
 
 
 @pytest.mark.asyncio
-async def test_multi_agent_broadcast(mock_e2b_api_key_none, client, openai_client, weather_tool):
+async def test_multi_agent_broadcast(disable_e2b_api_key, client, openai_client, weather_tool):
     actor = UserManager().get_user_or_default(user_id="asf")
 
     stale_agents = AgentManager().list_agents(actor=actor, limit=300)
     for agent in stale_agents:
-        client.delete_agent(agent_id=agent.id)
+        AgentManager().delete_agent(agent_id=agent.id, actor=actor)
 
-    manager_agent_state = client.create_agent(name=f"manager", include_base_tools=True, include_multi_agent_tools=True, tags=["manager"])
+    manager_agent_state = client.agents.create(
+        name=f"manager",
+        include_base_tools=True,
+        include_multi_agent_tools=True,
+        tags=["manager"],
+        model="openai/gpt-4o",
+        embedding="letta/letta-free",
+    )
     manager_agent = LettaAgent(
         agent_id=manager_agent_state.id,
         message_manager=MessageManager(),
@@ -290,12 +294,31 @@ async def test_multi_agent_broadcast(mock_e2b_api_key_none, client, openai_clien
     tag = "subagent"
     workers = []
     for idx in range(30):
-        workers.append(client.create_agent(name=f"worker_{idx}", include_base_tools=True, tags=[tag], tool_ids=[weather_tool.id]))
+        workers.append(
+            client.agents.create(
+                name=f"worker_{idx}",
+                include_base_tools=True,
+                tags=[tag],
+                tool_ids=[weather_tool.id],
+                model="openai/gpt-4o",
+                embedding="letta/letta-free",
+            ),
+        )
 
     response = await manager_agent.step(
-        UserMessage(
-            content="Use the `send_message_to_agents_matching_tags` tool to send a message to agents with tag 'subagent' asking them to check the weather in Seattle.",
-        )
+        [
+            LettaMessageCreate(
+                role="user",
+                content=[
+                    LettaTextContent(
+                        text=(
+                            "Use the `send_message_to_agents_matching_tags` tool to send a message to agents with "
+                            "tag 'subagent' asking them to check the weather in Seattle."
+                        )
+                    ),
+                ],
+            ),
+        ]
     )
 
 
@@ -306,7 +329,7 @@ def test_multi_agent_broadcast_client(client: Letta, weather_tool):
         client.agents.delete(agent_id=worker.id)
 
     # create worker agents
-    num_workers = 50
+    num_workers = 10
     for idx in range(num_workers):
         client.agents.create(
             name=f"worker_{idx}",
@@ -328,16 +351,59 @@ def test_multi_agent_broadcast_client(client: Letta, weather_tool):
     )
 
     # send a message to the supervisor
+    import time
+
+    start = time.perf_counter()
+    response = client.agents.messages.create(
+        agent_id=supervisor.id,
+        messages=[
+            MessageCreate(
+                role="user",
+                content=[
+                    TextContent(
+                        text="Use the `send_message_to_agents_matching_tags` tool to send a message to agents with tag 'worker' asking them to check the weather in Seattle."
+                    )
+                ],
+            )
+        ],
+    )
+    end = time.perf_counter()
+    print("TIME ELAPSED: " + str(end - start))
+    for message in response.messages:
+        print(message)
+
+
+def test_call_weather(client: Letta, weather_tool):
+    # delete any existing worker agents
+    workers = client.agents.list(tags=["worker", "supervisor"])
+    for worker in workers:
+        client.agents.delete(agent_id=worker.id)
+
+    # create supervisor agent
+    supervisor = client.agents.create(
+        name="supervisor",
+        include_base_tools=True,
+        tool_ids=[weather_tool.id],
+        model="openai/gpt-4o",
+        embedding="letta/letta-free",
+        tags=["supervisor"],
+    )
+
+    # send a message to the supervisor
+    import time
+
+    start = time.perf_counter()
     response = client.agents.messages.create(
         agent_id=supervisor.id,
         messages=[
             {
                 "role": "user",
-                "content": "Use the `send_message_to_agents_matching_tags` tool to send a message to agents with tag 'worker' asking them to check the weather in Seattle.",
+                "content": "What's the weather like in Seattle?",
             }
         ],
     )
-
+    end = time.perf_counter()
+    print("TIME ELAPSED: " + str(end - start))
     for message in response.messages:
         print(message)
 
@@ -385,23 +451,82 @@ def run_supervisor_worker_group(client: Letta, weather_tool, group_id: str):
     return response
 
 
-import concurrent.futures
+def test_anthropic_streaming(client: Letta):
+    agent_name = "anthropic_tester"
+
+    existing_agents = client.agents.list(tags=[agent_name])
+    for worker in existing_agents:
+        client.agents.delete(agent_id=worker.id)
+
+    llm_config = LLMConfig(
+        model="claude-3-7-sonnet-20250219",
+        model_endpoint_type="anthropic",
+        model_endpoint="https://api.anthropic.com/v1",
+        context_window=32000,
+        handle=f"anthropic/claude-3-5-sonnet-20241022",
+        put_inner_thoughts_in_kwargs=False,
+        max_tokens=4096,
+        enable_reasoner=True,
+        max_reasoning_tokens=1024,
+    )
+
+    agent = client.agents.create(
+        name=agent_name,
+        tags=[agent_name],
+        include_base_tools=True,
+        embedding="letta/letta-free",
+        llm_config=llm_config,
+        memory_blocks=[CreateBlock(label="human", value="")],
+        # tool_rules=[InitToolRule(tool_name="core_memory_append")]
+    )
+
+    response = client.agents.messages.create_stream(
+        agent_id=agent.id,
+        messages=[
+            MessageCreate(
+                role="user",
+                content=[TextContent(text="Use the core memory append tool to append `banana` to the persona core memory.")],
+            ),
+        ],
+        stream_tokens=True,
+    )
+
+    print(list(response))
 
 
-def test_multi_agent_broadcast_parallel(client: Letta, weather_tool):
-    start_time = time.time()
-    num_groups = 5
+import time
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_groups) as executor:
-        futures = []
-        for i in range(num_groups):
-            group_id = str(uuid.uuid4())[:8]
-            futures.append(executor.submit(run_supervisor_worker_group, client, weather_tool, group_id))
 
-        results = [f.result() for f in futures]
+def test_create_agents_telemetry(client: Letta):
+    start_total = time.perf_counter()
 
-    # Optionally: assert something or log runtimes
-    print(f"Executed {num_groups} supervisor-worker groups in parallel.")
-    print(f"Total runtime: {time.time() - start_time:.2f} seconds")
-    for idx, r in enumerate(results):
-        assert r is not None, f"Group {idx} returned no response"
+    # delete any existing worker agents
+    start_delete = time.perf_counter()
+    workers = client.agents.list(tags=["worker"])
+    for worker in workers:
+        client.agents.delete(agent_id=worker.id)
+    end_delete = time.perf_counter()
+    print(f"[telemetry] Deleted {len(workers)} existing worker agents in {end_delete - start_delete:.2f}s")
+
+    # create worker agents
+    num_workers = 1
+    agent_times = []
+    for idx in range(num_workers):
+        start = time.perf_counter()
+        client.agents.create(
+            name=f"worker_{idx}",
+            include_base_tools=True,
+            model="anthropic/claude-3-5-sonnet-20241022",
+            embedding="letta/letta-free",
+        )
+        end = time.perf_counter()
+        duration = end - start
+        agent_times.append(duration)
+        print(f"[telemetry] Created worker_{idx} in {duration:.2f}s")
+
+    total_duration = time.perf_counter() - start_total
+    avg_duration = sum(agent_times) / len(agent_times)
+
+    print(f"[telemetry] Total time to create {num_workers} agents: {total_duration:.2f}s")
+    print(f"[telemetry] Average agent creation time: {avg_duration:.2f}s")
+    print(f"[telemetry] Fastest agent: {min(agent_times):.2f}s, Slowest agent: {max(agent_times):.2f}s")

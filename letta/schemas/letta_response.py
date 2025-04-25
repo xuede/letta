@@ -1,12 +1,13 @@
 import html
 import json
 import re
+from datetime import datetime
 from typing import List, Union
 
 from pydantic import BaseModel, Field
 
 from letta.helpers.json_helpers import json_dumps
-from letta.schemas.enums import MessageStreamStatus
+from letta.schemas.enums import JobStatus, MessageStreamStatus
 from letta.schemas.letta_message import LettaMessage, LettaMessageUnion
 from letta.schemas.usage import LettaUsageStatistics
 
@@ -165,3 +166,12 @@ class LettaResponse(BaseModel):
 
 # The streaming response is either [DONE], [DONE_STEP], [DONE], an error, or a LettaMessage
 LettaStreamingResponse = Union[LettaMessage, MessageStreamStatus, LettaUsageStatistics]
+
+
+class LettaBatchResponse(BaseModel):
+    letta_batch_id: str = Field(..., description="A unique identifier for the Letta batch request.")
+    last_llm_batch_id: str = Field(..., description="A unique identifier for the most recent model provider batch request.")
+    status: JobStatus = Field(..., description="The current status of the batch request.")
+    agent_count: int = Field(..., description="The number of agents in the batch request.")
+    last_polled_at: datetime = Field(..., description="The timestamp when the batch was last polled for updates.")
+    created_at: datetime = Field(..., description="The timestamp when the batch request was created.")

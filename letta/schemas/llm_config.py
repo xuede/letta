@@ -1,6 +1,10 @@
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, root_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from letta.log import get_logger
+
+logger = get_logger(__name__)
 
 
 class LLMConfig(BaseModel):
@@ -63,14 +67,29 @@ class LLMConfig(BaseModel):
     enable_reasoner: bool = Field(
         False, description="Whether or not the model should use extended thinking if it is a 'reasoning' style model"
     )
+    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
+        None,
+        description="The reasoning effort to use when generating text reasoning models",
+    )
     max_reasoning_tokens: int = Field(
-        0, description="Configurable thinking budget for extended thinking, only used if enable_reasoner is True. Minimum value is 1024."
+        0, description="Configurable thinking budget for extended thinking. Used for enable_reasoner and also for Google Vertex models like Gemini 2.5 Flash. Minimum value is 1024 when used with enable_reasoner."
     )
 
     # FIXME hack to silence pydantic protected namespace warning
     model_config = ConfigDict(protected_namespaces=())
 
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
+    def set_default_enable_reasoner(cls, values):
+        # NOTE: this is really only applicable for models that can toggle reasoning on-and-off, like 3.7
+        # We can also use this field to identify if a model is a "reasoning" model (o1/o3, etc.) if we want
+        # if any(openai_reasoner_model in values.get("model", "") for openai_reasoner_model in ["o3-mini", "o1"]):
+        #     values["enable_reasoner"] = True
+        #     values["put_inner_thoughts_in_kwargs"] = False
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
     def set_default_put_inner_thoughts(cls, values):
         """
         Dynamically set the default for put_inner_thoughts_in_kwargs based on the model field,
@@ -79,19 +98,38 @@ class LLMConfig(BaseModel):
         model = values.get("model")
 
         # Define models where we want put_inner_thoughts_in_kwargs to be False
-        # For now it is gpt-4
         avoid_put_inner_thoughts_in_kwargs = ["gpt-4"]
 
-        # Only modify the value if it's None or not provided
         if values.get("put_inner_thoughts_in_kwargs") is None:
             values["put_inner_thoughts_in_kwargs"] = False if model in avoid_put_inner_thoughts_in_kwargs else True
 
+        # For the o1/o3 series from OpenAI, set to False by default
+        # We can set this flag to `true` if desired, which will enable "double-think"
+        from letta.llm_api.openai_client import is_openai_reasoning_model
+
+        if is_openai_reasoning_model(model):
+            values["put_inner_thoughts_in_kwargs"] = False
+
         return values
+
+    @model_validator(mode="after")
+    def issue_warning_for_reasoning_constraints(self) -> "LLMConfig":
+        if self.enable_reasoner:
+            if self.max_reasoning_tokens is None:
+                logger.warning("max_reasoning_tokens must be set when enable_reasoner is True")
+            if self.max_tokens is not None and self.max_reasoning_tokens >= self.max_tokens:
+                logger.warning("max_tokens must be greater than max_reasoning_tokens (thinking budget)")
+            if self.put_inner_thoughts_in_kwargs:
+                logger.debug("Extended thinking is not compatible with put_inner_thoughts_in_kwargs")
+        elif self.max_reasoning_tokens and not self.enable_reasoner:
+            logger.warning("model will not use reasoning unless enable_reasoner is set to True")
+
+        return self
 
     @classmethod
     def default_config(cls, model_name: str):
         """
-        Convinience function to generate a default `LLMConfig` from a model name. Only some models are supported in this function.
+        Convenience function to generate a default `LLMConfig` from a model name. Only some models are supported in this function.
 
         Args:
             model_name (str): The name of the model (gpt-4, gpt-4o-mini, letta).

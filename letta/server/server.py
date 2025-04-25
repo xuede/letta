@@ -8,6 +8,7 @@ from abc import abstractmethod
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from anthropic import AsyncAnthropic
 from composio.client import Composio
 from composio.client.collections import ActionModel, AppModel
 from fastapi import HTTPException
@@ -19,30 +20,29 @@ import letta.system as system
 from letta.agent import Agent, save_agent
 from letta.config import LettaConfig
 from letta.data_sources.connectors import DataConnector, load_data
-from letta.dynamic_multi_agent import DynamicMultiAgent
+from letta.errors import HandleNotFoundError
 from letta.functions.mcp_client.base_client import BaseMCPClient
 from letta.functions.mcp_client.sse_client import MCP_CONFIG_TOPLEVEL_KEY, SSEMCPClient
 from letta.functions.mcp_client.stdio_client import StdioMCPClient
 from letta.functions.mcp_client.types import MCPServerType, MCPTool, SSEServerConfig, StdioServerConfig
+from letta.groups.helpers import load_multi_agent
 from letta.helpers.datetime_helpers import get_utc_time
 from letta.helpers.json_helpers import json_dumps, json_loads
-from letta.helpers.message_helper import prepare_input_message_create
 
 # TODO use custom interface
 from letta.interface import AgentInterface  # abstract
 from letta.interface import CLIInterface  # for printing to terminal
 from letta.log import get_logger
-from letta.offline_memory_agent import OfflineMemoryAgent
 from letta.orm.errors import NoResultFound
-from letta.round_robin_multi_agent import RoundRobinMultiAgent
+from letta.prompts.gpt_system import get_system_text
 from letta.schemas.agent import AgentState, AgentType, CreateAgent, UpdateAgent
-from letta.schemas.block import BlockUpdate
+from letta.schemas.block import Block, BlockUpdate, CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 
 # openai schemas
 from letta.schemas.enums import JobStatus, MessageStreamStatus
 from letta.schemas.environment_variables import SandboxEnvironmentVariableCreate
-from letta.schemas.group import Group, ManagerType
+from letta.schemas.group import GroupCreate, SleeptimeManager
 from letta.schemas.job import Job, JobUpdate
 from letta.schemas.letta_message import LegacyLettaMessage, LettaMessage, ToolReturnMessage
 from letta.schemas.letta_message_content import TextContent
@@ -68,7 +68,7 @@ from letta.schemas.providers import (
     TogetherProvider,
     VLLMChatCompletionsProvider,
     VLLMCompletionsProvider,
-    xAIProvider,
+    XAIProvider,
 )
 from letta.schemas.sandbox_config import SandboxType
 from letta.schemas.source import Source
@@ -83,6 +83,7 @@ from letta.services.block_manager import BlockManager
 from letta.services.group_manager import GroupManager
 from letta.services.identity_manager import IdentityManager
 from letta.services.job_manager import JobManager
+from letta.services.llm_batch_manager import LLMBatchManager
 from letta.services.message_manager import MessageManager
 from letta.services.organization_manager import OrganizationManager
 from letta.services.passage_manager import PassageManager
@@ -94,9 +95,8 @@ from letta.services.tool_executor.tool_execution_sandbox import ToolExecutionSan
 from letta.services.tool_manager import ToolManager
 from letta.services.user_manager import UserManager
 from letta.settings import model_settings, settings, tool_settings
-from letta.supervisor_multi_agent import SupervisorMultiAgent
-from letta.tracing import trace_method
-from letta.utils import get_friendly_error_msg
+from letta.tracing import log_event, trace_method
+from letta.utils import get_friendly_error_msg, get_persona_text, make_key
 
 config = LettaConfig.load()
 logger = get_logger(__name__)
@@ -147,7 +147,7 @@ class Server(object):
         raise NotImplementedError
 
     @abstractmethod
-    def send_messages(self, user_id: str, agent_id: str, messages: Union[MessageCreate, List[Message]]) -> None:
+    def send_messages(self, user_id: str, agent_id: str, input_messages: List[MessageCreate]) -> None:
         """Send a list of messages to the agent"""
         raise NotImplementedError
 
@@ -209,6 +209,7 @@ class SyncServer(Server):
         self.step_manager = StepManager()
         self.identity_manager = IdentityManager()
         self.group_manager = GroupManager()
+        self.batch_manager = LLMBatchManager()
 
         # Make default user and org
         if init_with_default_org_and_user:
@@ -320,7 +321,7 @@ class SyncServer(Server):
         if model_settings.deepseek_api_key:
             self._enabled_providers.append(DeepSeekProvider(api_key=model_settings.deepseek_api_key))
         if model_settings.xai_api_key:
-            self._enabled_providers.append(xAIProvider(api_key=model_settings.xai_api_key))
+            self._enabled_providers.append(XAIProvider(api_key=model_settings.xai_api_key))
 
         # For MCP
         """Initialize the MCP clients (there may be multiple)"""
@@ -348,82 +349,35 @@ class SyncServer(Server):
             logger.info(f"MCP tools connected: {', '.join([t.name for t in mcp_tools])}")
             logger.debug(f"MCP tools: {', '.join([str(t) for t in mcp_tools])}")
 
+        # TODO: Remove these in memory caches
+        self._llm_config_cache = {}
+        self._embedding_config_cache = {}
+
+        # TODO: Replace this with the Anthropic client we have in house
+        self.anthropic_async_client = AsyncAnthropic()
+
     def load_agent(self, agent_id: str, actor: User, interface: Union[AgentInterface, None] = None) -> Agent:
         """Updated method to load agents from persisted storage"""
         agent_state = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
         if agent_state.multi_agent_group:
-            return self.load_multi_agent(agent_state.multi_agent_group, actor, interface, agent_state)
+            return load_multi_agent(
+                group=agent_state.multi_agent_group, agent_state=agent_state, actor=actor, interface=interface, mcp_clients=self.mcp_clients
+            )
 
         interface = interface or self.default_interface_factory()
-        if agent_state.agent_type == AgentType.memgpt_agent:
-            agent = Agent(agent_state=agent_state, interface=interface, user=actor, mcp_clients=self.mcp_clients)
-        elif agent_state.agent_type == AgentType.offline_memory_agent:
-            agent = OfflineMemoryAgent(agent_state=agent_state, interface=interface, user=actor)
-        else:
-            raise ValueError(f"Invalid agent type {agent_state.agent_type}")
-
-        return agent
-
-    def load_multi_agent(
-        self, group: Group, actor: User, interface: Union[AgentInterface, None] = None, agent_state: Optional[AgentState] = None
-    ) -> Agent:
-        if len(group.agent_ids) == 0:
-            raise ValueError("Empty group: group must have at least one agent")
-
-        match group.manager_type:
-            case ManagerType.round_robin:
-                agent_state = agent_state or self.agent_manager.get_agent_by_id(agent_id=group.agent_ids[0], actor=actor)
-                return RoundRobinMultiAgent(
-                    agent_state=agent_state,
-                    interface=interface,
-                    user=actor,
-                    group_id=group.id,
-                    agent_ids=group.agent_ids,
-                    description=group.description,
-                    max_turns=group.max_turns,
-                )
-            case ManagerType.dynamic:
-                agent_state = agent_state or self.agent_manager.get_agent_by_id(agent_id=group.manager_agent_id, actor=actor)
-                return DynamicMultiAgent(
-                    agent_state=agent_state,
-                    interface=interface,
-                    user=actor,
-                    group_id=group.id,
-                    agent_ids=group.agent_ids,
-                    description=group.description,
-                    max_turns=group.max_turns,
-                    termination_token=group.termination_token,
-                )
-            case ManagerType.supervisor:
-                agent_state = agent_state or self.agent_manager.get_agent_by_id(agent_id=group.manager_agent_id, actor=actor)
-                return SupervisorMultiAgent(
-                    agent_state=agent_state,
-                    interface=interface,
-                    user=actor,
-                    group_id=group.id,
-                    agent_ids=group.agent_ids,
-                    description=group.description,
-                )
-            case _:
-                raise ValueError(f"Type {group.manager_type} is not supported.")
+        return Agent(agent_state=agent_state, interface=interface, user=actor, mcp_clients=self.mcp_clients)
 
     def _step(
         self,
         actor: User,
         agent_id: str,
-        input_messages: Union[Message, List[Message]],
+        input_messages: List[MessageCreate],
         interface: Union[AgentInterface, None] = None,  # needed to getting responses
         put_inner_thoughts_first: bool = True,
         # timestamp: Optional[datetime],
     ) -> LettaUsageStatistics:
         """Send the input message through the agent"""
         # TODO: Thread actor directly through this function, since the top level caller most likely already retrieved the user
-        # Input validation
-        if isinstance(input_messages, Message):
-            input_messages = [input_messages]
-        if not all(isinstance(m, Message) for m in input_messages):
-            raise ValueError(f"messages should be a Message or a list of Message, got {type(input_messages)}")
-
         logger.debug(f"Got input messages: {input_messages}")
         letta_agent = None
         try:
@@ -439,8 +393,9 @@ class SyncServer(Server):
                 metadata = interface.metadata if hasattr(interface, "metadata") else None
             else:
                 metadata = None
+
             usage_stats = letta_agent.step(
-                messages=input_messages,
+                input_messages=input_messages,
                 chaining=self.chaining,
                 max_chaining_steps=self.max_chaining_steps,
                 stream=token_streaming,
@@ -611,23 +566,14 @@ class SyncServer(Server):
             )
 
             # NOTE: eventually deprecate and only allow passing Message types
-            # Convert to a Message object
-            if timestamp:
-                message = Message(
-                    agent_id=agent_id,
-                    role="user",
-                    content=[TextContent(text=packaged_user_message)],
-                    created_at=timestamp,
-                )
-            else:
-                message = Message(
-                    agent_id=agent_id,
-                    role="user",
-                    content=[TextContent(text=packaged_user_message)],
-                )
+            message = MessageCreate(
+                agent_id=agent_id,
+                role="user",
+                content=[TextContent(text=packaged_user_message)],
+            )
 
         # Run the agent state forward
-        usage = self._step(actor=actor, agent_id=agent_id, input_messages=message)
+        usage = self._step(actor=actor, agent_id=agent_id, input_messages=[message])
         return usage
 
     def system_message(
@@ -699,23 +645,14 @@ class SyncServer(Server):
         self,
         actor: User,
         agent_id: str,
-        messages: Union[List[MessageCreate], List[Message]],
+        input_messages: List[MessageCreate],
         wrap_user_message: bool = True,
         wrap_system_message: bool = True,
         interface: Union[AgentInterface, ChatCompletionsStreamingInterface, None] = None,  # needed for responses
         metadata: Optional[dict] = None,  # Pass through metadata to interface
         put_inner_thoughts_first: bool = True,
     ) -> LettaUsageStatistics:
-        """Send a list of messages to the agent.
-
-        If messages are of type MessageCreate, convert them to Message objects before sending.
-        """
-        if all(isinstance(m, MessageCreate) for m in messages):
-            message_objects = [prepare_input_message_create(m, agent_id, wrap_user_message, wrap_system_message) for m in messages]
-        elif all(isinstance(m, Message) for m in messages):
-            message_objects = messages
-        else:
-            raise ValueError(f"All messages must be of type Message or MessageCreate, got {[type(m) for m in messages]}")
+        """Send a list of messages to the agent."""
 
         # Store metadata in interface if provided
         if metadata and hasattr(interface, "metadata"):
@@ -725,7 +662,7 @@ class SyncServer(Server):
         return self._step(
             actor=actor,
             agent_id=agent_id,
-            input_messages=message_objects,
+            input_messages=input_messages,
             interface=interface,
             put_inner_thoughts_first=put_inner_thoughts_first,
         )
@@ -739,6 +676,21 @@ class SyncServer(Server):
                 command = command[1:]  # strip the prefix
         return self._command(user_id=user_id, agent_id=agent_id, command=command)
 
+    @trace_method
+    def get_cached_llm_config(self, **kwargs):
+        key = make_key(**kwargs)
+        if key not in self._llm_config_cache:
+            self._llm_config_cache[key] = self.get_llm_config_from_handle(**kwargs)
+        return self._llm_config_cache[key]
+
+    @trace_method
+    def get_cached_embedding_config(self, **kwargs):
+        key = make_key(**kwargs)
+        if key not in self._embedding_config_cache:
+            self._embedding_config_cache[key] = self.get_embedding_config_from_handle(**kwargs)
+        return self._embedding_config_cache[key]
+
+    @trace_method
     def create_agent(
         self,
         request: CreateAgent,
@@ -749,27 +701,39 @@ class SyncServer(Server):
         if request.llm_config is None:
             if request.model is None:
                 raise ValueError("Must specify either model or llm_config in request")
-            request.llm_config = self.get_llm_config_from_handle(
-                handle=request.model,
-                context_window_limit=request.context_window_limit,
-                max_tokens=request.max_tokens,
-                max_reasoning_tokens=request.max_reasoning_tokens,
-                enable_reasoner=request.enable_reasoner,
-            )
+            config_params = {
+                "handle": request.model,
+                "context_window_limit": request.context_window_limit,
+                "max_tokens": request.max_tokens,
+                "max_reasoning_tokens": request.max_reasoning_tokens,
+                "enable_reasoner": request.enable_reasoner,
+            }
+            log_event(name="start get_cached_llm_config", attributes=config_params)
+            request.llm_config = self.get_cached_llm_config(**config_params)
+            log_event(name="end get_cached_llm_config", attributes=config_params)
 
         if request.embedding_config is None:
             if request.embedding is None:
                 raise ValueError("Must specify either embedding or embedding_config in request")
-            request.embedding_config = self.get_embedding_config_from_handle(
-                handle=request.embedding, embedding_chunk_size=request.embedding_chunk_size or constants.DEFAULT_EMBEDDING_CHUNK_SIZE
-            )
+            embedding_config_params = {
+                "handle": request.embedding,
+                "embedding_chunk_size": request.embedding_chunk_size or constants.DEFAULT_EMBEDDING_CHUNK_SIZE,
+            }
+            log_event(name="start get_cached_embedding_config", attributes=embedding_config_params)
+            request.embedding_config = self.get_cached_embedding_config(**embedding_config_params)
+            log_event(name="end get_cached_embedding_config", attributes=embedding_config_params)
 
-        """Create a new agent using a config"""
-        # Invoke manager
-        return self.agent_manager.create_agent(
+        log_event(name="start create_agent db")
+        main_agent = self.agent_manager.create_agent(
             agent_create=request,
             actor=actor,
         )
+        log_event(name="end create_agent db")
+
+        if request.enable_sleeptime:
+            main_agent = self.create_sleeptime_agent(main_agent=main_agent, actor=actor)
+
+        return main_agent
 
     def update_agent(
         self,
@@ -783,12 +747,48 @@ class SyncServer(Server):
         if request.embedding is not None:
             request.embedding_config = self.get_embedding_config_from_handle(handle=request.embedding)
 
-        # Invoke manager
+        if request.enable_sleeptime:
+            agent = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
+            if agent.multi_agent_group is None:
+                self.create_sleeptime_agent(main_agent=agent, actor=actor)
+
         return self.agent_manager.update_agent(
             agent_id=agent_id,
             agent_update=request,
             actor=actor,
         )
+
+    def create_sleeptime_agent(self, main_agent: AgentState, actor: User) -> AgentState:
+        request = CreateAgent(
+            name=main_agent.name + "-sleeptime",
+            agent_type=AgentType.sleeptime_agent,
+            block_ids=[block.id for block in main_agent.memory.blocks],
+            memory_blocks=[
+                CreateBlock(
+                    label="memory_persona",
+                    value=get_persona_text("sleeptime_memory_persona"),
+                ),
+            ],
+            llm_config=main_agent.llm_config,
+            embedding_config=main_agent.embedding_config,
+            project_id=main_agent.project_id,
+        )
+        sleeptime_agent = self.agent_manager.create_agent(
+            agent_create=request,
+            actor=actor,
+        )
+        self.group_manager.create_group(
+            group=GroupCreate(
+                description="",
+                agent_ids=[sleeptime_agent.id],
+                manager_config=SleeptimeManager(
+                    manager_agent_id=main_agent.id,
+                    sleeptime_agent_frequency=5,
+                ),
+            ),
+            actor=actor,
+        )
+        return self.agent_manager.get_agent_by_id(agent_id=main_agent.id, actor=actor)
 
     # convert name->id
 
@@ -892,6 +892,7 @@ class SyncServer(Server):
                 use_assistant_message=use_assistant_message,
                 assistant_message_tool_name=assistant_message_tool_name,
                 assistant_message_tool_kwarg=assistant_message_tool_kwarg,
+                reverse=reverse,
             )
 
         if reverse:
@@ -960,12 +961,6 @@ class SyncServer(Server):
         connector = DirectoryConnector(input_files=[file_path])
         num_passages, num_documents = self.load_data(user_id=source.created_by_id, source_name=source.name, connector=connector)
 
-        # update job status
-        job.status = JobStatus.completed
-        job.metadata["num_passages"] = num_passages
-        job.metadata["num_documents"] = num_documents
-        self.job_manager.update_job_by_id(job_id=job_id, job_update=JobUpdate(**job.model_dump()), actor=actor)
-
         # update all agents who have this source attached
         agent_states = self.source_manager.list_attached_agents(source_id=source_id, actor=actor)
         for agent_state in agent_states:
@@ -973,14 +968,69 @@ class SyncServer(Server):
 
             # Attach source to agent
             curr_passage_size = self.agent_manager.passage_size(actor=actor, agent_id=agent_id)
-            self.agent_manager.attach_source(agent_id=agent_state.id, source_id=source_id, actor=actor)
+            agent_state = self.agent_manager.attach_source(agent_id=agent_state.id, source_id=source_id, actor=actor)
             new_passage_size = self.agent_manager.passage_size(actor=actor, agent_id=agent_id)
             assert new_passage_size >= curr_passage_size  # in case empty files are added
 
             # rebuild system prompt and force
-            self.agent_manager.rebuild_system_prompt(agent_id=agent_id, actor=actor, force=True)
+            agent_state = self.agent_manager.rebuild_system_prompt(agent_id=agent_id, actor=actor, force=True)
+
+        # update job status
+        job.status = JobStatus.completed
+        job.metadata["num_passages"] = num_passages
+        job.metadata["num_documents"] = num_documents
+        self.job_manager.update_job_by_id(job_id=job_id, job_update=JobUpdate(**job.model_dump()), actor=actor)
 
         return job
+
+    def sleeptime_document_ingest(self, main_agent: AgentState, source: Source, actor: User, clear_history: bool = False) -> None:
+        sleeptime_agent = self.create_document_sleeptime_agent(main_agent, source, actor, clear_history)
+        agent = self.load_agent(agent_id=sleeptime_agent.id, actor=actor)
+        for passage in self.list_data_source_passages(source_id=source.id, user_id=actor.id):
+            agent.step(
+                input_messages=[
+                    MessageCreate(role="user", content=passage.text),
+                ]
+            )
+        self.agent_manager.delete_agent(agent_id=sleeptime_agent.id, actor=actor)
+
+    def create_document_sleeptime_agent(
+        self, main_agent: AgentState, source: Source, actor: User, clear_history: bool = False
+    ) -> AgentState:
+        try:
+            block = self.agent_manager.get_block_with_label(agent_id=main_agent.id, block_label=source.name, actor=actor)
+        except:
+            block = self.block_manager.create_or_update_block(Block(label=source.name, value=""), actor=actor)
+            self.agent_manager.attach_block(agent_id=main_agent.id, block_id=block.id, actor=actor)
+
+        if clear_history and block.value != "":
+            block = self.block_manager.update_block(block_id=block.id, block=BlockUpdate(value=""))
+
+        request = CreateAgent(
+            name=main_agent.name + "-doc-sleeptime",
+            system=get_system_text("sleeptime_doc_ingest"),
+            agent_type=AgentType.sleeptime_agent,
+            block_ids=[block.id],
+            memory_blocks=[
+                CreateBlock(
+                    label="persona",
+                    value=get_persona_text("sleeptime_doc_persona"),
+                ),
+                CreateBlock(
+                    label="instructions",
+                    value=source.description,
+                ),
+            ],
+            llm_config=main_agent.llm_config,
+            embedding_config=main_agent.embedding_config,
+            project_id=main_agent.project_id,
+            include_base_tools=False,
+            tools=constants.BASE_SLEEPTIME_TOOLS,
+        )
+        return self.agent_manager.create_agent(
+            agent_create=request,
+            actor=actor,
+        )
 
     def load_data(
         self,
@@ -1083,6 +1133,7 @@ class SyncServer(Server):
         # Merge the two dictionaries, keeping the values from providers_from_db where conflicts occur
         return {**providers_from_env, **providers_from_db}.values()
 
+    @trace_method
     def get_llm_config_from_handle(
         self,
         handle: str,
@@ -1099,9 +1150,12 @@ class SyncServer(Server):
             if not llm_configs:
                 llm_configs = [config for config in provider.list_llm_models() if config.model == model_name]
             if not llm_configs:
-                raise ValueError(f"LLM model {model_name} is not supported by {provider_name}")
+                available_handles = [config.handle for config in provider.list_llm_models()]
+                raise HandleNotFoundError(handle, available_handles)
         except ValueError as e:
             llm_configs = [config for config in self.get_local_llm_configs() if config.handle == handle]
+            if not llm_configs:
+                llm_configs = [config for config in self.get_local_llm_configs() if config.model == model_name]
             if not llm_configs:
                 raise e
 
@@ -1130,23 +1184,29 @@ class SyncServer(Server):
 
         return llm_config
 
+    @trace_method
     def get_embedding_config_from_handle(
         self, handle: str, embedding_chunk_size: int = constants.DEFAULT_EMBEDDING_CHUNK_SIZE
     ) -> EmbeddingConfig:
-        provider_name, model_name = handle.split("/", 1)
-        provider = self.get_provider_from_name(provider_name)
+        try:
+            provider_name, model_name = handle.split("/", 1)
+            provider = self.get_provider_from_name(provider_name)
 
-        embedding_configs = [config for config in provider.list_embedding_models() if config.handle == handle]
-        if len(embedding_configs) == 1:
-            embedding_config = embedding_configs[0]
-        else:
-            embedding_configs = [config for config in provider.list_embedding_models() if config.embedding_model == model_name]
+            embedding_configs = [config for config in provider.list_embedding_models() if config.handle == handle]
             if not embedding_configs:
                 raise ValueError(f"Embedding model {model_name} is not supported by {provider_name}")
-            elif len(embedding_configs) > 1:
-                raise ValueError(f"Multiple embedding models with name {model_name} supported by {provider_name}")
-            else:
-                embedding_config = embedding_configs[0]
+        except ValueError as e:
+            # search local configs
+            embedding_configs = [config for config in self.get_local_embedding_configs() if config.handle == handle]
+            if not embedding_configs:
+                raise e
+
+        if len(embedding_configs) == 1:
+            embedding_config = embedding_configs[0]
+        elif len(embedding_configs) > 1:
+            raise ValueError(f"Multiple embedding models with name {model_name} supported by {provider_name}")
+        else:
+            embedding_config = embedding_configs[0]
 
         if embedding_chunk_size:
             embedding_config.embedding_chunk_size = embedding_chunk_size
@@ -1183,6 +1243,25 @@ class SyncServer(Server):
             warnings.warn(f"Error reading LLM configs directory: {e}")
         return llm_models
 
+    def get_local_embedding_configs(self):
+        embedding_models = []
+        try:
+            embedding_configs_dir = os.path.expanduser("~/.letta/embedding_configs")
+            if os.path.exists(embedding_configs_dir):
+                for filename in os.listdir(embedding_configs_dir):
+                    if filename.endswith(".json"):
+                        filepath = os.path.join(embedding_configs_dir, filename)
+                        try:
+                            with open(filepath, "r") as f:
+                                config_data = json.load(f)
+                                embedding_config = EmbeddingConfig(**config_data)
+                                embedding_models.append(embedding_config)
+                        except (json.JSONDecodeError, ValueError) as e:
+                            warnings.warn(f"Error parsing embedding config file {filename}: {e}")
+        except Exception as e:
+            warnings.warn(f"Error reading embedding configs directory: {e}")
+        return embedding_models
+
     def add_llm_model(self, request: LLMConfig) -> LLMConfig:
         """Add a new LLM model"""
 
@@ -1208,16 +1287,16 @@ class SyncServer(Server):
         if tool_source_type is not None and tool_source_type != "python":
             raise ValueError("Only Python source code is supported at this time")
 
-        # NOTE: we're creating a floating Tool object and NOT persisting to DB
-        tool = Tool(
-            name=tool_name,
-            source_code=tool_source,
-            args_json_schema=tool_args_json_schema,
-        )
-
         # If tools_json_schema is explicitly passed in, override it on the created Tool object
         if tool_json_schema:
-            tool.json_schema = tool_json_schema
+            tool = Tool(name=tool_name, source_code=tool_source, json_schema=tool_json_schema)
+        else:
+            # NOTE: we're creating a floating Tool object and NOT persisting to DB
+            tool = Tool(
+                name=tool_name,
+                source_code=tool_source,
+                args_json_schema=tool_args_json_schema,
+            )
 
         assert tool.name is not None, "Failed to create tool object"
 
@@ -1226,17 +1305,19 @@ class SyncServer(Server):
 
         # Next, attempt to run the tool with the sandbox
         try:
-            sandbox_run_result = ToolExecutionSandbox(tool.name, tool_args, actor, tool_object=tool).run(
+            tool_execution_result = ToolExecutionSandbox(tool.name, tool_args, actor, tool_object=tool).run(
                 agent_state=agent_state, additional_env_vars=tool_env_vars
             )
+            status = "error" if tool_execution_result.stderr else "success"
+            tool_return = str(tool_execution_result.stderr) if tool_execution_result.stderr else str(tool_execution_result.func_return)
             return ToolReturnMessage(
                 id="null",
                 tool_call_id="null",
                 date=get_utc_time(),
-                status=sandbox_run_result.status,
-                tool_return=str(sandbox_run_result.func_return),
-                stdout=sandbox_run_result.stdout,
-                stderr=sandbox_run_result.stderr,
+                status=status,
+                tool_return=tool_return,
+                stdout=tool_execution_result.stdout,
+                stderr=tool_execution_result.stderr,
             )
 
         except Exception as e:
@@ -1450,7 +1531,7 @@ class SyncServer(Server):
         agent_id: str,
         actor: User,
         # role: MessageRole,
-        messages: Union[List[Message], List[MessageCreate]],
+        input_messages: List[MessageCreate],
         stream_steps: bool,
         stream_tokens: bool,
         # related to whether or not we return `LettaMessage`s or `Message`s
@@ -1530,7 +1611,7 @@ class SyncServer(Server):
                     self.send_messages,
                     actor=actor,
                     agent_id=agent_id,
-                    messages=messages,
+                    input_messages=input_messages,
                     interface=streaming_interface,
                     metadata=metadata,
                 )
@@ -1584,7 +1665,7 @@ class SyncServer(Server):
         self,
         group_id: str,
         actor: User,
-        messages: Union[List[Message], List[MessageCreate]],
+        input_messages: Union[List[Message], List[MessageCreate]],
         stream_steps: bool,
         stream_tokens: bool,
         chat_completion_mode: bool = False,
@@ -1599,7 +1680,9 @@ class SyncServer(Server):
             raise ValueError("stream_steps must be 'true' if stream_tokens is 'true'")
 
         group = self.group_manager.retrieve_group(group_id=group_id, actor=actor)
-        letta_multi_agent = self.load_multi_agent(group=group, actor=actor)
+        agent_state_id = group.manager_agent_id or (group.agent_ids[0] if len(group.agent_ids) > 0 else None)
+        agent_state = self.agent_manager.get_agent_by_id(agent_id=agent_state_id, actor=actor) if agent_state_id else None
+        letta_multi_agent = load_multi_agent(group=group, agent_state=agent_state, actor=actor)
 
         llm_config = letta_multi_agent.agent_state.llm_config
         supports_token_streaming = ["openai", "anthropic", "deepseek"]
@@ -1632,7 +1715,7 @@ class SyncServer(Server):
         task = asyncio.create_task(
             asyncio.to_thread(
                 letta_multi_agent.step,
-                messages=messages,
+                input_messages=input_messages,
                 chaining=self.chaining,
                 max_chaining_steps=self.max_chaining_steps,
             )

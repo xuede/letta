@@ -10,6 +10,7 @@ from letta.schemas.tool_rule import (
     ContinueToolRule,
     InitToolRule,
     MaxCountPerStepToolRule,
+    ParentToolRule,
     TerminalToolRule,
 )
 
@@ -33,34 +34,59 @@ class ToolRulesSolver(BaseModel):
     child_based_tool_rules: List[Union[ChildToolRule, ConditionalToolRule, MaxCountPerStepToolRule]] = Field(
         default_factory=list, description="Standard tool rules for controlling execution sequence and allowed transitions."
     )
+    parent_tool_rules: List[ParentToolRule] = Field(
+        default_factory=list, description="Filter tool rules to be used to filter out tools from the available set."
+    )
     terminal_tool_rules: List[TerminalToolRule] = Field(
         default_factory=list, description="Terminal tool rules that end the agent loop if called."
     )
     tool_call_history: List[str] = Field(default_factory=list, description="History of tool calls, updated with each tool call.")
 
-    def __init__(self, tool_rules: List[BaseToolRule], **kwargs):
-        super().__init__(**kwargs)
-        # Separate the provided tool rules into init, standard, and terminal categories
-        for rule in tool_rules:
-            if rule.type == ToolRuleType.run_first:
-                assert isinstance(rule, InitToolRule)
-                self.init_tool_rules.append(rule)
-            elif rule.type == ToolRuleType.constrain_child_tools:
-                assert isinstance(rule, ChildToolRule)
-                self.child_based_tool_rules.append(rule)
-            elif rule.type == ToolRuleType.conditional:
-                assert isinstance(rule, ConditionalToolRule)
-                self.validate_conditional_tool(rule)
-                self.child_based_tool_rules.append(rule)
-            elif rule.type == ToolRuleType.exit_loop:
-                assert isinstance(rule, TerminalToolRule)
-                self.terminal_tool_rules.append(rule)
-            elif rule.type == ToolRuleType.continue_loop:
-                assert isinstance(rule, ContinueToolRule)
-                self.continue_tool_rules.append(rule)
-            elif rule.type == ToolRuleType.max_count_per_step:
-                assert isinstance(rule, MaxCountPerStepToolRule)
-                self.child_based_tool_rules.append(rule)
+    def __init__(
+        self,
+        tool_rules: Optional[List[BaseToolRule]] = None,
+        init_tool_rules: Optional[List[InitToolRule]] = None,
+        continue_tool_rules: Optional[List[ContinueToolRule]] = None,
+        child_based_tool_rules: Optional[List[Union[ChildToolRule, ConditionalToolRule, MaxCountPerStepToolRule]]] = None,
+        parent_tool_rules: Optional[List[ParentToolRule]] = None,
+        terminal_tool_rules: Optional[List[TerminalToolRule]] = None,
+        tool_call_history: Optional[List[str]] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            init_tool_rules=init_tool_rules or [],
+            continue_tool_rules=continue_tool_rules or [],
+            child_based_tool_rules=child_based_tool_rules or [],
+            parent_tool_rules=parent_tool_rules or [],
+            terminal_tool_rules=terminal_tool_rules or [],
+            tool_call_history=tool_call_history or [],
+            **kwargs,
+        )
+
+        if tool_rules:
+            for rule in tool_rules:
+                if rule.type == ToolRuleType.run_first:
+                    assert isinstance(rule, InitToolRule)
+                    self.init_tool_rules.append(rule)
+                elif rule.type == ToolRuleType.constrain_child_tools:
+                    assert isinstance(rule, ChildToolRule)
+                    self.child_based_tool_rules.append(rule)
+                elif rule.type == ToolRuleType.conditional:
+                    assert isinstance(rule, ConditionalToolRule)
+                    self.validate_conditional_tool(rule)
+                    self.child_based_tool_rules.append(rule)
+                elif rule.type == ToolRuleType.exit_loop:
+                    assert isinstance(rule, TerminalToolRule)
+                    self.terminal_tool_rules.append(rule)
+                elif rule.type == ToolRuleType.continue_loop:
+                    assert isinstance(rule, ContinueToolRule)
+                    self.continue_tool_rules.append(rule)
+                elif rule.type == ToolRuleType.max_count_per_step:
+                    assert isinstance(rule, MaxCountPerStepToolRule)
+                    self.child_based_tool_rules.append(rule)
+                elif rule.type == ToolRuleType.parent_last_tool:
+                    assert isinstance(rule, ParentToolRule)
+                    self.parent_tool_rules.append(rule)
 
     def register_tool_call(self, tool_name: str):
         """Update the internal state to track tool call history."""
@@ -85,13 +111,14 @@ class ToolRulesSolver(BaseModel):
                 # If there are init tool rules, only return those defined in the init tool rules
                 return [rule.tool_name for rule in self.init_tool_rules]
             else:
-                # Otherwise, return all the available tools
+                # Otherwise, return all tools besides those constrained by parent tool rules
+                available_tools = available_tools - set.union(set(), *(set(rule.children) for rule in self.parent_tool_rules))
                 return list(available_tools)
         else:
             # Collect valid tools from all child-based rules
             valid_tool_sets = [
                 rule.get_valid_tools(self.tool_call_history, available_tools, last_function_response)
-                for rule in self.child_based_tool_rules
+                for rule in self.child_based_tool_rules + self.parent_tool_rules
             ]
 
             # Compute intersection of all valid tool sets

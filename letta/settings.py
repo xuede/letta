@@ -17,6 +17,7 @@ class ToolSettings(BaseSettings):
 
     # Local Sandbox configurations
     local_sandbox_dir: Optional[str] = None
+    local_sandbox_timeout: float = 180
 
     # MCP settings
     mcp_connect_to_server_timeout: float = 30.0
@@ -166,8 +167,8 @@ class Settings(BaseSettings):
     pg_host: Optional[str] = None
     pg_port: Optional[int] = None
     pg_uri: Optional[str] = default_pg_uri  # option to specify full uri
-    pg_pool_size: int = 20  # Concurrent connections
-    pg_max_overflow: int = 10  # Overflow limit
+    pg_pool_size: int = 80  # Concurrent connections
+    pg_max_overflow: int = 30  # Overflow limit
     pg_pool_timeout: int = 30  # Seconds to wait for a connection
     pg_pool_recycle: int = 1800  # When to recycle connections
     pg_echo: bool = False  # Logging
@@ -202,6 +203,10 @@ class Settings(BaseSettings):
     httpx_max_connections: int = 500
     httpx_max_keepalive_connections: int = 500
     httpx_keepalive_expiry: float = 120.0
+
+    # cron job parameters
+    enable_batch_job_polling: bool = False
+    poll_running_llm_batches_interval_seconds: int = 5 * 60
 
     @property
     def letta_pg_uri(self) -> str:

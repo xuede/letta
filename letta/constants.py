@@ -47,20 +47,33 @@ DEFAULT_PERSONA = "sam_pov"
 DEFAULT_HUMAN = "basic"
 DEFAULT_PRESET = "memgpt_chat"
 
+SEND_MESSAGE_TOOL_NAME = "send_message"
 # Base tools that cannot be edited, as they access agent state directly
 # Note that we don't include "conversation_search_date" for now
-BASE_TOOLS = ["send_message", "conversation_search", "archival_memory_insert", "archival_memory_search"]
+BASE_TOOLS = [SEND_MESSAGE_TOOL_NAME, "conversation_search", "archival_memory_insert", "archival_memory_search"]
 # Base memory tools CAN be edited, and are added by default by the server
 BASE_MEMORY_TOOLS = ["core_memory_append", "core_memory_replace"]
+# Base tools if the memgpt agent has enable_sleeptime on
+BASE_SLEEPTIME_CHAT_TOOLS = [SEND_MESSAGE_TOOL_NAME, "conversation_search", "archival_memory_search"]
+# Base memory tools for sleeptime agent
+BASE_SLEEPTIME_TOOLS = [
+    "memory_replace",
+    "memory_insert",
+    "memory_rethink",
+    "memory_finish_edits",
+    # "archival_memory_insert",
+    # "archival_memory_search",
+    # "conversation_search",
+]
 # Multi agent tools
 MULTI_AGENT_TOOLS = ["send_message_to_agent_and_wait_for_reply", "send_message_to_agents_matching_tags", "send_message_to_agent_async"]
 # Set of all built-in Letta tools
-LETTA_TOOL_SET = set(BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS)
+LETTA_TOOL_SET = set(BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS + BASE_SLEEPTIME_TOOLS)
 
 # The name of the tool used to send message to the user
 # May not be relevant in cases where the agent has multiple ways to message to user (send_imessage, send_discord_mesasge, ...)
 # or in cases where the agent has no concept of messaging a user (e.g. a workflow agent)
-DEFAULT_MESSAGE_TOOL = "send_message"
+DEFAULT_MESSAGE_TOOL = SEND_MESSAGE_TOOL_NAME
 DEFAULT_MESSAGE_TOOL_KWARG = "message"
 
 PRE_EXECUTION_MESSAGE_ARG = "pre_exec_msg"
@@ -91,6 +104,11 @@ ERROR_MESSAGE_PREFIX = "Error"
 
 NON_USER_MSG_PREFIX = "[This is an automated system message hidden from the user] "
 
+CORE_MEMORY_LINE_NUMBER_WARNING = (
+    "# NOTE: Line numbers shown below are to help during editing. Do NOT include line number prefixes in your memory edit tool calls."
+)
+
+
 # Constants to do with summarization / conversation length window
 # The max amount of tokens supported by the underlying model (eg 8k for gpt-4 and Mistral 7B)
 LLM_MAX_TOKENS = {
@@ -98,6 +116,12 @@ LLM_MAX_TOKENS = {
     "deepseek-chat": 64000,
     "deepseek-reasoner": 64000,
     ## OpenAI models: https://platform.openai.com/docs/models/overview
+    "gpt-4.1": 1047576,
+    "gpt-4.1-2025-04-14": 1047576,
+    "gpt-4.1-mini": 1047576,
+    "gpt-4.1-mini-2025-04-14": 1047576,
+    "gpt-4.1-nano": 1047576,
+    "gpt-4.1-nano-2025-04-14": 1047576,
     # gpt-4.5-preview
     "gpt-4.5-preview": 128000,
     "gpt-4.5-preview-2025-02-27": 128000,

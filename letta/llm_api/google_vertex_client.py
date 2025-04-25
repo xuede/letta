@@ -2,13 +2,14 @@ import uuid
 from typing import List, Optional
 
 from google import genai
-from google.genai.types import FunctionCallingConfig, FunctionCallingConfigMode, GenerateContentResponse, ToolConfig
+from google.genai.types import FunctionCallingConfig, FunctionCallingConfigMode, GenerateContentResponse, ThinkingConfig, ToolConfig
 
-from letta.helpers.datetime_helpers import get_utc_time
+from letta.helpers.datetime_helpers import get_utc_time_int
 from letta.helpers.json_helpers import json_dumps
 from letta.llm_api.google_ai_client import GoogleAIClient
 from letta.local_llm.json_parser import clean_json_string_extra_backslash
 from letta.local_llm.utils import count_tokens
+from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse, Choice, FunctionCall, Message, ToolCall, UsageStatistics
 from letta.settings import model_settings
@@ -17,7 +18,7 @@ from letta.utils import get_tool_call_id
 
 class GoogleVertexClient(GoogleAIClient):
 
-    def request(self, request_data: dict) -> dict:
+    def request(self, request_data: dict, llm_config: LLMConfig) -> dict:
         """
         Performs underlying request to llm and returns raw response.
         """
@@ -28,7 +29,7 @@ class GoogleVertexClient(GoogleAIClient):
             http_options={"api_version": "v1"},
         )
         response = client.models.generate_content(
-            model=self.llm_config.model,
+            model=llm_config.model,
             contents=request_data["contents"],
             config=request_data["config"],
         )
@@ -37,23 +38,36 @@ class GoogleVertexClient(GoogleAIClient):
     def build_request_data(
         self,
         messages: List[PydanticMessage],
+        llm_config: LLMConfig,
         tools: List[dict],
-        tool_call: Optional[str],
+        force_tool_call: Optional[str] = None,
     ) -> dict:
         """
         Constructs a request object in the expected data format for this client.
         """
-        request_data = super().build_request_data(messages, tools, tool_call)
+        request_data = super().build_request_data(messages, llm_config, tools, force_tool_call)
         request_data["config"] = request_data.pop("generation_config")
         request_data["config"]["tools"] = request_data.pop("tools")
 
+        tool_names = [t["name"] for t in tools]
         tool_config = ToolConfig(
             function_calling_config=FunctionCallingConfig(
                 # ANY mode forces the model to predict only function calls
                 mode=FunctionCallingConfigMode.ANY,
+                # Provide the list of tools (though empty should also work, it seems not to)
+                allowed_function_names=tool_names,
             )
         )
         request_data["config"]["tool_config"] = tool_config.model_dump()
+
+        # Add thinking_config
+        # If enable_reasoner is False, set thinking_budget to 0
+        # Otherwise, use the value from max_reasoning_tokens
+        thinking_budget = 0 if not self.llm_config.enable_reasoner else self.llm_config.max_reasoning_tokens
+        thinking_config = ThinkingConfig(
+            thinking_budget=thinking_budget,
+        )
+        request_data["config"]["thinking_config"] = thinking_config.model_dump()
 
         return request_data
 
@@ -61,6 +75,7 @@ class GoogleVertexClient(GoogleAIClient):
         self,
         response_data: dict,
         input_messages: List[PydanticMessage],
+        llm_config: LLMConfig,
     ) -> ChatCompletionResponse:
         """
         Converts custom response format from llm client into an OpenAI
@@ -86,6 +101,8 @@ class GoogleVertexClient(GoogleAIClient):
         }
         }
         """
+        # print(response_data)
+
         response = GenerateContentResponse(**response_data)
         try:
             choices = []
@@ -97,6 +114,17 @@ class GoogleVertexClient(GoogleAIClient):
                 assert role == "model", f"Unknown role in response: {role}"
 
                 parts = content.parts
+
+                # NOTE: we aren't properly supported multi-parts here anyways (we're just appending choices),
+                #       so let's disable it for now
+
+                # NOTE(Apr 9, 2025): there's a very strange bug on 2.5 where the response has a part with broken text
+                # {'candidates': [{'content': {'parts': [{'functionCall': {'name': 'send_message', 'args': {'request_heartbeat': False, 'message': 'Hello! How can I make your day better?', 'inner_thoughts': 'User has initiated contact. Sending a greeting.'}}}], 'role': 'model'}, 'finishReason': 'STOP', 'avgLogprobs': -0.25891534213362066}], 'usageMetadata': {'promptTokenCount': 2493, 'candidatesTokenCount': 29, 'totalTokenCount': 2522, 'promptTokensDetails': [{'modality': 'TEXT', 'tokenCount': 2493}], 'candidatesTokensDetails': [{'modality': 'TEXT', 'tokenCount': 29}]}, 'modelVersion': 'gemini-1.5-pro-002'}
+                # To patch this, if we have multiple parts we can take the last one
+                if len(parts) > 1:
+                    logger.warning(f"Unexpected multiple parts in response from Google AI: {parts}")
+                    parts = [parts[-1]]
+
                 # TODO support parts / multimodal
                 # TODO support parallel tool calling natively
                 # TODO Alternative here is to throw away everything else except for the first part
@@ -109,7 +137,7 @@ class GoogleVertexClient(GoogleAIClient):
                         assert isinstance(function_args, dict), function_args
 
                         # NOTE: this also involves stripping the inner monologue out of the function
-                        if self.llm_config.put_inner_thoughts_in_kwargs:
+                        if llm_config.put_inner_thoughts_in_kwargs:
                             from letta.local_llm.constants import INNER_THOUGHTS_KWARG
 
                             assert INNER_THOUGHTS_KWARG in function_args, f"Couldn't find inner thoughts in function args:\n{function_call}"
@@ -206,8 +234,8 @@ class GoogleVertexClient(GoogleAIClient):
             return ChatCompletionResponse(
                 id=response_id,
                 choices=choices,
-                model=self.llm_config.model,  # NOTE: Google API doesn't pass back model in the response
-                created=get_utc_time(),
+                model=llm_config.model,  # NOTE: Google API doesn't pass back model in the response
+                created=get_utc_time_int(),
                 usage=usage,
             )
         except KeyError as e:

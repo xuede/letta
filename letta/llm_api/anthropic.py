@@ -20,11 +20,12 @@ from anthropic.types.beta import (
 )
 
 from letta.errors import BedrockError, BedrockPermissionError
-from letta.helpers.datetime_helpers import get_utc_time
+from letta.helpers.datetime_helpers import get_utc_time_int, timestamp_to_datetime
 from letta.llm_api.aws_bedrock import get_bedrock_client
 from letta.llm_api.helpers import add_inner_thoughts_to_functions
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG, INNER_THOUGHTS_KWARG_DESCRIPTION
 from letta.local_llm.utils import num_tokens_from_functions, num_tokens_from_messages
+from letta.log import get_logger
 from letta.schemas.message import Message as _Message
 from letta.schemas.message import MessageRole as _MessageRole
 from letta.schemas.openai.chat_completion_request import ChatCompletionRequest, Tool
@@ -43,6 +44,8 @@ from letta.services.provider_manager import ProviderManager
 from letta.settings import model_settings
 from letta.streaming_interface import AgentChunkStreamingInterface, AgentRefreshStreamingInterface
 from letta.tracing import log_event
+
+logger = get_logger(__name__)
 
 BASE_URL = "https://api.anthropic.com/v1"
 
@@ -393,7 +396,7 @@ def convert_anthropic_response_to_chatcompletion(
     return ChatCompletionResponse(
         id=response.id,
         choices=[choice],
-        created=get_utc_time(),
+        created=get_utc_time_int(),
         model=response.model,
         usage=UsageStatistics(
             prompt_tokens=prompt_tokens,
@@ -448,7 +451,7 @@ def convert_anthropic_stream_event_to_chatcompletion(
                 'logprobs': None
             }
         ],
-        'created': datetime.datetime(2025, 1, 24, 0, 18, 55, tzinfo=TzInfo(UTC)),
+        'created': 1713216662,
         'model': 'gpt-4o-mini-2024-07-18',
         'system_fingerprint': 'fp_bd83329f63',
         'object': 'chat.completion.chunk'
@@ -610,7 +613,7 @@ def convert_anthropic_stream_event_to_chatcompletion(
     return ChatCompletionChunkResponse(
         id=message_id,
         choices=[choice],
-        created=get_utc_time(),
+        created=get_utc_time_int(),
         model=model,
         output_tokens=completion_chunk_tokens,
     )
@@ -620,9 +623,9 @@ def _prepare_anthropic_request(
     data: ChatCompletionRequest,
     inner_thoughts_xml_tag: Optional[str] = "thinking",
     # if true, prefix fill the generation with the thinking tag
-    prefix_fill: bool = True,
+    prefix_fill: bool = False,
     # if true, put COT inside the tool calls instead of inside the content
-    put_inner_thoughts_in_kwargs: bool = False,
+    put_inner_thoughts_in_kwargs: bool = True,
     bedrock: bool = False,
     # extended thinking related fields
     # https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
@@ -634,7 +637,9 @@ def _prepare_anthropic_request(
         assert (
             max_reasoning_tokens is not None and max_reasoning_tokens < data.max_tokens
         ), "max tokens must be greater than thinking budget"
-        assert not put_inner_thoughts_in_kwargs, "extended thinking not compatible with put_inner_thoughts_in_kwargs"
+        if put_inner_thoughts_in_kwargs:
+            logger.warning("Extended thinking not compatible with put_inner_thoughts_in_kwargs")
+            put_inner_thoughts_in_kwargs = False
         # assert not prefix_fill, "extended thinking not compatible with prefix_fill"
         # Silently disable prefix_fill for now
         prefix_fill = False
@@ -686,7 +691,6 @@ def _prepare_anthropic_request(
     # Convert to Anthropic format
     msg_objs = [
         _Message.dict_to_message(
-            user_id=None,
             agent_id=None,
             openai_message_dict=m,
         )
@@ -916,7 +920,7 @@ def anthropic_chat_completions_process_stream(
     chat_completion_response = ChatCompletionResponse(
         id=dummy_message.id if create_message_id else TEMP_STREAM_RESPONSE_ID,
         choices=[],
-        created=dummy_message.created_at,
+        created=int(dummy_message.created_at.timestamp()),
         model=chat_completion_request.model,
         usage=UsageStatistics(
             prompt_tokens=prompt_tokens,
@@ -930,6 +934,8 @@ def anthropic_chat_completions_process_stream(
         stream_interface.stream_start()
 
     completion_tokens = 0
+    prev_message_type = None
+    message_idx = 0
     try:
         for chunk_idx, chat_completion_chunk in enumerate(
             anthropic_chat_completions_request_stream(
@@ -945,15 +951,23 @@ def anthropic_chat_completions_process_stream(
 
             if stream_interface:
                 if isinstance(stream_interface, AgentChunkStreamingInterface):
-                    stream_interface.process_chunk(
+                    message_type = stream_interface.process_chunk(
                         chat_completion_chunk,
                         message_id=chat_completion_response.id if create_message_id else chat_completion_chunk.id,
-                        message_date=chat_completion_response.created if create_message_datetime else chat_completion_chunk.created,
+                        message_date=(
+                            timestamp_to_datetime(chat_completion_response.created)
+                            if create_message_datetime
+                            else timestamp_to_datetime(chat_completion_chunk.created)
+                        ),
                         # if extended_thinking is on, then reasoning_content will be flowing as chunks
                         # TODO handle emitting redacted reasoning content (e.g. as concat?)
                         expect_reasoning_content=extended_thinking,
                         name=name,
+                        message_index=message_idx,
                     )
+                    if message_type != prev_message_type and message_type is not None:
+                        message_idx += 1
+                    prev_message_type = message_type
                 elif isinstance(stream_interface, AgentRefreshStreamingInterface):
                     stream_interface.process_refresh(chat_completion_response)
                 else:
@@ -1106,5 +1120,10 @@ def anthropic_chat_completions_process_stream(
     assert len(chat_completion_response.choices) > 0, chat_completion_response
 
     log_event(name="llm_response_received", attributes=chat_completion_response.model_dump())
+
+    for choice in chat_completion_response.choices:
+        if choice.message.content is not None:
+            choice.message.content = choice.message.content.replace(f"<{inner_thoughts_xml_tag}>", "")
+            choice.message.content = choice.message.content.replace(f"</{inner_thoughts_xml_tag}>", "")
 
     return chat_completion_response

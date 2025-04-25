@@ -1,34 +1,53 @@
 import os
 import random
+import re
 import string
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import List
 
+import httpx
 import pytest
+from anthropic.types.beta import BetaMessage
+from anthropic.types.beta.messages import BetaMessageBatchIndividualResponse, BetaMessageBatchSucceededResult
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall as OpenAIToolCall
 from openai.types.chat.chat_completion_message_tool_call import Function as OpenAIFunction
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 
 from letta.config import LettaConfig
-from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS, LETTA_TOOL_EXECUTION_DIR, MCP_TOOL_TAG_NAME_PREFIX, MULTI_AGENT_TOOLS
+from letta.constants import (
+    BASE_MEMORY_TOOLS,
+    BASE_SLEEPTIME_TOOLS,
+    BASE_TOOLS,
+    LETTA_TOOL_EXECUTION_DIR,
+    MCP_TOOL_TAG_NAME_PREFIX,
+    MULTI_AGENT_TOOLS,
+)
 from letta.embeddings import embedding_model
 from letta.functions.functions import derive_openai_json_schema, parse_source_code
 from letta.functions.mcp_client.types import MCPTool
-from letta.orm import Base
-from letta.orm.enums import JobType, ToolType
+from letta.helpers import ToolRulesSolver
+from letta.jobs.types import ItemUpdateInfo, RequestStatusUpdateInfo, StepStatusUpdateInfo
+from letta.orm import Base, Block
+from letta.orm.block_history import BlockHistory
+from letta.orm.enums import ActorType, JobType, ToolType
 from letta.orm.errors import NoResultFound, UniqueConstraintViolationError
-from letta.schemas.agent import CreateAgent, UpdateAgent
+from letta.schemas.agent import AgentStepState, CreateAgent, UpdateAgent
 from letta.schemas.block import Block as PydanticBlock
 from letta.schemas.block import BlockUpdate, CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
-from letta.schemas.enums import JobStatus, MessageRole
+from letta.schemas.enums import AgentStepStatus, JobStatus, MessageRole, ProviderType
 from letta.schemas.environment_variables import SandboxEnvironmentVariableCreate, SandboxEnvironmentVariableUpdate
 from letta.schemas.file import FileMetadata as PydanticFileMetadata
-from letta.schemas.identity import IdentityCreate, IdentityProperty, IdentityPropertyType, IdentityType, IdentityUpdate
+from letta.schemas.identity import IdentityCreate, IdentityProperty, IdentityPropertyType, IdentityType, IdentityUpdate, IdentityUpsert
+from letta.schemas.job import BatchJob
+from letta.schemas.job import Job
 from letta.schemas.job import Job as PydanticJob
 from letta.schemas.job import JobUpdate, LettaRequestConfig
 from letta.schemas.letta_message import UpdateAssistantMessage, UpdateReasoningMessage, UpdateSystemMessage, UpdateUserMessage
 from letta.schemas.letta_message_content import TextContent
+from letta.schemas.llm_batch_job import LLMBatchItem
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.message import MessageCreate, MessageUpdate
@@ -46,6 +65,7 @@ from letta.schemas.tool import ToolCreate, ToolUpdate
 from letta.schemas.tool_rule import InitToolRule
 from letta.schemas.user import User as PydanticUser
 from letta.schemas.user import UserUpdate
+from letta.server.db import db_context
 from letta.server.server import SyncServer
 from letta.services.block_manager import BlockManager
 from letta.services.organization_manager import OrganizationManager
@@ -67,11 +87,12 @@ USING_SQLITE = not bool(os.getenv("LETTA_PG_URI"))
 
 
 @pytest.fixture(autouse=True)
-def clear_tables():
-    from letta.server.db import db_context
-
+def _clear_tables():
     with db_context() as session:
         for table in reversed(Base.metadata.sorted_tables):  # Reverse to avoid FK issues
+            # If this is the block_history table, skip it
+            if table.name == "block_history":
+                continue
             session.execute(table.delete())  # Truncate table
         session.commit()
 
@@ -415,8 +436,9 @@ def sarah_agent(server: SyncServer, default_user, default_organization):
         agent_create=CreateAgent(
             name="sarah_agent",
             memory_blocks=[],
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -430,8 +452,9 @@ def charles_agent(server: SyncServer, default_user, default_organization):
         agent_create=CreateAgent(
             name="charles_agent",
             memory_blocks=[CreateBlock(label="human", value="Charles"), CreateBlock(label="persona", value="I am a helpful assistant")],
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -444,7 +467,7 @@ def comprehensive_test_agent_fixture(server: SyncServer, default_user, print_too
     create_agent_request = CreateAgent(
         system="test system",
         memory_blocks=memory_blocks,
-        llm_config=LLMConfig.default_config("gpt-4"),
+        llm_config=LLMConfig.default_config("gpt-4o-mini"),
         embedding_config=EmbeddingConfig.default_config(provider="openai"),
         block_ids=[default_block.id],
         tool_ids=[print_tool.id],
@@ -456,6 +479,7 @@ def comprehensive_test_agent_fixture(server: SyncServer, default_user, print_too
         initial_message_sequence=[MessageCreate(role=MessageRole.user, content="hello world")],
         tool_exec_environment_variables={"test_env_var_key_a": "test_env_var_value_a", "test_env_var_key_b": "test_env_var_value_b"},
         message_buffer_autoclear=True,
+        include_base_tools=False,
     )
     created_agent = server.agent_manager.create_agent(
         create_agent_request,
@@ -529,6 +553,7 @@ def agent_with_tags(server: SyncServer, default_user):
             llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
             memory_blocks=[],
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -540,6 +565,7 @@ def agent_with_tags(server: SyncServer, default_user):
             llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
             memory_blocks=[],
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -551,11 +577,51 @@ def agent_with_tags(server: SyncServer, default_user):
             llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
             memory_blocks=[],
+            include_base_tools=False,
         ),
         actor=default_user,
     )
 
     return [agent1, agent2, agent3]
+
+
+@pytest.fixture
+def dummy_llm_config() -> LLMConfig:
+    return LLMConfig.default_config("gpt-4o-mini")
+
+
+@pytest.fixture
+def dummy_tool_rules_solver() -> ToolRulesSolver:
+    return ToolRulesSolver(tool_rules=[InitToolRule(tool_name="send_message")])
+
+
+@pytest.fixture
+def dummy_step_state(dummy_tool_rules_solver: ToolRulesSolver) -> AgentStepState:
+    return AgentStepState(step_number=1, tool_rules_solver=dummy_tool_rules_solver)
+
+
+@pytest.fixture
+def dummy_successful_response() -> BetaMessageBatchIndividualResponse:
+    return BetaMessageBatchIndividualResponse(
+        custom_id="my-second-request",
+        result=BetaMessageBatchSucceededResult(
+            type="succeeded",
+            message=BetaMessage(
+                id="msg_abc123",
+                role="assistant",
+                type="message",
+                model="claude-3-5-sonnet-20240620",
+                content=[{"type": "text", "text": "hi!"}],
+                usage={"input_tokens": 5, "output_tokens": 7},
+                stop_reason="end_turn",
+            ),
+        ),
+    )
+
+
+@pytest.fixture
+def letta_batch_job(server: SyncServer, default_user) -> Job:
+    return server.job_manager.create_job(BatchJob(user_id=default_user.id), actor=default_user)
 
 
 # ======================================================================================================================
@@ -590,12 +656,13 @@ def test_create_agent_passed_in_initial_messages(server: SyncServer, default_use
     create_agent_request = CreateAgent(
         system="test system",
         memory_blocks=memory_blocks,
-        llm_config=LLMConfig.default_config("gpt-4"),
+        llm_config=LLMConfig.default_config("gpt-4o-mini"),
         embedding_config=EmbeddingConfig.default_config(provider="openai"),
         block_ids=[default_block.id],
         tags=["a", "b"],
         description="test_description",
         initial_message_sequence=[MessageCreate(role=MessageRole.user, content="hello world")],
+        include_base_tools=False,
     )
     agent_state = server.agent_manager.create_agent(
         create_agent_request,
@@ -603,6 +670,7 @@ def test_create_agent_passed_in_initial_messages(server: SyncServer, default_use
     )
     assert server.message_manager.size(agent_id=agent_state.id, actor=default_user) == 2
     init_messages = server.agent_manager.get_in_context_messages(agent_id=agent_state.id, actor=default_user)
+
     # Check that the system appears in the first initial message
     assert create_agent_request.system in init_messages[0].content[0].text
     assert create_agent_request.memory_blocks[0].value in init_messages[0].content[0].text
@@ -616,11 +684,12 @@ def test_create_agent_default_initial_message(server: SyncServer, default_user, 
     create_agent_request = CreateAgent(
         system="test system",
         memory_blocks=memory_blocks,
-        llm_config=LLMConfig.default_config("gpt-4"),
+        llm_config=LLMConfig.default_config("gpt-4o-mini"),
         embedding_config=EmbeddingConfig.default_config(provider="openai"),
         block_ids=[default_block.id],
         tags=["a", "b"],
         description="test_description",
+        include_base_tools=False,
     )
     agent_state = server.agent_manager.create_agent(
         create_agent_request,
@@ -631,6 +700,35 @@ def test_create_agent_default_initial_message(server: SyncServer, default_user, 
     # Check that the system appears in the first initial message
     assert create_agent_request.system in init_messages[0].content[0].text
     assert create_agent_request.memory_blocks[0].value in init_messages[0].content[0].text
+
+
+def test_create_agent_with_json_in_system_message(server: SyncServer, default_user, default_block):
+    system_prompt = (
+        "You are an expert teaching agent with encyclopedic knowledge. "
+        "When you receive a topic, query the external database for more "
+        "information. Format the queries as a JSON list of queries making "
+        "sure to include your reasoning for that query, e.g. "
+        "{'query1' : 'reason1', 'query2' : 'reason2'}"
+    )
+    create_agent_request = CreateAgent(
+        system=system_prompt,
+        llm_config=LLMConfig.default_config("gpt-4o-mini"),
+        embedding_config=EmbeddingConfig.default_config(provider="openai"),
+        block_ids=[default_block.id],
+        tags=["a", "b"],
+        description="test_description",
+        include_base_tools=False,
+    )
+    agent_state = server.agent_manager.create_agent(
+        create_agent_request,
+        actor=default_user,
+    )
+    assert agent_state is not None
+    system_message_id = agent_state.message_ids[0]
+    system_message = server.message_manager.get_message_by_id(message_id=system_message_id, actor=default_user)
+    assert system_prompt in system_message.content[0].text
+    assert default_block.value in system_message.content[0].text
+    server.agent_manager.delete_agent(agent_id=agent_state.id, actor=default_user)
 
 
 def test_update_agent(server: SyncServer, comprehensive_test_agent_fixture, other_tool, other_source, other_block, default_user):
@@ -762,9 +860,10 @@ def test_list_agents_ascending(server: SyncServer, default_user):
     agent1 = server.agent_manager.create_agent(
         agent_create=CreateAgent(
             name="agent_oldest",
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
             memory_blocks=[],
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -775,9 +874,10 @@ def test_list_agents_ascending(server: SyncServer, default_user):
     agent2 = server.agent_manager.create_agent(
         agent_create=CreateAgent(
             name="agent_newest",
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
             memory_blocks=[],
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -792,9 +892,10 @@ def test_list_agents_descending(server: SyncServer, default_user):
     agent1 = server.agent_manager.create_agent(
         agent_create=CreateAgent(
             name="agent_oldest",
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
             memory_blocks=[],
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -805,9 +906,10 @@ def test_list_agents_descending(server: SyncServer, default_user):
     agent2 = server.agent_manager.create_agent(
         agent_create=CreateAgent(
             name="agent_newest",
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
             memory_blocks=[],
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -827,8 +929,9 @@ def test_list_agents_ordering_and_pagination(server: SyncServer, default_user):
             agent_create=CreateAgent(
                 name=name,
                 memory_blocks=[],
-                llm_config=LLMConfig.default_config("gpt-4"),
+                llm_config=LLMConfig.default_config("gpt-4o-mini"),
                 embedding_config=EmbeddingConfig.default_config(provider="openai"),
+                include_base_tools=False,
             ),
             actor=default_user,
         )
@@ -1187,9 +1290,10 @@ def test_list_agents_by_tags_pagination(server: SyncServer, default_user, defaul
         agent_create=CreateAgent(
             name="agent1",
             tags=["pagination_test", "tag1"],
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
             memory_blocks=[],
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -1202,9 +1306,10 @@ def test_list_agents_by_tags_pagination(server: SyncServer, default_user, defaul
         agent_create=CreateAgent(
             name="agent2",
             tags=["pagination_test", "tag2"],
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
             memory_blocks=[],
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -1243,8 +1348,9 @@ def test_list_agents_query_text_pagination(server: SyncServer, default_user, def
             name="Search Agent One",
             memory_blocks=[],
             description="This is a search agent for testing",
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -1254,8 +1360,9 @@ def test_list_agents_query_text_pagination(server: SyncServer, default_user, def
             name="Search Agent Two",
             memory_blocks=[],
             description="Another search agent for testing",
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -1265,8 +1372,9 @@ def test_list_agents_query_text_pagination(server: SyncServer, default_user, def
             name="Different Agent",
             memory_blocks=[],
             description="This is a different agent",
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -1481,6 +1589,46 @@ def test_modify_letta_message(server: SyncServer, sarah_agent, default_user):
     # TODO: tool calls/responses
 
 
+def test_list_messages_with_query_text_filter(server: SyncServer, sarah_agent, default_user):
+    """
+    Ensure that list_messages_for_agent correctly filters messages by query_text.
+    """
+    test_contents = [
+        "This is a message about unicorns and rainbows.",
+        "Another message discussing dragons in the sky.",
+        "Plain message with no magical beasts.",
+        "Mentioning unicorns again for good measure.",
+        "Something unrelated entirely.",
+    ]
+
+    created_messages = []
+    for content in test_contents:
+        message = PydanticMessage(
+            agent_id=sarah_agent.id,
+            role=MessageRole.user,
+            content=[{"type": "text", "text": content}],
+        )
+        created = server.message_manager.create_message(pydantic_msg=message, actor=default_user)
+        created_messages.append(created)
+
+    # Query messages that include "unicorns"
+    unicorn_messages = server.message_manager.list_messages_for_agent(agent_id=sarah_agent.id, actor=default_user, query_text="unicorns")
+    assert len(unicorn_messages) == 2
+    for msg in unicorn_messages:
+        assert any(chunk.type == "text" and "unicorns" in chunk.text.lower() for chunk in msg.content or [])
+
+    # Query messages that include "dragons"
+    dragon_messages = server.message_manager.list_messages_for_agent(agent_id=sarah_agent.id, actor=default_user, query_text="dragons")
+    assert len(dragon_messages) == 1
+    assert any(chunk.type == "text" and "dragons" in chunk.text.lower() for chunk in dragon_messages[0].content or [])
+
+    # Query with a word that shouldn't match any message
+    no_match_messages = server.message_manager.list_messages_for_agent(
+        agent_id=sarah_agent.id, actor=default_user, query_text="nonexistentcreature"
+    )
+    assert len(no_match_messages) == 0
+
+
 # ======================================================================================================================
 # AgentManager Tests - Blocks Relationship
 # ======================================================================================================================
@@ -1582,6 +1730,29 @@ def test_get_block_with_label(server: SyncServer, sarah_agent, default_block, de
     assert block.label == default_block.label
 
 
+def test_refresh_memory(server: SyncServer, default_user):
+    block = server.block_manager.create_or_update_block(
+        PydanticBlock(
+            label="test",
+            value="test",
+            limit=1000,
+        ),
+        actor=default_user,
+    )
+    agent = server.agent_manager.create_agent(
+        CreateAgent(
+            name="test",
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
+            embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            include_base_tools=False,
+        ),
+        actor=default_user,
+    )
+    assert len(agent.memory.blocks) == 0
+    agent = server.agent_manager.refresh_memory(agent_state=agent, actor=default_user)
+    assert len(agent.memory.blocks) == 0
+
+
 # ======================================================================================================================
 # Agent Manager - Passages Tests
 # ======================================================================================================================
@@ -1678,7 +1849,7 @@ def test_agent_list_passages_filtering(server, default_user, sarah_agent, defaul
     assert len(source_filtered) == 3
 
     # Test date filtering
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     future_date = now + timedelta(days=1)
     past_date = now - timedelta(days=1)
 
@@ -2163,7 +2334,7 @@ def test_delete_tool_by_id(server: SyncServer, print_tool, default_user):
 
 def test_upsert_base_tools(server: SyncServer, default_user):
     tools = server.tool_manager.upsert_base_tools(actor=default_user)
-    expected_tool_names = sorted(BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS)
+    expected_tool_names = sorted(set(BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS + BASE_SLEEPTIME_TOOLS))
     assert sorted([t.name for t in tools]) == expected_tool_names
 
     # Call it again to make sure it doesn't create duplicates
@@ -2178,6 +2349,8 @@ def test_upsert_base_tools(server: SyncServer, default_user):
             assert t.tool_type == ToolType.LETTA_MEMORY_CORE
         elif t.name in MULTI_AGENT_TOOLS:
             assert t.tool_type == ToolType.LETTA_MULTI_AGENT_CORE
+        elif t.name in BASE_SLEEPTIME_TOOLS:
+            assert t.tool_type == ToolType.LETTA_SLEEPTIME_CORE
         else:
             pytest.fail(f"The tool name is unrecognized as a base tool: {t.name}")
         assert t.source_code is None
@@ -2366,7 +2539,7 @@ def test_message_listing_text_search(server: SyncServer, hello_world_message_fix
 
 
 # ======================================================================================================================
-# Block Manager Tests
+# Block Manager Tests - Basic
 # ======================================================================================================================
 
 
@@ -2575,6 +2748,602 @@ def test_get_agents_for_block(server: SyncServer, sarah_agent, charles_agent, de
     assert charles_agent.id in agent_state_ids
 
 
+def test_batch_create_multiple_blocks(server: SyncServer, default_user):
+    block_manager = BlockManager()
+    num_blocks = 10
+
+    # Prepare distinct blocks
+    blocks_to_create = [PydanticBlock(label=f"batch_label_{i}", value=f"batch_value_{i}") for i in range(num_blocks)]
+
+    # Create the blocks
+    created_blocks = block_manager.batch_create_blocks(blocks_to_create, actor=default_user)
+    assert len(created_blocks) == num_blocks
+
+    # Map created blocks by label for lookup
+    created_by_label = {blk.label: blk for blk in created_blocks}
+
+    # Assert all blocks were created correctly
+    for i in range(num_blocks):
+        label = f"batch_label_{i}"
+        value = f"batch_value_{i}"
+        assert label in created_by_label, f"Missing label: {label}"
+        blk = created_by_label[label]
+        assert blk.value == value
+        assert blk.organization_id == default_user.organization_id
+        assert blk.id is not None
+
+    # Confirm all created blocks exist in the full list from get_blocks
+    all_labels = {blk.label for blk in block_manager.get_blocks(actor=default_user)}
+    expected_labels = {f"batch_label_{i}" for i in range(num_blocks)}
+    assert expected_labels.issubset(all_labels)
+
+
+# ======================================================================================================================
+# Block Manager Tests - Checkpointing
+# ======================================================================================================================
+
+
+def test_checkpoint_creates_history(server: SyncServer, default_user):
+    """
+    Ensures that calling checkpoint_block creates a BlockHistory row and updates
+    the block's current_history_entry_id appropriately.
+    """
+
+    block_manager = BlockManager()
+
+    # Create a block
+    initial_value = "Initial block content"
+    created_block = block_manager.create_or_update_block(PydanticBlock(label="test_checkpoint", value=initial_value), actor=default_user)
+
+    # Act: checkpoint it
+    block_manager.checkpoint_block(block_id=created_block.id, actor=default_user)
+
+    with db_context() as session:
+        # Get BlockHistory entries for this block
+        history_entries: List[BlockHistory] = session.query(BlockHistory).filter(BlockHistory.block_id == created_block.id).all()
+        assert len(history_entries) == 1, "Exactly one history entry should be created"
+        hist = history_entries[0]
+
+        # Fetch ORM block for internal checks
+        db_block = session.get(Block, created_block.id)
+
+        assert hist.sequence_number == 1
+        assert hist.value == initial_value
+        assert hist.actor_type == ActorType.LETTA_USER
+        assert hist.actor_id == default_user.id
+        assert db_block.current_history_entry_id == hist.id
+
+
+def test_multiple_checkpoints(server: SyncServer, default_user):
+    block_manager = BlockManager()
+
+    # Create a block
+    block = block_manager.create_or_update_block(PydanticBlock(label="test_multi_checkpoint", value="v1"), actor=default_user)
+
+    # 1) First checkpoint
+    block_manager.checkpoint_block(block_id=block.id, actor=default_user)
+
+    # 2) Update block content
+    updated_block_data = PydanticBlock(**block.model_dump())
+    updated_block_data.value = "v2"
+    block_manager.create_or_update_block(updated_block_data, actor=default_user)
+
+    # 3) Second checkpoint
+    block_manager.checkpoint_block(block_id=block.id, actor=default_user)
+
+    with db_context() as session:
+        history_entries = (
+            session.query(BlockHistory).filter(BlockHistory.block_id == block.id).order_by(BlockHistory.sequence_number.asc()).all()
+        )
+        assert len(history_entries) == 2, "Should have two history entries"
+
+        # First is seq=1, value='v1'
+        assert history_entries[0].sequence_number == 1
+        assert history_entries[0].value == "v1"
+
+        # Second is seq=2, value='v2'
+        assert history_entries[1].sequence_number == 2
+        assert history_entries[1].value == "v2"
+
+        # The block should now point to the second entry
+        db_block = session.get(Block, block.id)
+        assert db_block.current_history_entry_id == history_entries[1].id
+
+
+def test_checkpoint_with_agent_id(server: SyncServer, default_user, sarah_agent):
+    """
+    Ensures that if we pass agent_id to checkpoint_block, we get
+    actor_type=LETTA_AGENT, actor_id=<agent.id> in BlockHistory.
+    """
+    block_manager = BlockManager()
+
+    # Create a block
+    block = block_manager.create_or_update_block(PydanticBlock(label="test_agent_checkpoint", value="Agent content"), actor=default_user)
+
+    # Checkpoint with agent_id
+    block_manager.checkpoint_block(block_id=block.id, actor=default_user, agent_id=sarah_agent.id)
+
+    # Verify
+    with db_context() as session:
+        hist_entry = session.query(BlockHistory).filter(BlockHistory.block_id == block.id).one()
+        assert hist_entry.actor_type == ActorType.LETTA_AGENT
+        assert hist_entry.actor_id == sarah_agent.id
+
+
+def test_checkpoint_with_no_state_change(server: SyncServer, default_user):
+    """
+    If we call checkpoint_block twice without any edits,
+    we expect two entries or only one, depending on your policy.
+    """
+    block_manager = BlockManager()
+
+    # Create block
+    block = block_manager.create_or_update_block(PydanticBlock(label="test_no_change", value="original"), actor=default_user)
+
+    # 1) checkpoint
+    block_manager.checkpoint_block(block_id=block.id, actor=default_user)
+    # 2) checkpoint again (no changes)
+    block_manager.checkpoint_block(block_id=block.id, actor=default_user)
+
+    with db_context() as session:
+        all_hist = session.query(BlockHistory).filter(BlockHistory.block_id == block.id).all()
+        assert len(all_hist) == 2
+
+
+def test_checkpoint_concurrency_stale(server: SyncServer, default_user):
+    block_manager = BlockManager()
+
+    # create block
+    block = block_manager.create_or_update_block(PydanticBlock(label="test_stale_checkpoint", value="hello"), actor=default_user)
+
+    # session1 loads
+    with db_context() as s1:
+        block_s1 = s1.get(Block, block.id)  # version=1
+
+    # session2 loads
+    with db_context() as s2:
+        block_s2 = s2.get(Block, block.id)  # also version=1
+
+    # session1 checkpoint => version=2
+    with db_context() as s1:
+        block_s1 = s1.merge(block_s1)
+        block_manager.checkpoint_block(
+            block_id=block_s1.id,
+            actor=default_user,
+            use_preloaded_block=block_s1,  # let manager use the object in memory
+        )
+        # commits inside checkpoint_block => version goes to 2
+
+    # session2 tries to checkpoint => sees old version=1 => stale error
+    with pytest.raises(StaleDataError):
+        with db_context() as s2:
+            block_s2 = s2.merge(block_s2)
+            block_manager.checkpoint_block(
+                block_id=block_s2.id,
+                actor=default_user,
+                use_preloaded_block=block_s2,
+            )
+
+
+def test_checkpoint_no_future_states(server: SyncServer, default_user):
+    """
+    Ensures that if the block is already at the highest sequence,
+    creating a new checkpoint does NOT delete anything.
+    """
+
+    block_manager = BlockManager()
+
+    # 1) Create block with "v1" and checkpoint => seq=1
+    block_v1 = block_manager.create_or_update_block(PydanticBlock(label="no_future_test", value="v1"), actor=default_user)
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    # 2) Create "v2" and checkpoint => seq=2
+    updated_data = PydanticBlock(**block_v1.model_dump())
+    updated_data.value = "v2"
+    block_manager.create_or_update_block(updated_data, actor=default_user)
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    # So we have seq=1: v1, seq=2: v2. No "future" states.
+    # 3) Another checkpoint (no changes made) => should become seq=3, not delete anything
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    with db_context() as session:
+        # We expect 3 rows in block_history, none removed
+        history_rows = (
+            session.query(BlockHistory).filter(BlockHistory.block_id == block_v1.id).order_by(BlockHistory.sequence_number.asc()).all()
+        )
+        # Should be seq=1, seq=2, seq=3
+        assert len(history_rows) == 3
+        assert history_rows[0].value == "v1"
+        assert history_rows[1].value == "v2"
+        # The last is also "v2" if we didn't change it, or the same current fields
+        assert history_rows[2].sequence_number == 3
+        # There's no leftover row that was deleted
+
+
+# ======================================================================================================================
+# Block Manager Tests - Undo
+# ======================================================================================================================
+
+
+def test_undo_checkpoint_block(server: SyncServer, default_user):
+    """
+    Verifies that we can undo to the previous checkpoint:
+      1) Create a block and checkpoint -> sequence_number=1
+      2) Update block content and checkpoint -> sequence_number=2
+      3) Undo -> should revert block to sequence_number=1's content
+    """
+    block_manager = BlockManager()
+
+    # 1) Create block
+    initial_value = "Version 1 content"
+    created_block = block_manager.create_or_update_block(PydanticBlock(label="undo_test", value=initial_value), actor=default_user)
+
+    # 2) First checkpoint => seq=1
+    block_manager.checkpoint_block(block_id=created_block.id, actor=default_user)
+
+    # 3) Update block content to "Version 2"
+    updated_data = PydanticBlock(**created_block.model_dump())
+    updated_data.value = "Version 2 content"
+    block_manager.create_or_update_block(updated_data, actor=default_user)
+
+    # 4) Second checkpoint => seq=2
+    block_manager.checkpoint_block(block_id=created_block.id, actor=default_user)
+
+    # 5) Undo => revert to seq=1
+    undone_block = block_manager.undo_checkpoint_block(block_id=created_block.id, actor=default_user)
+
+    # 6) Verify the block is now restored to "Version 1" content
+    assert undone_block.value == initial_value, "Block should revert to version 1 content"
+    assert undone_block.label == "undo_test", "Label should also revert if changed (or remain the same if unchanged)"
+
+
+def test_checkpoint_deletes_future_states_after_undo(server: SyncServer, default_user):
+    """
+    Verifies that once we've undone to an earlier checkpoint, creating a new
+    checkpoint removes any leftover 'future' states that existed beyond that sequence.
+    """
+    block_manager = BlockManager()
+
+    # 1) Create block
+    block_init = PydanticBlock(label="test_truncation", value="v1")
+    block_v1 = block_manager.create_or_update_block(block_init, actor=default_user)
+    # Checkpoint => seq=1
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    # 2) Update to "v2", checkpoint => seq=2
+    block_v2 = PydanticBlock(**block_v1.model_dump())
+    block_v2.value = "v2"
+    block_manager.create_or_update_block(block_v2, actor=default_user)
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    # 3) Update to "v3", checkpoint => seq=3
+    block_v3 = PydanticBlock(**block_v1.model_dump())
+    block_v3.value = "v3"
+    block_manager.create_or_update_block(block_v3, actor=default_user)
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    # We now have three states in history: seq=1 (v1), seq=2 (v2), seq=3 (v3).
+
+    # Undo from seq=3 -> seq=2
+    block_undo_1 = block_manager.undo_checkpoint_block(block_v1.id, actor=default_user)
+    assert block_undo_1.value == "v2"
+
+    # Undo from seq=2 -> seq=1
+    block_undo_2 = block_manager.undo_checkpoint_block(block_v1.id, actor=default_user)
+    assert block_undo_2.value == "v1"
+
+    # 4) Now we are at seq=1. If we checkpoint again, we should remove the old seq=2,3
+    #    because the new code truncates future states beyond seq=1.
+
+    # Let's do a new edit: "v1.5"
+    block_v1_5 = PydanticBlock(**block_undo_2.model_dump())
+    block_v1_5.value = "v1.5"
+    block_manager.create_or_update_block(block_v1_5, actor=default_user)
+
+    # 5) Checkpoint => new seq=2, removing the old seq=2 and seq=3
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    with db_context() as session:
+        # Let's see which BlockHistory rows remain
+        history_entries = (
+            session.query(BlockHistory).filter(BlockHistory.block_id == block_v1.id).order_by(BlockHistory.sequence_number.asc()).all()
+        )
+
+        # We expect two rows: seq=1 => "v1", seq=2 => "v1.5"
+        assert len(history_entries) == 2, f"Expected 2 entries, got {len(history_entries)}"
+        assert history_entries[0].sequence_number == 1
+        assert history_entries[0].value == "v1"
+        assert history_entries[1].sequence_number == 2
+        assert history_entries[1].value == "v1.5"
+
+        # No row should contain "v2" or "v3"
+        existing_values = {h.value for h in history_entries}
+        assert "v2" not in existing_values, "Old seq=2 should have been removed."
+        assert "v3" not in existing_values, "Old seq=3 should have been removed."
+
+
+def test_undo_no_history(server: SyncServer, default_user):
+    """
+    If a block has never been checkpointed (no current_history_entry_id),
+    undo_checkpoint_block should raise a ValueError.
+    """
+    block_manager = BlockManager()
+
+    # Create a block but don't checkpoint it
+    block = block_manager.create_or_update_block(PydanticBlock(label="no_history_test", value="initial"), actor=default_user)
+
+    # Attempt to undo
+    with pytest.raises(ValueError, match="has no history entry - cannot undo"):
+        block_manager.undo_checkpoint_block(block_id=block.id, actor=default_user)
+
+
+def test_undo_first_checkpoint(server: SyncServer, default_user):
+    """
+    If the block is at the first checkpoint (sequence_number=1),
+    undo should fail because there's no prior checkpoint.
+    """
+    block_manager = BlockManager()
+
+    # 1) Create the block
+    block_data = PydanticBlock(label="first_checkpoint", value="Version1")
+    block = block_manager.create_or_update_block(block_data, actor=default_user)
+
+    # 2) First checkpoint => seq=1
+    block_manager.checkpoint_block(block_id=block.id, actor=default_user)
+
+    # Attempt undo -> expect ValueError
+    with pytest.raises(ValueError, match="Cannot undo further"):
+        block_manager.undo_checkpoint_block(block_id=block.id, actor=default_user)
+
+
+def test_undo_multiple_checkpoints(server: SyncServer, default_user):
+    """
+    Tests multiple checkpoints in a row, then undo repeatedly
+    from seq=3 -> seq=2 -> seq=1, verifying each revert.
+    """
+    block_manager = BlockManager()
+
+    # Step 1: Create block
+    block_data = PydanticBlock(label="multi_checkpoint", value="v1")
+    block_v1 = block_manager.create_or_update_block(block_data, actor=default_user)
+    # checkpoint => seq=1
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    # Step 2: Update to v2, checkpoint => seq=2
+    block_data_v2 = PydanticBlock(**block_v1.model_dump())
+    block_data_v2.value = "v2"
+    block_manager.create_or_update_block(block_data_v2, actor=default_user)
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    # Step 3: Update to v3, checkpoint => seq=3
+    block_data_v3 = PydanticBlock(**block_v1.model_dump())
+    block_data_v3.value = "v3"
+    block_manager.create_or_update_block(block_data_v3, actor=default_user)
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    # Now we have 3 seq: v1, v2, v3
+    # Undo from seq=3 -> seq=2
+    undone_block = block_manager.undo_checkpoint_block(block_v1.id, actor=default_user)
+    assert undone_block.value == "v2"
+
+    # Undo from seq=2 -> seq=1
+    undone_block = block_manager.undo_checkpoint_block(block_v1.id, actor=default_user)
+    assert undone_block.value == "v1"
+
+    # Try once more -> fails because seq=1 is the earliest
+    with pytest.raises(ValueError, match="Cannot undo further"):
+        block_manager.undo_checkpoint_block(block_v1.id, actor=default_user)
+
+
+def test_undo_concurrency_stale(server: SyncServer, default_user):
+    """
+    Demonstrate concurrency: both sessions start with the block at seq=2,
+    one session undoes first -> block now seq=1, version increments,
+    the other session tries to undo with stale data -> StaleDataError.
+    """
+    block_manager = BlockManager()
+
+    # 1) create block
+    block_data = PydanticBlock(label="concurrency_undo", value="v1")
+    block_v1 = block_manager.create_or_update_block(block_data, actor=default_user)
+    # checkpoint => seq=1
+    block_manager.checkpoint_block(block_v1.id, actor=default_user)
+
+    # 2) update to v2
+    block_data_v2 = PydanticBlock(**block_v1.model_dump())
+    block_data_v2.value = "v2"
+    block_manager.create_or_update_block(block_data_v2, actor=default_user)
+    # checkpoint => seq=2
+    block_manager.checkpoint_block(block_v1.id, actor=default_user)
+
+    # Now block is at seq=2
+
+    # session1 preloads the block
+    with db_context() as s1:
+        block_s1 = s1.get(Block, block_v1.id)  # version=? let's say 2 in memory
+
+    # session2 also preloads the block
+    with db_context() as s2:
+        block_s2 = s2.get(Block, block_v1.id)  # also version=2
+
+    # Session1 -> undo to seq=1
+    block_manager.undo_checkpoint_block(
+        block_id=block_v1.id, actor=default_user, use_preloaded_block=block_s1  # stale object from session1
+    )
+    # This commits first => block now points to seq=1, version increments
+
+    # Session2 tries the same undo, but it's stale
+    with pytest.raises(StaleDataError):
+        block_manager.undo_checkpoint_block(block_id=block_v1.id, actor=default_user, use_preloaded_block=block_s2)  # also seq=2 in memory
+
+
+# ======================================================================================================================
+# Block Manager Tests - Redo
+# ======================================================================================================================
+
+
+def test_redo_checkpoint_block(server: SyncServer, default_user):
+    """
+    1) Create a block with value v1 -> checkpoint => seq=1
+    2) Update to v2 -> checkpoint => seq=2
+    3) Update to v3 -> checkpoint => seq=3
+    4) Undo once (seq=3 -> seq=2)
+    5) Redo once (seq=2 -> seq=3)
+    """
+
+    block_manager = BlockManager()
+
+    # 1) Create block, set value='v1'; checkpoint => seq=1
+    block_v1 = block_manager.create_or_update_block(PydanticBlock(label="redo_test", value="v1"), actor=default_user)
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    # 2) Update to 'v2'; checkpoint => seq=2
+    block_v2 = PydanticBlock(**block_v1.model_dump())
+    block_v2.value = "v2"
+    block_manager.create_or_update_block(block_v2, actor=default_user)
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    # 3) Update to 'v3'; checkpoint => seq=3
+    block_v3 = PydanticBlock(**block_v1.model_dump())
+    block_v3.value = "v3"
+    block_manager.create_or_update_block(block_v3, actor=default_user)
+    block_manager.checkpoint_block(block_id=block_v1.id, actor=default_user)
+
+    # Undo from seq=3 -> seq=2
+    undone_block = block_manager.undo_checkpoint_block(block_v1.id, actor=default_user)
+    assert undone_block.value == "v2", "After undo, block should revert to v2"
+
+    # Redo from seq=2 -> seq=3
+    redone_block = block_manager.redo_checkpoint_block(block_v1.id, actor=default_user)
+    assert redone_block.value == "v3", "After redo, block should go back to v3"
+
+
+def test_redo_no_history(server: SyncServer, default_user):
+    """
+    If a block has no current_history_entry_id (never checkpointed),
+    then redo_checkpoint_block should raise ValueError.
+    """
+    block_manager = BlockManager()
+
+    # Create block with no checkpoint
+    block = block_manager.create_or_update_block(PydanticBlock(label="redo_no_history", value="v0"), actor=default_user)
+
+    # Attempt to redo => expect ValueError
+    with pytest.raises(ValueError, match="no history entry - cannot redo"):
+        block_manager.redo_checkpoint_block(block.id, actor=default_user)
+
+
+def test_redo_at_highest_checkpoint(server: SyncServer, default_user):
+    """
+    If the block is at the maximum sequence number, there's no higher checkpoint to move to.
+    redo_checkpoint_block should raise ValueError.
+    """
+    block_manager = BlockManager()
+
+    # 1) Create block => checkpoint => seq=1
+    b_init = block_manager.create_or_update_block(PydanticBlock(label="redo_highest", value="v1"), actor=default_user)
+    block_manager.checkpoint_block(b_init.id, actor=default_user)
+
+    # 2) Another edit => seq=2
+    b_next = PydanticBlock(**b_init.model_dump())
+    b_next.value = "v2"
+    block_manager.create_or_update_block(b_next, actor=default_user)
+    block_manager.checkpoint_block(b_init.id, actor=default_user)
+
+    # We are at seq=2, which is the highest checkpoint.
+    # Attempt redo => there's no seq=3
+    with pytest.raises(ValueError, match="Cannot redo further"):
+        block_manager.redo_checkpoint_block(b_init.id, actor=default_user)
+
+
+def test_redo_after_multiple_undo(server: SyncServer, default_user):
+    """
+    1) Create and checkpoint versions: v1 -> seq=1, v2 -> seq=2, v3 -> seq=3, v4 -> seq=4
+    2) Undo thrice => from seq=4 to seq=1
+    3) Redo thrice => from seq=1 back to seq=4
+    """
+    block_manager = BlockManager()
+
+    # Step 1: create initial block => seq=1
+    b_init = block_manager.create_or_update_block(PydanticBlock(label="redo_multi", value="v1"), actor=default_user)
+    block_manager.checkpoint_block(b_init.id, actor=default_user)
+
+    # seq=2
+    b_v2 = PydanticBlock(**b_init.model_dump())
+    b_v2.value = "v2"
+    block_manager.create_or_update_block(b_v2, actor=default_user)
+    block_manager.checkpoint_block(b_init.id, actor=default_user)
+
+    # seq=3
+    b_v3 = PydanticBlock(**b_init.model_dump())
+    b_v3.value = "v3"
+    block_manager.create_or_update_block(b_v3, actor=default_user)
+    block_manager.checkpoint_block(b_init.id, actor=default_user)
+
+    # seq=4
+    b_v4 = PydanticBlock(**b_init.model_dump())
+    b_v4.value = "v4"
+    block_manager.create_or_update_block(b_v4, actor=default_user)
+    block_manager.checkpoint_block(b_init.id, actor=default_user)
+
+    # We have 4 checkpoints: v1...v4. Current is seq=4.
+
+    # 2) Undo thrice => from seq=4 -> seq=1
+    for expected_value in ["v3", "v2", "v1"]:
+        undone_block = block_manager.undo_checkpoint_block(b_init.id, actor=default_user)
+        assert undone_block.value == expected_value, f"Undo should get us back to {expected_value}"
+
+    # 3) Redo thrice => from seq=1 -> seq=4
+    for expected_value in ["v2", "v3", "v4"]:
+        redone_block = block_manager.redo_checkpoint_block(b_init.id, actor=default_user)
+        assert redone_block.value == expected_value, f"Redo should get us forward to {expected_value}"
+
+
+def test_redo_concurrency_stale(server: SyncServer, default_user):
+    block_manager = BlockManager()
+
+    # 1) Create block => checkpoint => seq=1
+    block = block_manager.create_or_update_block(PydanticBlock(label="redo_concurrency", value="v1"), actor=default_user)
+    block_manager.checkpoint_block(block.id, actor=default_user)
+
+    # 2) Another edit => checkpoint => seq=2
+    block_v2 = PydanticBlock(**block.model_dump())
+    block_v2.value = "v2"
+    block_manager.create_or_update_block(block_v2, actor=default_user)
+    block_manager.checkpoint_block(block.id, actor=default_user)
+
+    # 3) Another edit => checkpoint => seq=3
+    block_v3 = PydanticBlock(**block.model_dump())
+    block_v3.value = "v3"
+    block_manager.create_or_update_block(block_v3, actor=default_user)
+    block_manager.checkpoint_block(block.id, actor=default_user)
+    # Now the block is at seq=3 in the DB
+
+    # 4) Undo from seq=3 -> seq=2 so that we have a known future state at seq=3
+    undone_block = block_manager.undo_checkpoint_block(block.id, actor=default_user)
+    assert undone_block.value == "v2"
+
+    # At this point the block is physically at seq=2 in DB,
+    # but there's a valid row for seq=3 in block_history (the 'v3' state).
+
+    # 5) Simulate concurrency: two sessions each read the block at seq=2
+    with db_context() as s1:
+        block_s1 = s1.get(Block, block.id)
+    with db_context() as s2:
+        block_s2 = s2.get(Block, block.id)
+
+    # 6) Session1 redoes to seq=3 first -> success
+    block_manager.redo_checkpoint_block(block_id=block.id, actor=default_user, use_preloaded_block=block_s1)
+    # commits => block is now seq=3 in DB, version increments
+
+    # 7) Session2 tries to do the same from stale version
+    # => we expect StaleDataError, because the second session is using
+    #    an out-of-date version of the block
+    with pytest.raises(StaleDataError):
+        block_manager.redo_checkpoint_block(block_id=block.id, actor=default_user, use_preloaded_block=block_s2)
+
+
 # ======================================================================================================================
 # Identity Manager Tests
 # ======================================================================================================================
@@ -2609,7 +3378,7 @@ def test_create_and_upsert_identity(server: SyncServer, default_user):
 
     identity_create.properties = [(IdentityProperty(key="age", value=29, type=IdentityPropertyType.number))]
 
-    identity = server.identity_manager.upsert_identity(identity_create, actor=default_user)
+    identity = server.identity_manager.upsert_identity(identity=IdentityUpsert(**identity_create.model_dump()), actor=default_user)
 
     identity = server.identity_manager.get_identity(identity_id=identity.id, actor=default_user)
     assert len(identity.properties) == 1
@@ -2704,17 +3473,19 @@ def test_get_set_agents_for_identities(server: SyncServer, sarah_agent, charles_
     agent_with_identity = server.create_agent(
         CreateAgent(
             memory_blocks=[],
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
             identity_ids=[identity.id],
+            include_base_tools=False,
         ),
         actor=default_user,
     )
     agent_without_identity = server.create_agent(
         CreateAgent(
             memory_blocks=[],
-            llm_config=LLMConfig.default_config("gpt-4"),
+            llm_config=LLMConfig.default_config("gpt-4o-mini"),
             embedding_config=EmbeddingConfig.default_config(provider="openai"),
+            include_base_tools=False,
         ),
         actor=default_user,
     )
@@ -2824,6 +3595,34 @@ def test_get_set_blocks_for_identities(server: SyncServer, default_block, defaul
     assert default_block.id in block_ids
     assert not block_with_identity.id in block_ids
     assert not block_without_identity.id in block_ids
+
+    server.identity_manager.delete_identity(identity.id, actor=default_user)
+
+
+def test_upsert_properties(server: SyncServer, default_user):
+    identity_create = IdentityCreate(
+        identifier_key="1234",
+        name="caren",
+        identity_type=IdentityType.user,
+        properties=[
+            IdentityProperty(key="email", value="caren@letta.com", type=IdentityPropertyType.string),
+            IdentityProperty(key="age", value=28, type=IdentityPropertyType.number),
+        ],
+    )
+
+    identity = server.identity_manager.create_identity(identity_create, actor=default_user)
+    properties = [
+        IdentityProperty(key="email", value="caren@gmail.com", type=IdentityPropertyType.string),
+        IdentityProperty(key="age", value="28", type=IdentityPropertyType.string),
+        IdentityProperty(key="test", value=123, type=IdentityPropertyType.number),
+    ]
+
+    updated_identity = server.identity_manager.upsert_identity_properties(
+        identity_id=identity.id,
+        properties=properties,
+        actor=default_user,
+    )
+    assert updated_identity.properties == properties
 
     server.identity_manager.delete_identity(identity.id, actor=default_user)
 
@@ -3478,6 +4277,40 @@ def test_list_jobs_filter_by_type(server: SyncServer, default_user, default_job)
     assert jobs[0].id == run.id
 
 
+def test_e2e_job_callback(monkeypatch, server: SyncServer, default_user):
+    captured = {}
+
+    def fake_post(url, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+
+        class FakeResponse:
+            status_code = 202
+
+        return FakeResponse()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    job_in = PydanticJob(status=JobStatus.created, metadata={"foo": "bar"}, callback_url="http://example.test/webhook/jobs")
+    created = server.job_manager.create_job(job_in, actor=default_user)
+    assert created.callback_url == "http://example.test/webhook/jobs"
+
+    update = JobUpdate(status=JobStatus.completed)
+    updated = server.job_manager.update_job_by_id(created.id, update, actor=default_user)
+
+    assert captured["url"] == created.callback_url
+    assert captured["json"]["job_id"] == created.id
+    assert captured["json"]["status"] == JobStatus.completed.value
+
+    # Normalize the received completed_at to compare properly
+    actual_dt = datetime.fromisoformat(captured["json"]["completed_at"]).replace(tzinfo=None)
+    expected_dt = updated.completed_at.replace(tzinfo=None)
+    assert actual_dt == expected_dt
+
+    assert isinstance(updated.callback_sent_at, datetime)
+    assert updated.callback_status_code == 202
+
+
 # ======================================================================================================================
 # JobManager Tests - Messages
 # ======================================================================================================================
@@ -3614,7 +4447,7 @@ def test_job_messages_pagination(server: SyncServer, default_run, default_user, 
 def test_job_messages_ordering(server: SyncServer, default_run, default_user, sarah_agent):
     """Test that messages are ordered by created_at."""
     # Create messages with different timestamps
-    base_time = datetime.utcnow()
+    base_time = datetime.now(timezone.utc)
     message_times = [
         base_time - timedelta(minutes=2),
         base_time - timedelta(minutes=1),
@@ -3857,7 +4690,7 @@ def test_job_usage_stats_add_and_get(server: SyncServer, sarah_agent, default_jo
     step_manager.log_step(
         agent_id=sarah_agent.id,
         provider_name="openai",
-        model="gpt-4",
+        model="gpt-4o-mini",
         model_endpoint="https://api.openai.com/v1",
         context_window_limit=8192,
         job_id=default_job.id,
@@ -3908,7 +4741,7 @@ def test_job_usage_stats_add_multiple(server: SyncServer, sarah_agent, default_j
     step_manager.log_step(
         agent_id=sarah_agent.id,
         provider_name="openai",
-        model="gpt-4",
+        model="gpt-4o-mini",
         model_endpoint="https://api.openai.com/v1",
         context_window_limit=8192,
         job_id=default_job.id,
@@ -3924,7 +4757,7 @@ def test_job_usage_stats_add_multiple(server: SyncServer, sarah_agent, default_j
     step_manager.log_step(
         agent_id=sarah_agent.id,
         provider_name="openai",
-        model="gpt-4",
+        model="gpt-4o-mini",
         model_endpoint="https://api.openai.com/v1",
         context_window_limit=8192,
         job_id=default_job.id,
@@ -3970,7 +4803,7 @@ def test_job_usage_stats_add_nonexistent_job(server: SyncServer, sarah_agent, de
         step_manager.log_step(
             agent_id=sarah_agent.id,
             provider_name="openai",
-            model="gpt-4",
+            model="gpt-4o-mini",
             model_endpoint="https://api.openai.com/v1",
             context_window_limit=8192,
             job_id="nonexistent_job",
@@ -3996,9 +4829,10 @@ def test_list_tags(server: SyncServer, default_user, default_organization):
             agent_create=CreateAgent(
                 name="tag_agent_" + str(i),
                 memory_blocks=[],
-                llm_config=LLMConfig.default_config("gpt-4"),
+                llm_config=LLMConfig.default_config("gpt-4o-mini"),
                 embedding_config=EmbeddingConfig.default_config(provider="openai"),
                 tags=tags[i : i + 3],  # Each agent gets 3 consecutive tags
+                include_base_tools=False,
             ),
         )
         agents.append(agent)
@@ -4034,3 +4868,504 @@ def test_list_tags(server: SyncServer, default_user, default_organization):
     # Cleanup
     for agent in agents:
         server.agent_manager.delete_agent(agent.id, actor=default_user)
+
+
+# ======================================================================================================================
+# LLMBatchManager Tests
+# ======================================================================================================================
+
+
+def test_create_and_get_batch_request(server, default_user, dummy_beta_message_batch, letta_batch_job):
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        status=JobStatus.created,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+    assert batch.id.startswith("batch_req-")
+    assert batch.create_batch_response == dummy_beta_message_batch
+    fetched = server.batch_manager.get_llm_batch_job_by_id(batch.id, actor=default_user)
+    assert fetched.id == batch.id
+
+
+def test_update_batch_status(server, default_user, dummy_beta_message_batch, letta_batch_job):
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        status=JobStatus.created,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+    before = datetime.now(timezone.utc)
+
+    server.batch_manager.update_llm_batch_status(
+        llm_batch_id=batch.id,
+        status=JobStatus.completed,
+        latest_polling_response=dummy_beta_message_batch,
+        actor=default_user,
+    )
+
+    updated = server.batch_manager.get_llm_batch_job_by_id(batch.id, actor=default_user)
+    assert updated.status == JobStatus.completed
+    assert updated.latest_polling_response == dummy_beta_message_batch
+    assert updated.last_polled_at >= before
+
+
+def test_create_and_get_batch_item(
+    server, default_user, sarah_agent, dummy_beta_message_batch, dummy_llm_config, dummy_step_state, letta_batch_job
+):
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        status=JobStatus.created,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    item = server.batch_manager.create_llm_batch_item(
+        llm_batch_id=batch.id,
+        agent_id=sarah_agent.id,
+        llm_config=dummy_llm_config,
+        step_state=dummy_step_state,
+        actor=default_user,
+    )
+
+    assert item.llm_batch_id == batch.id
+    assert item.agent_id == sarah_agent.id
+    assert item.step_state == dummy_step_state
+
+    fetched = server.batch_manager.get_llm_batch_item_by_id(item.id, actor=default_user)
+    assert fetched.id == item.id
+
+
+def test_update_batch_item(
+    server,
+    default_user,
+    sarah_agent,
+    dummy_beta_message_batch,
+    dummy_llm_config,
+    dummy_step_state,
+    dummy_successful_response,
+    letta_batch_job,
+):
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        status=JobStatus.created,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    item = server.batch_manager.create_llm_batch_item(
+        llm_batch_id=batch.id,
+        agent_id=sarah_agent.id,
+        llm_config=dummy_llm_config,
+        step_state=dummy_step_state,
+        actor=default_user,
+    )
+
+    updated_step_state = AgentStepState(step_number=2, tool_rules_solver=dummy_step_state.tool_rules_solver)
+
+    server.batch_manager.update_llm_batch_item(
+        item_id=item.id,
+        request_status=JobStatus.completed,
+        step_status=AgentStepStatus.resumed,
+        llm_request_response=dummy_successful_response,
+        step_state=updated_step_state,
+        actor=default_user,
+    )
+
+    updated = server.batch_manager.get_llm_batch_item_by_id(item.id, actor=default_user)
+    assert updated.request_status == JobStatus.completed
+    assert updated.batch_request_result == dummy_successful_response
+
+
+def test_delete_batch_item(
+    server, default_user, sarah_agent, dummy_beta_message_batch, dummy_llm_config, dummy_step_state, letta_batch_job
+):
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        status=JobStatus.created,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    item = server.batch_manager.create_llm_batch_item(
+        llm_batch_id=batch.id,
+        agent_id=sarah_agent.id,
+        llm_config=dummy_llm_config,
+        step_state=dummy_step_state,
+        actor=default_user,
+    )
+
+    server.batch_manager.delete_llm_batch_item(item_id=item.id, actor=default_user)
+
+    with pytest.raises(NoResultFound):
+        server.batch_manager.get_llm_batch_item_by_id(item.id, actor=default_user)
+
+
+def test_list_running_batches(server, default_user, dummy_beta_message_batch, letta_batch_job):
+    server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        status=JobStatus.running,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    running_batches = server.batch_manager.list_running_llm_batches(actor=default_user)
+    assert len(running_batches) >= 1
+    assert all(batch.status == JobStatus.running for batch in running_batches)
+
+
+def test_bulk_update_batch_statuses(server, default_user, dummy_beta_message_batch, letta_batch_job):
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        status=JobStatus.created,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    server.batch_manager.bulk_update_llm_batch_statuses([(batch.id, JobStatus.completed, dummy_beta_message_batch)])
+
+    updated = server.batch_manager.get_llm_batch_job_by_id(batch.id, actor=default_user)
+    assert updated.status == JobStatus.completed
+    assert updated.latest_polling_response == dummy_beta_message_batch
+
+
+def test_bulk_update_batch_items_results_by_agent(
+    server,
+    default_user,
+    sarah_agent,
+    dummy_beta_message_batch,
+    dummy_llm_config,
+    dummy_step_state,
+    dummy_successful_response,
+    letta_batch_job,
+):
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+    item = server.batch_manager.create_llm_batch_item(
+        llm_batch_id=batch.id,
+        agent_id=sarah_agent.id,
+        llm_config=dummy_llm_config,
+        step_state=dummy_step_state,
+        actor=default_user,
+    )
+
+    server.batch_manager.bulk_update_batch_llm_items_results_by_agent(
+        [ItemUpdateInfo(batch.id, sarah_agent.id, JobStatus.completed, dummy_successful_response)]
+    )
+
+    updated = server.batch_manager.get_llm_batch_item_by_id(item.id, actor=default_user)
+    assert updated.request_status == JobStatus.completed
+    assert updated.batch_request_result == dummy_successful_response
+
+
+def test_bulk_update_batch_items_step_status_by_agent(
+    server, default_user, sarah_agent, dummy_beta_message_batch, dummy_llm_config, dummy_step_state, letta_batch_job
+):
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+    item = server.batch_manager.create_llm_batch_item(
+        llm_batch_id=batch.id,
+        agent_id=sarah_agent.id,
+        llm_config=dummy_llm_config,
+        step_state=dummy_step_state,
+        actor=default_user,
+    )
+
+    server.batch_manager.bulk_update_llm_batch_items_step_status_by_agent(
+        [StepStatusUpdateInfo(batch.id, sarah_agent.id, AgentStepStatus.resumed)]
+    )
+
+    updated = server.batch_manager.get_llm_batch_item_by_id(item.id, actor=default_user)
+    assert updated.step_status == AgentStepStatus.resumed
+
+
+def test_list_batch_items_limit_and_filter(
+    server, default_user, sarah_agent, dummy_beta_message_batch, dummy_llm_config, dummy_step_state, letta_batch_job
+):
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    for _ in range(3):
+        server.batch_manager.create_llm_batch_item(
+            llm_batch_id=batch.id,
+            agent_id=sarah_agent.id,
+            llm_config=dummy_llm_config,
+            step_state=dummy_step_state,
+            actor=default_user,
+        )
+
+    all_items = server.batch_manager.list_llm_batch_items(llm_batch_id=batch.id, actor=default_user)
+    limited_items = server.batch_manager.list_llm_batch_items(llm_batch_id=batch.id, limit=2, actor=default_user)
+
+    assert len(all_items) >= 3
+    assert len(limited_items) == 2
+
+
+def test_list_batch_items_pagination(
+    server, default_user, sarah_agent, dummy_beta_message_batch, dummy_llm_config, dummy_step_state, letta_batch_job
+):
+    # Create a batch job.
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    # Create 10 batch items.
+    created_items = []
+    for i in range(10):
+        item = server.batch_manager.create_llm_batch_item(
+            llm_batch_id=batch.id,
+            agent_id=sarah_agent.id,
+            llm_config=dummy_llm_config,
+            step_state=dummy_step_state,
+            actor=default_user,
+        )
+        created_items.append(item)
+
+    # Retrieve all items (without pagination).
+    all_items = server.batch_manager.list_llm_batch_items(llm_batch_id=batch.id, actor=default_user)
+    assert len(all_items) >= 10, f"Expected at least 10 items, got {len(all_items)}"
+
+    # Verify the items are ordered ascending by id (based on our implementation).
+    sorted_ids = [item.id for item in sorted(all_items, key=lambda i: i.id)]
+    retrieved_ids = [item.id for item in all_items]
+    assert retrieved_ids == sorted_ids, "Batch items are not ordered in ascending order by id"
+
+    # Choose a cursor: the id of the 5th item.
+    cursor = all_items[4].id
+
+    # Retrieve items after the cursor.
+    paged_items = server.batch_manager.list_llm_batch_items(llm_batch_id=batch.id, actor=default_user, after=cursor)
+
+    # All returned items should have an id greater than the cursor.
+    for item in paged_items:
+        assert item.id > cursor, f"Item id {item.id} is not greater than the cursor {cursor}"
+
+    # Count expected remaining items.
+    # Find the index of the cursor in our sorted list.
+    cursor_index = sorted_ids.index(cursor)
+    expected_remaining = len(sorted_ids) - cursor_index - 1
+    assert len(paged_items) == expected_remaining, f"Expected {expected_remaining} items after cursor, got {len(paged_items)}"
+
+    # Test pagination with a limit.
+    limit = 3
+    limited_page = server.batch_manager.list_llm_batch_items(llm_batch_id=batch.id, actor=default_user, after=cursor, limit=limit)
+    # If more than 'limit' items remain, we should only get exactly 'limit' items.
+    assert len(limited_page) == min(
+        limit, expected_remaining
+    ), f"Expected {min(limit, expected_remaining)} items with limit {limit}, got {len(limited_page)}"
+
+    # Optional: Test with a cursor beyond the last item returns an empty list.
+    last_cursor = sorted_ids[-1]
+    empty_page = server.batch_manager.list_llm_batch_items(llm_batch_id=batch.id, actor=default_user, after=last_cursor)
+    assert empty_page == [], "Expected an empty list when cursor is after the last item"
+
+
+def test_bulk_update_batch_items_request_status_by_agent(
+    server, default_user, sarah_agent, dummy_beta_message_batch, dummy_llm_config, dummy_step_state, letta_batch_job
+):
+    # Create a batch job
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    # Create a batch item
+    item = server.batch_manager.create_llm_batch_item(
+        llm_batch_id=batch.id,
+        agent_id=sarah_agent.id,
+        llm_config=dummy_llm_config,
+        step_state=dummy_step_state,
+        actor=default_user,
+    )
+
+    # Update the request status using the bulk update method
+    server.batch_manager.bulk_update_llm_batch_items_request_status_by_agent(
+        [RequestStatusUpdateInfo(batch.id, sarah_agent.id, JobStatus.expired)]
+    )
+
+    # Verify the update was applied
+    updated = server.batch_manager.get_llm_batch_item_by_id(item.id, actor=default_user)
+    assert updated.request_status == JobStatus.expired
+
+
+def test_bulk_update_nonexistent_items_should_error(
+    server,
+    default_user,
+    dummy_beta_message_batch,
+    dummy_successful_response,
+    letta_batch_job,
+):
+    # Create a batch job
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    nonexistent_pairs = [(batch.id, "nonexistent-agent-id")]
+    nonexistent_updates = [{"request_status": JobStatus.expired}]
+    expected_err_msg = (
+        f"Cannot bulk-update batch items: no records for the following "
+        f"(llm_batch_id, agent_id) pairs: {{('{batch.id}', 'nonexistent-agent-id')}}"
+    )
+
+    with pytest.raises(ValueError, match=re.escape(expected_err_msg)):
+        server.batch_manager.bulk_update_llm_batch_items(nonexistent_pairs, nonexistent_updates)
+
+    with pytest.raises(ValueError, match=re.escape(expected_err_msg)):
+        server.batch_manager.bulk_update_batch_llm_items_results_by_agent(
+            [ItemUpdateInfo(batch.id, "nonexistent-agent-id", JobStatus.expired, dummy_successful_response)]
+        )
+
+    with pytest.raises(ValueError, match=re.escape(expected_err_msg)):
+        server.batch_manager.bulk_update_llm_batch_items_step_status_by_agent(
+            [StepStatusUpdateInfo(batch.id, "nonexistent-agent-id", AgentStepStatus.resumed)]
+        )
+
+    with pytest.raises(ValueError, match=re.escape(expected_err_msg)):
+        server.batch_manager.bulk_update_llm_batch_items_request_status_by_agent(
+            [RequestStatusUpdateInfo(batch.id, "nonexistent-agent-id", JobStatus.expired)]
+        )
+
+
+def test_bulk_update_nonexistent_items(server, default_user, dummy_beta_message_batch, dummy_successful_response, letta_batch_job):
+    # Create a batch job
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    # Attempt to update non-existent items should not raise errors
+
+    # Test with the direct bulk_update_llm_batch_items method
+    nonexistent_pairs = [(batch.id, "nonexistent-agent-id")]
+    nonexistent_updates = [{"request_status": JobStatus.expired}]
+
+    # This should not raise an error, just silently skip non-existent items
+    server.batch_manager.bulk_update_llm_batch_items(nonexistent_pairs, nonexistent_updates, strict=False)
+
+    # Test with higher-level methods
+    # Results by agent
+    server.batch_manager.bulk_update_batch_llm_items_results_by_agent(
+        [ItemUpdateInfo(batch.id, "nonexistent-agent-id", JobStatus.expired, dummy_successful_response)], strict=False
+    )
+
+    # Step status by agent
+    server.batch_manager.bulk_update_llm_batch_items_step_status_by_agent(
+        [StepStatusUpdateInfo(batch.id, "nonexistent-agent-id", AgentStepStatus.resumed)], strict=False
+    )
+
+    # Request status by agent
+    server.batch_manager.bulk_update_llm_batch_items_request_status_by_agent(
+        [RequestStatusUpdateInfo(batch.id, "nonexistent-agent-id", JobStatus.expired)], strict=False
+    )
+
+
+def test_create_batch_items_bulk(
+    server, default_user, sarah_agent, dummy_beta_message_batch, dummy_llm_config, dummy_step_state, letta_batch_job
+):
+    # Create a batch job
+    llm_batch_job = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    # Prepare data for multiple batch items
+    batch_items = []
+    agent_ids = [sarah_agent.id, sarah_agent.id, sarah_agent.id]  # Using the same agent for simplicity
+
+    for agent_id in agent_ids:
+        batch_item = LLMBatchItem(
+            llm_batch_id=llm_batch_job.id,
+            agent_id=agent_id,
+            llm_config=dummy_llm_config,
+            request_status=JobStatus.created,
+            step_status=AgentStepStatus.paused,
+            step_state=dummy_step_state,
+        )
+        batch_items.append(batch_item)
+
+    # Call the bulk create function
+    created_items = server.batch_manager.create_llm_batch_items_bulk(batch_items, actor=default_user)
+
+    # Verify the correct number of items were created
+    assert len(created_items) == len(agent_ids)
+
+    # Verify each item has expected properties
+    for item in created_items:
+        assert item.id.startswith("batch_item-")
+        assert item.llm_batch_id == llm_batch_job.id
+        assert item.agent_id in agent_ids
+        assert item.llm_config == dummy_llm_config
+        assert item.request_status == JobStatus.created
+        assert item.step_status == AgentStepStatus.paused
+        assert item.step_state == dummy_step_state
+
+    # Verify items can be retrieved from the database
+    all_items = server.batch_manager.list_llm_batch_items(llm_batch_id=llm_batch_job.id, actor=default_user)
+    assert len(all_items) >= len(agent_ids)
+
+    # Verify the IDs of created items match what's in the database
+    created_ids = [item.id for item in created_items]
+    for item_id in created_ids:
+        fetched = server.batch_manager.get_llm_batch_item_by_id(item_id, actor=default_user)
+        assert fetched.id in created_ids
+
+
+def test_count_batch_items(
+    server, default_user, sarah_agent, dummy_beta_message_batch, dummy_llm_config, dummy_step_state, letta_batch_job
+):
+    # Create a batch job first.
+    batch = server.batch_manager.create_llm_batch_job(
+        llm_provider=ProviderType.anthropic,
+        status=JobStatus.created,
+        create_batch_response=dummy_beta_message_batch,
+        actor=default_user,
+        letta_batch_job_id=letta_batch_job.id,
+    )
+
+    # Create a specific number of batch items for this batch.
+    num_items = 5
+    for _ in range(num_items):
+        server.batch_manager.create_llm_batch_item(
+            llm_batch_id=batch.id,
+            agent_id=sarah_agent.id,
+            llm_config=dummy_llm_config,
+            step_state=dummy_step_state,
+            actor=default_user,
+        )
+
+    # Use the count_llm_batch_items method to count the items.
+    count = server.batch_manager.count_llm_batch_items(llm_batch_id=batch.id)
+
+    # Assert that the count matches the expected number.
+    assert count == num_items, f"Expected {num_items} items, got {count}"

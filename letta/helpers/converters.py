@@ -2,12 +2,14 @@ import base64
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
+from anthropic.types.beta.messages import BetaMessageBatch, BetaMessageBatchIndividualResponse
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall as OpenAIToolCall
 from openai.types.chat.chat_completion_message_tool_call import Function as OpenAIFunction
 from sqlalchemy import Dialect
 
+from letta.schemas.agent import AgentStepState
 from letta.schemas.embedding_config import EmbeddingConfig
-from letta.schemas.enums import ToolRuleType
+from letta.schemas.enums import ProviderType, ToolRuleType
 from letta.schemas.letta_message_content import (
     MessageContent,
     MessageContentType,
@@ -20,12 +22,20 @@ from letta.schemas.letta_message_content import (
 )
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import ToolReturn
+from letta.schemas.response_format import (
+    JsonObjectResponseFormat,
+    JsonSchemaResponseFormat,
+    ResponseFormatType,
+    ResponseFormatUnion,
+    TextResponseFormat,
+)
 from letta.schemas.tool_rule import (
     ChildToolRule,
     ConditionalToolRule,
     ContinueToolRule,
     InitToolRule,
     MaxCountPerStepToolRule,
+    ParentToolRule,
     TerminalToolRule,
     ToolRule,
 )
@@ -38,7 +48,7 @@ from letta.schemas.tool_rule import (
 def serialize_llm_config(config: Union[Optional[LLMConfig], Dict]) -> Optional[Dict]:
     """Convert an LLMConfig object into a JSON-serializable dictionary."""
     if config and isinstance(config, LLMConfig):
-        return config.model_dump()
+        return config.model_dump(mode="json")
     return config
 
 
@@ -55,7 +65,7 @@ def deserialize_llm_config(data: Optional[Dict]) -> Optional[LLMConfig]:
 def serialize_embedding_config(config: Union[Optional[EmbeddingConfig], Dict]) -> Optional[Dict]:
     """Convert an EmbeddingConfig object into a JSON-serializable dictionary."""
     if config and isinstance(config, EmbeddingConfig):
-        return config.model_dump()
+        return config.model_dump(mode="json")
     return config
 
 
@@ -75,7 +85,9 @@ def serialize_tool_rules(tool_rules: Optional[List[ToolRule]]) -> List[Dict[str,
     if not tool_rules:
         return []
 
-    data = [{**rule.model_dump(), "type": rule.type.value} for rule in tool_rules]  # Convert Enum to string for JSON compatibility
+    data = [
+        {**rule.model_dump(mode="json"), "type": rule.type.value} for rule in tool_rules
+    ]  # Convert Enum to string for JSON compatibility
 
     # Validate ToolRule structure
     for rule_data in data:
@@ -85,7 +97,7 @@ def serialize_tool_rules(tool_rules: Optional[List[ToolRule]]) -> List[Dict[str,
     return data
 
 
-def deserialize_tool_rules(data: Optional[List[Dict]]) -> List[Union[ChildToolRule, InitToolRule, TerminalToolRule, ConditionalToolRule]]:
+def deserialize_tool_rules(data: Optional[List[Dict]]) -> List[ToolRule]:
     """Convert a list of dictionaries back into ToolRule objects."""
     if not data:
         return []
@@ -95,7 +107,7 @@ def deserialize_tool_rules(data: Optional[List[Dict]]) -> List[Union[ChildToolRu
 
 def deserialize_tool_rule(
     data: Dict,
-) -> Union[ChildToolRule, InitToolRule, TerminalToolRule, ConditionalToolRule, ContinueToolRule, MaxCountPerStepToolRule]:
+) -> ToolRule:
     """Deserialize a dictionary to the appropriate ToolRule subclass based on 'type'."""
     rule_type = ToolRuleType(data.get("type"))
 
@@ -114,6 +126,8 @@ def deserialize_tool_rule(
         return ContinueToolRule(**data)
     elif rule_type == ToolRuleType.max_count_per_step:
         return MaxCountPerStepToolRule(**data)
+    elif rule_type == ToolRuleType.parent_last_tool:
+        return ParentToolRule(**data)
     raise ValueError(f"Unknown ToolRule type: {rule_type}")
 
 
@@ -130,7 +144,7 @@ def serialize_tool_calls(tool_calls: Optional[List[Union[OpenAIToolCall, dict]]]
     serialized_calls = []
     for call in tool_calls:
         if isinstance(call, OpenAIToolCall):
-            serialized_calls.append(call.model_dump())
+            serialized_calls.append(call.model_dump(mode="json"))
         elif isinstance(call, dict):
             serialized_calls.append(call)  # Already a dictionary, leave it as-is
         else:
@@ -147,7 +161,7 @@ def deserialize_tool_calls(data: Optional[List[Dict]]) -> List[OpenAIToolCall]:
     calls = []
     for item in data:
         func_data = item.pop("function", None)
-        tool_call_function = OpenAIFunction(**func_data) if func_data else None
+        tool_call_function = OpenAIFunction(**func_data)
         calls.append(OpenAIToolCall(function=tool_call_function, **item))
 
     return calls
@@ -166,7 +180,7 @@ def serialize_tool_returns(tool_returns: Optional[List[Union[ToolReturn, dict]]]
     serialized_tool_returns = []
     for tool_return in tool_returns:
         if isinstance(tool_return, ToolReturn):
-            serialized_tool_returns.append(tool_return.model_dump())
+            serialized_tool_returns.append(tool_return.model_dump(mode="json"))
         elif isinstance(tool_return, dict):
             serialized_tool_returns.append(tool_return)  # Already a dictionary, leave it as-is
         else:
@@ -201,7 +215,7 @@ def serialize_message_content(message_content: Optional[List[Union[MessageConten
     serialized_message_content = []
     for content in message_content:
         if isinstance(content, MessageContent):
-            serialized_message_content.append(content.model_dump())
+            serialized_message_content.append(content.model_dump(mode="json"))
         elif isinstance(content, dict):
             serialized_message_content.append(content)  # Already a dictionary, leave it as-is
         else:
@@ -266,3 +280,123 @@ def deserialize_vector(data: Optional[bytes], dialect: Dialect) -> Optional[np.n
         data = base64.b64decode(data)
 
     return np.frombuffer(data, dtype=np.float32)
+
+
+# --------------------------
+# Batch Request Serialization
+# --------------------------
+
+
+def serialize_create_batch_response(create_batch_response: Union[BetaMessageBatch]) -> Dict[str, Any]:
+    """Convert a list of ToolRules into a JSON-serializable format."""
+    llm_provider_type = None
+    if isinstance(create_batch_response, BetaMessageBatch):
+        llm_provider_type = ProviderType.anthropic.value
+
+    if not llm_provider_type:
+        raise ValueError(f"Could not determine llm provider from create batch response object type: {create_batch_response}")
+
+    return {"data": create_batch_response.model_dump(mode="json"), "type": llm_provider_type}
+
+
+def deserialize_create_batch_response(data: Dict) -> Union[BetaMessageBatch]:
+    provider_type = ProviderType(data.get("type"))
+
+    if provider_type == ProviderType.anthropic:
+        return BetaMessageBatch(**data.get("data"))
+
+    raise ValueError(f"Unknown ProviderType type: {provider_type}")
+
+
+# TODO: Note that this is the same as above for Anthropic, but this is not the case for all providers
+# TODO: Some have different types based on the create v.s. poll requests
+def serialize_poll_batch_response(poll_batch_response: Optional[Union[BetaMessageBatch]]) -> Optional[Dict[str, Any]]:
+    """Convert a list of ToolRules into a JSON-serializable format."""
+    if not poll_batch_response:
+        return None
+
+    llm_provider_type = None
+    if isinstance(poll_batch_response, BetaMessageBatch):
+        llm_provider_type = ProviderType.anthropic.value
+
+    if not llm_provider_type:
+        raise ValueError(f"Could not determine llm provider from poll batch response object type: {poll_batch_response}")
+
+    return {"data": poll_batch_response.model_dump(mode="json"), "type": llm_provider_type}
+
+
+def deserialize_poll_batch_response(data: Optional[Dict]) -> Optional[Union[BetaMessageBatch]]:
+    if not data:
+        return None
+
+    provider_type = ProviderType(data.get("type"))
+
+    if provider_type == ProviderType.anthropic:
+        return BetaMessageBatch(**data.get("data"))
+
+    raise ValueError(f"Unknown ProviderType type: {provider_type}")
+
+
+def serialize_batch_request_result(
+    batch_individual_response: Optional[Union[BetaMessageBatchIndividualResponse]],
+) -> Optional[Dict[str, Any]]:
+    """Convert a list of ToolRules into a JSON-serializable format."""
+    if not batch_individual_response:
+        return None
+
+    llm_provider_type = None
+    if isinstance(batch_individual_response, BetaMessageBatchIndividualResponse):
+        llm_provider_type = ProviderType.anthropic.value
+
+    if not llm_provider_type:
+        raise ValueError(f"Could not determine llm provider from batch result object type: {batch_individual_response}")
+
+    return {"data": batch_individual_response.model_dump(mode="json"), "type": llm_provider_type}
+
+
+def deserialize_batch_request_result(data: Optional[Dict]) -> Optional[Union[BetaMessageBatchIndividualResponse]]:
+    if not data:
+        return None
+    provider_type = ProviderType(data.get("type"))
+
+    if provider_type == ProviderType.anthropic:
+        return BetaMessageBatchIndividualResponse(**data.get("data"))
+
+    raise ValueError(f"Unknown ProviderType type: {provider_type}")
+
+
+def serialize_agent_step_state(agent_step_state: Optional[AgentStepState]) -> Optional[Dict[str, Any]]:
+    """Convert a list of ToolRules into a JSON-serializable format."""
+    if not agent_step_state:
+        return None
+
+    return agent_step_state.model_dump(mode="json")
+
+
+def deserialize_agent_step_state(data: Optional[Dict]) -> Optional[AgentStepState]:
+    if not data:
+        return None
+
+    return AgentStepState(**data)
+
+
+# --------------------------
+# Response Format Serialization
+# --------------------------
+
+
+def serialize_response_format(response_format: Optional[ResponseFormatUnion]) -> Optional[Dict[str, Any]]:
+    if not response_format:
+        return None
+    return response_format.model_dump(mode="json")
+
+
+def deserialize_response_format(data: Optional[Dict]) -> Optional[ResponseFormatUnion]:
+    if not data:
+        return None
+    if data["type"] == ResponseFormatType.text:
+        return TextResponseFormat(**data)
+    if data["type"] == ResponseFormatType.json_schema:
+        return JsonSchemaResponseFormat(**data)
+    if data["type"] == ResponseFormatType.json_object:
+        return JsonObjectResponseFormat(**data)

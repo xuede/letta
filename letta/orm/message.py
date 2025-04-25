@@ -1,8 +1,8 @@
 from typing import List, Optional
 
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall as OpenAIToolCall
-from sqlalchemy import ForeignKey, Index
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import BigInteger, FetchedValue, ForeignKey, Index, event, text
+from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from letta.orm.custom_columns import MessageContentColumn, ToolCallColumn, ToolReturnColumn
 from letta.orm.mixins import AgentMixin, OrganizationMixin
@@ -11,6 +11,7 @@ from letta.schemas.letta_message_content import MessageContent
 from letta.schemas.letta_message_content import TextContent as PydanticTextContent
 from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.message import ToolReturn
+from letta.settings import settings
 
 
 class Message(SqlalchemyBase, OrganizationMixin, AgentMixin):
@@ -20,6 +21,7 @@ class Message(SqlalchemyBase, OrganizationMixin, AgentMixin):
     __table_args__ = (
         Index("ix_messages_agent_created_at", "agent_id", "created_at"),
         Index("ix_messages_created_at", "created_at", "id"),
+        Index("ix_messages_agent_sequence", "agent_id", "sequence_id"),
     )
     __pydantic_model__ = PydanticMessage
 
@@ -39,9 +41,19 @@ class Message(SqlalchemyBase, OrganizationMixin, AgentMixin):
         ToolReturnColumn, nullable=True, doc="Tool execution return information for prior tool calls"
     )
     group_id: Mapped[Optional[str]] = mapped_column(nullable=True, doc="The multi-agent group that the message was sent in")
+    sender_id: Mapped[Optional[str]] = mapped_column(
+        nullable=True, doc="The id of the sender of the message, can be an identity id or agent id"
+    )
+
+    # Monotonically increasing sequence for efficient/correct listing
+    sequence_id: Mapped[int] = mapped_column(
+        BigInteger,
+        server_default=FetchedValue(),
+        unique=True,
+        nullable=False,
+    )
 
     # Relationships
-    agent: Mapped["Agent"] = relationship("Agent", back_populates="messages", lazy="selectin")
     organization: Mapped["Organization"] = relationship("Organization", back_populates="messages", lazy="selectin")
     step: Mapped["Step"] = relationship("Step", back_populates="messages", lazy="selectin")
 
@@ -60,4 +72,25 @@ class Message(SqlalchemyBase, OrganizationMixin, AgentMixin):
         model = self.__pydantic_model__.model_validate(self)
         if self.text and not model.content:
             model.content = [PydanticTextContent(text=self.text)]
+        # If there are no tool calls, set tool_calls to None
+        if len(self.tool_calls) == 0:
+            model.tool_calls = None
         return model
+
+
+# listener
+
+
+@event.listens_for(Message, "before_insert")
+def set_sequence_id_for_sqlite(mapper, connection, target):
+    # TODO: Kind of hacky, used to detect if we are using sqlite or not
+    if not settings.letta_pg_uri_no_default:
+        session = Session.object_session(target)
+
+        if not hasattr(session, "_sequence_id_counter"):
+            # Initialize counter for this flush
+            max_seq = connection.scalar(text("SELECT MAX(sequence_id) FROM messages"))
+            session._sequence_id_counter = max_seq or 0
+
+        session._sequence_id_counter += 1
+        target.sequence_id = session._sequence_id_counter

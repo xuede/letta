@@ -1,31 +1,39 @@
+import json
 import uuid
 from typing import List, Optional, Tuple
 
 import requests
+from google.genai.types import FunctionCallingConfig, FunctionCallingConfigMode, ToolConfig
 
 from letta.constants import NON_USER_MSG_PREFIX
-from letta.helpers.datetime_helpers import get_utc_time
+from letta.helpers.datetime_helpers import get_utc_time_int
 from letta.helpers.json_helpers import json_dumps
 from letta.llm_api.helpers import make_post_request
 from letta.llm_api.llm_client_base import LLMClientBase
 from letta.local_llm.json_parser import clean_json_string_extra_backslash
 from letta.local_llm.utils import count_tokens
+from letta.log import get_logger
+from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.openai.chat_completion_request import Tool
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse, Choice, FunctionCall, Message, ToolCall, UsageStatistics
 from letta.settings import model_settings
 from letta.utils import get_tool_call_id
 
+logger = get_logger(__name__)
+
 
 class GoogleAIClient(LLMClientBase):
 
-    def request(self, request_data: dict) -> dict:
+    def request(self, request_data: dict, llm_config: LLMConfig) -> dict:
         """
         Performs underlying request to llm and returns raw response.
         """
+        # print("[google_ai request]", json.dumps(request_data, indent=2))
+
         url, headers = get_gemini_endpoint_and_headers(
-            base_url=str(self.llm_config.model_endpoint),
-            model=self.llm_config.model,
+            base_url=str(llm_config.model_endpoint),
+            model=llm_config.model,
             api_key=str(model_settings.gemini_api_key),
             key_in_header=True,
             generate_content=True,
@@ -35,34 +43,52 @@ class GoogleAIClient(LLMClientBase):
     def build_request_data(
         self,
         messages: List[PydanticMessage],
+        llm_config: LLMConfig,
         tools: List[dict],
-        tool_call: Optional[str],
+        force_tool_call: Optional[str] = None,
     ) -> dict:
         """
         Constructs a request object in the expected data format for this client.
         """
         if tools:
             tools = [{"type": "function", "function": f} for f in tools]
-            tools = self.convert_tools_to_google_ai_format(
-                [Tool(**t) for t in tools],
-            )
+            tool_objs = [Tool(**t) for t in tools]
+            tool_names = [t.function.name for t in tool_objs]
+            # Convert to the exact payload style Google expects
+            tools = self.convert_tools_to_google_ai_format(tool_objs, llm_config)
+        else:
+            tool_names = []
+
         contents = self.add_dummy_model_messages(
             [m.to_google_ai_dict() for m in messages],
         )
 
-        return {
+        request_data = {
             "contents": contents,
             "tools": tools,
             "generation_config": {
-                "temperature": self.llm_config.temperature,
-                "max_output_tokens": self.llm_config.max_tokens,
+                "temperature": llm_config.temperature,
+                "max_output_tokens": llm_config.max_tokens,
             },
         }
+
+        # write tool config
+        tool_config = ToolConfig(
+            function_calling_config=FunctionCallingConfig(
+                # ANY mode forces the model to predict only function calls
+                mode=FunctionCallingConfigMode.ANY,
+                # Provide the list of tools (though empty should also work, it seems not to)
+                allowed_function_names=tool_names,
+            )
+        )
+        request_data["tool_config"] = tool_config.model_dump()
+        return request_data
 
     def convert_response_to_chat_completion(
         self,
         response_data: dict,
         input_messages: List[PydanticMessage],
+        llm_config: LLMConfig,
     ) -> ChatCompletionResponse:
         """
         Converts custom response format from llm client into an OpenAI
@@ -88,6 +114,8 @@ class GoogleAIClient(LLMClientBase):
             }
         }
         """
+        # print("[google_ai response]", json.dumps(response_data, indent=2))
+
         try:
             choices = []
             index = 0
@@ -98,6 +126,17 @@ class GoogleAIClient(LLMClientBase):
                 assert role == "model", f"Unknown role in response: {role}"
 
                 parts = content["parts"]
+
+                # NOTE: we aren't properly supported multi-parts here anyways (we're just appending choices),
+                #       so let's disable it for now
+
+                # NOTE(Apr 9, 2025): there's a very strange bug on 2.5 where the response has a part with broken text
+                # {'candidates': [{'content': {'parts': [{'functionCall': {'name': 'send_message', 'args': {'request_heartbeat': False, 'message': 'Hello! How can I make your day better?', 'inner_thoughts': 'User has initiated contact. Sending a greeting.'}}}], 'role': 'model'}, 'finishReason': 'STOP', 'avgLogprobs': -0.25891534213362066}], 'usageMetadata': {'promptTokenCount': 2493, 'candidatesTokenCount': 29, 'totalTokenCount': 2522, 'promptTokensDetails': [{'modality': 'TEXT', 'tokenCount': 2493}], 'candidatesTokensDetails': [{'modality': 'TEXT', 'tokenCount': 29}]}, 'modelVersion': 'gemini-1.5-pro-002'}
+                # To patch this, if we have multiple parts we can take the last one
+                if len(parts) > 1:
+                    logger.warning(f"Unexpected multiple parts in response from Google AI: {parts}")
+                    parts = [parts[-1]]
+
                 # TODO support parts / multimodal
                 # TODO support parallel tool calling natively
                 # TODO Alternative here is to throw away everything else except for the first part
@@ -112,7 +151,7 @@ class GoogleAIClient(LLMClientBase):
                         assert isinstance(function_args, dict), function_args
 
                         # NOTE: this also involves stripping the inner monologue out of the function
-                        if self.llm_config.put_inner_thoughts_in_kwargs:
+                        if llm_config.put_inner_thoughts_in_kwargs:
                             from letta.local_llm.constants import INNER_THOUGHTS_KWARG
 
                             assert INNER_THOUGHTS_KWARG in function_args, f"Couldn't find inner thoughts in function args:\n{function_call}"
@@ -188,10 +227,22 @@ class GoogleAIClient(LLMClientBase):
             #     "totalTokenCount": 36
             #   }
             if "usageMetadata" in response_data:
+                usage_data = response_data["usageMetadata"]
+                if "promptTokenCount" not in usage_data:
+                    raise ValueError(f"promptTokenCount not found in usageMetadata:\n{json.dumps(usage_data, indent=2)}")
+                if "totalTokenCount" not in usage_data:
+                    raise ValueError(f"totalTokenCount not found in usageMetadata:\n{json.dumps(usage_data, indent=2)}")
+                if "candidatesTokenCount" not in usage_data:
+                    raise ValueError(f"candidatesTokenCount not found in usageMetadata:\n{json.dumps(usage_data, indent=2)}")
+
+                prompt_tokens = usage_data["promptTokenCount"]
+                completion_tokens = usage_data["candidatesTokenCount"]
+                total_tokens = usage_data["totalTokenCount"]
+
                 usage = UsageStatistics(
-                    prompt_tokens=response_data["usageMetadata"]["promptTokenCount"],
-                    completion_tokens=response_data["usageMetadata"]["candidatesTokenCount"],
-                    total_tokens=response_data["usageMetadata"]["totalTokenCount"],
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
                 )
             else:
                 # Count it ourselves
@@ -209,14 +260,14 @@ class GoogleAIClient(LLMClientBase):
             return ChatCompletionResponse(
                 id=response_id,
                 choices=choices,
-                model=self.llm_config.model,  # NOTE: Google API doesn't pass back model in the response
-                created=get_utc_time(),
+                model=llm_config.model,  # NOTE: Google API doesn't pass back model in the response
+                created=get_utc_time_int(),
                 usage=usage,
             )
         except KeyError as e:
             raise e
 
-    def convert_tools_to_google_ai_format(self, tools: List[Tool]) -> List[dict]:
+    def convert_tools_to_google_ai_format(self, tools: List[Tool], llm_config: LLMConfig) -> List[dict]:
         """
         OpenAI style:
         "tools": [{
@@ -271,17 +322,20 @@ class GoogleAIClient(LLMClientBase):
             for t in tools
         ]
 
-        # Correct casing + add inner thoughts if needed
+        # Add inner thoughts if needed
         for func in function_list:
-            func["parameters"]["type"] = "OBJECT"
-            for param_name, param_fields in func["parameters"]["properties"].items():
-                param_fields["type"] = param_fields["type"].upper()
+            # Note: Google AI API used to have weird casing requirements, but not any more
+
+            # Google AI API only supports a subset of OpenAPI 3.0, so unsupported params must be cleaned
+            if "parameters" in func and isinstance(func["parameters"], dict):
+                self._clean_google_ai_schema_properties(func["parameters"])
+
             # Add inner thoughts
-            if self.llm_config.put_inner_thoughts_in_kwargs:
+            if llm_config.put_inner_thoughts_in_kwargs:
                 from letta.local_llm.constants import INNER_THOUGHTS_KWARG, INNER_THOUGHTS_KWARG_DESCRIPTION
 
                 func["parameters"]["properties"][INNER_THOUGHTS_KWARG] = {
-                    "type": "STRING",
+                    "type": "string",
                     "description": INNER_THOUGHTS_KWARG_DESCRIPTION,
                 }
                 func["parameters"]["required"].append(INNER_THOUGHTS_KWARG)

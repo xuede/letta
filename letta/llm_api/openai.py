@@ -4,7 +4,9 @@ from typing import Generator, List, Optional, Union
 import requests
 from openai import OpenAI
 
+from letta.helpers.datetime_helpers import timestamp_to_datetime
 from letta.llm_api.helpers import add_inner_thoughts_to_functions, convert_to_structured_output, make_post_request
+from letta.llm_api.openai_client import supports_parallel_tool_calling, supports_temperature_param
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG, INNER_THOUGHTS_KWARG_DESCRIPTION, INNER_THOUGHTS_KWARG_DESCRIPTION_GO_FIRST
 from letta.local_llm.utils import num_tokens_from_functions, num_tokens_from_messages
 from letta.log import get_logger
@@ -135,7 +137,8 @@ def build_openai_chat_completions_request(
             tool_choice=tool_choice,
             user=str(user_id),
             max_completion_tokens=llm_config.max_tokens,
-            temperature=llm_config.temperature,
+            temperature=llm_config.temperature if supports_temperature_param(model) else None,
+            reasoning_effort=llm_config.reasoning_effort,
         )
     else:
         data = ChatCompletionRequest(
@@ -145,7 +148,8 @@ def build_openai_chat_completions_request(
             function_call=function_call,
             user=str(user_id),
             max_completion_tokens=llm_config.max_tokens,
-            temperature=llm_config.temperature,
+            temperature=1.0 if llm_config.enable_reasoner else llm_config.temperature,
+            reasoning_effort=llm_config.reasoning_effort,
         )
         # https://platform.openai.com/docs/guides/text-generation/json-mode
         # only supported by gpt-4o, gpt-4-turbo, or gpt-3.5-turbo
@@ -168,7 +172,6 @@ def build_openai_chat_completions_request(
                 tool.function = FunctionSchema(**structured_output_version)
             except ValueError as e:
                 warnings.warn(f"Failed to convert tool function to structured output, tool={tool}, error={e}")
-
     return data
 
 
@@ -236,7 +239,7 @@ def openai_chat_completions_process_stream(
     chat_completion_response = ChatCompletionResponse(
         id=dummy_message.id if create_message_id else TEMP_STREAM_RESPONSE_ID,
         choices=[],
-        created=dummy_message.created_at,  # NOTE: doesn't matter since both will do get_utc_time()
+        created=int(dummy_message.created_at.timestamp()),  # NOTE: doesn't matter since both will do get_utc_time()
         model=chat_completion_request.model,
         usage=UsageStatistics(
             completion_tokens=0,
@@ -252,6 +255,8 @@ def openai_chat_completions_process_stream(
 
     n_chunks = 0  # approx == n_tokens
     chunk_idx = 0
+    prev_message_type = None
+    message_idx = 0
     try:
         for chat_completion_chunk in openai_chat_completions_request_stream(
             url=url, api_key=api_key, chat_completion_request=chat_completion_request
@@ -268,13 +273,21 @@ def openai_chat_completions_process_stream(
 
             if stream_interface:
                 if isinstance(stream_interface, AgentChunkStreamingInterface):
-                    stream_interface.process_chunk(
+                    message_type = stream_interface.process_chunk(
                         chat_completion_chunk,
                         message_id=chat_completion_response.id if create_message_id else chat_completion_chunk.id,
-                        message_date=chat_completion_response.created if create_message_datetime else chat_completion_chunk.created,
+                        message_date=(
+                            timestamp_to_datetime(chat_completion_response.created)
+                            if create_message_datetime
+                            else timestamp_to_datetime(chat_completion_chunk.created)
+                        ),
                         expect_reasoning_content=expect_reasoning_content,
                         name=name,
+                        message_index=message_idx,
                     )
+                    if message_type != prev_message_type and message_type is not None:
+                        message_idx += 1
+                    prev_message_type = message_type
                 elif isinstance(stream_interface, AgentRefreshStreamingInterface):
                     stream_interface.process_refresh(chat_completion_response)
                 else:
@@ -481,5 +494,8 @@ def prepare_openai_payload(chat_completion_request: ChatCompletionRequest):
     #             tool["function"] = convert_to_structured_output(tool["function"])
     #         except ValueError as e:
     #             warnings.warn(f"Failed to convert tool function to structured output, tool={tool}, error={e}")
+
+    if not supports_parallel_tool_calling(chat_completion_request.model):
+        data.pop("parallel_tool_calls", None)
 
     return data

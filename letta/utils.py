@@ -828,7 +828,7 @@ def parse_json(string) -> dict:
             raise ValueError(f"JSON from string input ({string}) is not a dictionary (type {type(result)}): {result}")
         return result
     except Exception as e:
-        print(f"Error parsing json with json package: {e}")
+        print(f"Error parsing json with json package, falling back to demjson: {e}")
 
     try:
         result = demjson.decode(string)
@@ -836,7 +836,7 @@ def parse_json(string) -> dict:
             raise ValueError(f"JSON from string input ({string}) is not a dictionary (type {type(result)}): {result}")
         return result
     except demjson.JSONDecodeError as e:
-        print(f"Error parsing json with demjson package: {e}")
+        print(f"Error parsing json with demjson package (fatal): {e}")
         raise e
 
 
@@ -1070,3 +1070,7 @@ def log_telemetry(logger: Logger, event: str, **kwargs):
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S,%f UTC")  # More readable timestamp
         extra_data = " | ".join(f"{key}={value}" for key, value in kwargs.items() if value is not None)
         logger.info(f"[{timestamp}] EVENT: {event} | {extra_data}")
+
+
+def make_key(*args, **kwargs):
+    return str((args, tuple(sorted(kwargs.items()))))

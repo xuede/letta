@@ -3,7 +3,8 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from letta.constants import DEFAULT_EMBEDDING_CHUNK_SIZE
+from letta.constants import CORE_MEMORY_LINE_NUMBER_WARNING, DEFAULT_EMBEDDING_CHUNK_SIZE
+from letta.helpers import ToolRulesSolver
 from letta.schemas.block import CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.environment_variables import AgentEnvironmentVariable
@@ -13,6 +14,7 @@ from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import Memory
 from letta.schemas.message import Message, MessageCreate
 from letta.schemas.openai.chat_completion_response import UsageStatistics
+from letta.schemas.response_format import ResponseFormatUnion
 from letta.schemas.source import Source
 from letta.schemas.tool import Tool
 from letta.schemas.tool_rule import ToolRule
@@ -26,7 +28,7 @@ class AgentType(str, Enum):
 
     memgpt_agent = "memgpt_agent"
     split_thread_agent = "split_thread_agent"
-    offline_memory_agent = "offline_memory_agent"
+    sleeptime_agent = "sleeptime_agent"
 
 
 class AgentState(OrmMetadataBase, validate_assignment=True):
@@ -65,6 +67,9 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     # llm information
     llm_config: LLMConfig = Field(..., description="The LLM configuration used by the agent.")
     embedding_config: EmbeddingConfig = Field(..., description="The embedding configuration used by the agent.")
+    response_format: Optional[ResponseFormatUnion] = Field(
+        None, description="The response format used by the agent when returning from `send_message`."
+    )
 
     # This is an object representing the in-process state of a running `Agent`
     # Field in this object can be theoretically edited by tools, and will be persisted by the ORM
@@ -89,6 +94,10 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     message_buffer_autoclear: bool = Field(
         False,
         description="If set to True, the agent will not remember previous messages (though the agent will still retain state via core memory blocks and archival/recall memory). Not recommended unless you have an advanced use case.",
+    )
+    enable_sleeptime: Optional[bool] = Field(
+        None,
+        description="If set to True, memory management will move to a background agent thread.",
     )
 
     multi_agent_group: Optional[Group] = Field(None, description="The multi-agent group that this agent manages")
@@ -174,6 +183,8 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
         False,
         description="If set to True, the agent will not remember previous messages (though the agent will still retain state via core memory blocks and archival/recall memory). Not recommended unless you have an advanced use case.",
     )
+    enable_sleeptime: Optional[bool] = Field(None, description="If set to True, memory management will move to a background agent thread.")
+    response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the agent.")
 
     @field_validator("name")
     @classmethod
@@ -252,6 +263,8 @@ class UpdateAgent(BaseModel):
     embedding: Optional[str] = Field(
         None, description="The embedding configuration handle used by the agent, specified in the format provider/model-name."
     )
+    enable_sleeptime: Optional[bool] = Field(None, description="If set to True, memory management will move to a background agent thread.")
+    response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the agent.")
 
     class Config:
         extra = "ignore"  # Ignores extra fields
@@ -265,3 +278,31 @@ class AgentStepResponse(BaseModel):
         ..., description="Whether the agent step ended because the in-context memory is near its limit."
     )
     usage: UsageStatistics = Field(..., description="Usage statistics of the LLM call during the agent's step.")
+
+
+class AgentStepState(BaseModel):
+    step_number: int = Field(..., description="The current step number in the agent loop")
+    tool_rules_solver: ToolRulesSolver = Field(..., description="The current state of the ToolRulesSolver")
+
+
+def get_prompt_template_for_agent_type(agent_type: Optional[AgentType] = None):
+    if agent_type == AgentType.sleeptime_agent:
+        return (
+            "{% for block in blocks %}"
+            '<{{ block.label }} characters="{{ block.value|length }}/{{ block.limit }}">\n'
+            f"{CORE_MEMORY_LINE_NUMBER_WARNING}"
+            "{% for line in block.value.split('\\n') %}"
+            "Line {{ loop.index }}: {{ line }}\n"
+            "{% endfor %}"
+            "</{{ block.label }}>"
+            "{% if not loop.last %}\n{% endif %}"
+            "{% endfor %}"
+        )
+    return (
+        "{% for block in blocks %}"
+        '<{{ block.label }} characters="{{ block.value|length }}/{{ block.limit }}">\n'
+        "{{ block.value }}\n"
+        "</{{ block.label }}>"
+        "{% if not loop.last %}\n{% endif %}"
+        "{% endfor %}"
+    )

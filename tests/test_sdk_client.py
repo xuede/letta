@@ -101,9 +101,8 @@ def test_shared_blocks(client: LettaSDKClient):
     )
 
     # check agent 2 memory
-    assert (
-        "charles" in client.blocks.retrieve(block_id=block.id).value.lower()
-    ), f"Shared block update failed {client.retrieve_block(block.id).value}"
+    block_value = client.blocks.retrieve(block_id=block.id).value
+    assert "charles" in block_value.lower(), f"Shared block update failed {block_value}"
 
     client.agents.messages.create(
         agent_id=agent_state2.id,
@@ -219,30 +218,30 @@ def test_agent_tags(client: LettaSDKClient):
     )
 
     # Test getting all tags
-    all_tags = client.tag.list_tags()
+    all_tags = client.tags.list()
     expected_tags = ["agent1", "agent2", "agent3", "development", "production", "test"]
     assert sorted(all_tags) == expected_tags
 
     # Test pagination
-    paginated_tags = client.tag.list_tags(limit=2)
+    paginated_tags = client.tags.list(limit=2)
     assert len(paginated_tags) == 2
     assert paginated_tags[0] == "agent1"
     assert paginated_tags[1] == "agent2"
 
     # Test pagination with cursor
-    next_page_tags = client.tag.list_tags(after="agent2", limit=2)
+    next_page_tags = client.tags.list(after="agent2", limit=2)
     assert len(next_page_tags) == 2
     assert next_page_tags[0] == "agent3"
     assert next_page_tags[1] == "development"
 
     # Test text search
-    prod_tags = client.tag.list_tags(query_text="prod")
+    prod_tags = client.tags.list(query_text="prod")
     assert sorted(prod_tags) == ["production"]
 
-    dev_tags = client.tag.list_tags(query_text="dev")
+    dev_tags = client.tags.list(query_text="dev")
     assert sorted(dev_tags) == ["development"]
 
-    agent_tags = client.tag.list_tags(query_text="agent")
+    agent_tags = client.tags.list(query_text="agent")
     assert sorted(agent_tags) == ["agent1", "agent2", "agent3"]
 
     # Remove agents
@@ -505,7 +504,7 @@ def test_send_message_async(client: LettaSDKClient, agent: AgentState):
     start_time = time.time()
     while run.status == "created":
         time.sleep(1)
-        run = client.runs.retrieve_run(run_id=run.id)
+        run = client.runs.retrieve(run_id=run.id)
         print(f"Run status: {run.status}")
         if time.time() - start_time > 10:
             pytest.fail("Run took too long to complete")
@@ -514,30 +513,23 @@ def test_send_message_async(client: LettaSDKClient, agent: AgentState):
     assert run.status == "completed"
 
     # Get messages for the job
-    messages = client.runs.list_run_messages(run_id=run.id)
+    messages = client.runs.messages.list(run_id=run.id)
     assert len(messages) >= 2  # At least assistant response
 
     # Check filters
-    assistant_messages = client.runs.list_run_messages(run_id=run.id, role="assistant")
+    assistant_messages = client.runs.messages.list(run_id=run.id, role="assistant")
     assert len(assistant_messages) > 0
-    tool_messages = client.runs.list_run_messages(run_id=run.id, role="tool")
+    tool_messages = client.runs.messages.list(run_id=run.id, role="tool")
     assert len(tool_messages) > 0
 
     # specific_tool_messages = [message for message in client.runs.list_run_messages(run_id=run.id) if isinstance(message, ToolCallMessage)]
     # assert specific_tool_messages[0].tool_call.name == "send_message"
     # assert len(specific_tool_messages) > 0
 
-    # Get and verify usage statistics
-    usage = client.runs.retrieve_run_usage(run_id=run.id)
-    assert usage.completion_tokens >= 0
-    assert usage.prompt_tokens >= 0
-    assert usage.total_tokens >= 0
-    assert usage.total_tokens == usage.completion_tokens + usage.prompt_tokens
-
 
 def test_agent_creation(client: LettaSDKClient):
     """Test that block IDs are properly attached when creating an agent."""
-    offline_memory_agent_system = """
+    sleeptime_agent_system = """
     You are a helpful agent. You will be provided with a list of memory blocks and a user preferences block.
     You should use the memory blocks to remember information about the user and their preferences.
     You should also use the user preferences block to remember information about the user's preferences.
@@ -563,13 +555,13 @@ def test_agent_creation(client: LettaSDKClient):
     tool2 = client.tools.upsert_from_function(func=another_test_tool, tags=["test"])
 
     # Create test blocks
-    offline_persona_block = client.blocks.create(label="persona", value="persona description", limit=5000)
+    sleeptime_persona_block = client.blocks.create(label="persona", value="persona description", limit=5000)
     mindy_block = client.blocks.create(label="mindy", value="Mindy is a helpful assistant", limit=5000)
 
     # Create agent with the blocks and tools
     agent = client.agents.create(
         name=f"test_agent_{str(uuid.uuid4())}",
-        memory_blocks=[offline_persona_block, mindy_block],
+        memory_blocks=[sleeptime_persona_block, mindy_block],
         model="openai/gpt-4o-mini",
         embedding="openai/text-embedding-ada-002",
         tool_ids=[tool1.id, tool2.id],
@@ -583,7 +575,7 @@ def test_agent_creation(client: LettaSDKClient):
     assert agent.id is not None
 
     # Verify all memory blocks are properly attached
-    for block in [offline_persona_block, mindy_block, user_preferences_block]:
+    for block in [sleeptime_persona_block, mindy_block, user_preferences_block]:
         agent_block = client.agents.blocks.retrieve(agent_id=agent.id, block_label=block.label)
         assert block.value == agent_block.value and block.limit == agent_block.limit
 

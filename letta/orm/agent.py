@@ -5,17 +5,17 @@ from sqlalchemy import JSON, Boolean, Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from letta.orm.block import Block
-from letta.orm.custom_columns import EmbeddingConfigColumn, LLMConfigColumn, ToolRulesColumn
+from letta.orm.custom_columns import EmbeddingConfigColumn, LLMConfigColumn, ResponseFormatColumn, ToolRulesColumn
 from letta.orm.identity import Identity
-from letta.orm.message import Message
 from letta.orm.mixins import OrganizationMixin
 from letta.orm.organization import Organization
 from letta.orm.sqlalchemy_base import SqlalchemyBase
 from letta.schemas.agent import AgentState as PydanticAgentState
-from letta.schemas.agent import AgentType
+from letta.schemas.agent import AgentType, get_prompt_template_for_agent_type
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import Memory
+from letta.schemas.response_format import ResponseFormatUnion
 from letta.schemas.tool_rule import ToolRule
 
 if TYPE_CHECKING:
@@ -49,6 +49,11 @@ class Agent(SqlalchemyBase, OrganizationMixin):
     # This is dangerously flexible with the JSON type
     message_ids: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True, doc="List of message IDs in in-context memory.")
 
+    # Response Format
+    response_format: Mapped[Optional[ResponseFormatUnion]] = mapped_column(
+        ResponseFormatColumn, nullable=True, doc="The response format for the agent."
+    )
+
     # Metadata and configs
     metadata_: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True, doc="metadata for the agent.")
     llm_config: Mapped[Optional[LLMConfig]] = mapped_column(
@@ -67,6 +72,9 @@ class Agent(SqlalchemyBase, OrganizationMixin):
     # Stateless
     message_buffer_autoclear: Mapped[bool] = mapped_column(
         Boolean, doc="If set to True, the agent will not remember previous messages. Not recommended unless you have an advanced use case."
+    )
+    enable_sleeptime: Mapped[Optional[bool]] = mapped_column(
+        Boolean, doc="If set to True, memory management will move to a background agent thread."
     )
 
     # relationships
@@ -88,38 +96,12 @@ class Agent(SqlalchemyBase, OrganizationMixin):
         back_populates="agents",
         doc="Blocks forming the core memory of the agent.",
     )
-    messages: Mapped[List["Message"]] = relationship(
-        "Message",
-        back_populates="agent",
-        lazy="selectin",
-        cascade="all, delete-orphan",  # Ensure messages are deleted when the agent is deleted
-        passive_deletes=True,
-    )
     tags: Mapped[List["AgentsTags"]] = relationship(
         "AgentsTags",
         back_populates="agent",
         cascade="all, delete-orphan",
         lazy="selectin",
         doc="Tags associated with the agent.",
-    )
-    source_passages: Mapped[List["SourcePassage"]] = relationship(
-        "SourcePassage",
-        secondary="sources_agents",  # The join table for Agent -> Source
-        primaryjoin="Agent.id == sources_agents.c.agent_id",
-        secondaryjoin="and_(SourcePassage.source_id == sources_agents.c.source_id)",
-        lazy="selectin",
-        order_by="SourcePassage.created_at.desc()",
-        viewonly=True,  # Ensures SQLAlchemy doesn't attempt to manage this relationship
-        doc="All passages derived from sources associated with this agent.",
-    )
-    agent_passages: Mapped[List["AgentPassage"]] = relationship(
-        "AgentPassage",
-        back_populates="agent",
-        lazy="selectin",
-        order_by="AgentPassage.created_at.desc()",
-        cascade="all, delete-orphan",
-        viewonly=True,  # Ensures SQLAlchemy doesn't attempt to manage this relationship
-        doc="All passages derived created by this agent.",
     )
     identities: Mapped[List["Identity"]] = relationship(
         "Identity",
@@ -141,6 +123,7 @@ class Agent(SqlalchemyBase, OrganizationMixin):
         viewonly=True,
         back_populates="manager_agent",
     )
+    batch_items: Mapped[List["LLMBatchItem"]] = relationship("LLMBatchItem", back_populates="agent", lazy="selectin")
 
     def to_pydantic(self, include_relationships: Optional[Set[str]] = None) -> PydanticAgentState:
         """
@@ -190,6 +173,8 @@ class Agent(SqlalchemyBase, OrganizationMixin):
             "identity_ids": [],
             "multi_agent_group": None,
             "tool_exec_environment_variables": [],
+            "enable_sleeptime": None,
+            "response_format": self.response_format,
         }
 
         # Optional fields: only included if requested
@@ -197,10 +182,14 @@ class Agent(SqlalchemyBase, OrganizationMixin):
             "tags": lambda: [t.tag for t in self.tags],
             "tools": lambda: self.tools,
             "sources": lambda: [s.to_pydantic() for s in self.sources],
-            "memory": lambda: Memory(blocks=[b.to_pydantic() for b in self.core_memory]),
+            "memory": lambda: Memory(
+                blocks=[b.to_pydantic() for b in self.core_memory],
+                prompt_template=get_prompt_template_for_agent_type(self.agent_type),
+            ),
             "identity_ids": lambda: [i.id for i in self.identities],
             "multi_agent_group": lambda: self.multi_agent_group,
             "tool_exec_environment_variables": lambda: self.tool_exec_environment_variables,
+            "enable_sleeptime": lambda: self.enable_sleeptime,
         }
 
         include_relationships = set(optional_fields.keys() if include_relationships is None else include_relationships)

@@ -15,7 +15,6 @@ from letta.orm.sqlite_functions import adapt_array
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
-    from sqlalchemy.orm import Session
 
 
 logger = get_logger(__name__)
@@ -335,6 +334,9 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         if len(identifiers) > 0:
             query = query.where(cls.id.in_(identifiers))
             query_conditions.append(f"id='{identifiers}'")
+        elif not kwargs:
+            logger.debug(f"No identifiers provided for {cls.__name__}, returning empty list")
+            return []
 
         if kwargs:
             query = query.filter_by(**kwargs)
@@ -370,17 +372,19 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
         return []
 
     @handle_db_timeout
-    def create(self, db_session: "Session", actor: Optional["User"] = None) -> "SqlalchemyBase":
+    def create(self, db_session: "Session", actor: Optional["User"] = None, no_commit: bool = False) -> "SqlalchemyBase":
         logger.debug(f"Creating {self.__class__.__name__} with ID: {self.id} with actor={actor}")
 
         if actor:
             self._set_created_and_updated_by_fields(actor.id)
         try:
-            with db_session as session:
-                session.add(self)
-                session.commit()
-                session.refresh(self)
-                return self
+            db_session.add(self)
+            if no_commit:
+                db_session.flush()  # no commit, just flush to get PK
+            else:
+                db_session.commit()
+            db_session.refresh(self)
+            return self
         except (DBAPIError, IntegrityError) as e:
             self._handle_dbapi_error(e)
 
@@ -389,17 +393,14 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
     def batch_create(cls, items: List["SqlalchemyBase"], db_session: "Session", actor: Optional["User"] = None) -> List["SqlalchemyBase"]:
         """
         Create multiple records in a single transaction for better performance.
-
         Args:
             items: List of model instances to create
             db_session: SQLAlchemy session
             actor: Optional user performing the action
-
         Returns:
             List of created model instances
         """
         logger.debug(f"Batch creating {len(items)} {cls.__name__} items with actor={actor}")
-
         if not items:
             return []
 
@@ -455,18 +456,20 @@ class SqlalchemyBase(CommonSqlalchemyMetaMixins, Base):
                 logger.debug(f"{self.__class__.__name__} with ID {self.id} successfully hard deleted")
 
     @handle_db_timeout
-    def update(self, db_session: "Session", actor: Optional["User"] = None) -> "SqlalchemyBase":
-        logger.debug(f"Updating {self.__class__.__name__} with ID: {self.id} with actor={actor}")
+    def update(self, db_session: Session, actor: Optional["User"] = None, no_commit: bool = False) -> "SqlalchemyBase":
+        logger.debug(...)
         if actor:
             self._set_created_and_updated_by_fields(actor.id)
-
         self.set_updated_at()
 
-        with db_session as session:
-            session.add(self)
-            session.commit()
-            session.refresh(self)
-            return self
+        # remove the context manager:
+        db_session.add(self)
+        if no_commit:
+            db_session.flush()  # no commit, just flush to get PK
+        else:
+            db_session.commit()
+        db_session.refresh(self)
+        return self
 
     @classmethod
     @handle_db_timeout
