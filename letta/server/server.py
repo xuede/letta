@@ -1,4 +1,3 @@
-# inspecting tools
 import asyncio
 import json
 import os
@@ -6,8 +5,10 @@ import traceback
 import warnings
 from abc import abstractmethod
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import httpx
 from anthropic import AsyncAnthropic
 from composio.client import Composio
 from composio.client.collections import ActionModel, AppModel
@@ -18,12 +19,11 @@ import letta.constants as constants
 import letta.server.utils as server_utils
 import letta.system as system
 from letta.agent import Agent, save_agent
+from letta.agents.letta_agent import LettaAgent
 from letta.config import LettaConfig
+from letta.constants import LETTA_TOOL_EXECUTION_DIR
 from letta.data_sources.connectors import DataConnector, load_data
 from letta.errors import HandleNotFoundError
-from letta.functions.mcp_client.base_client import BaseMCPClient
-from letta.functions.mcp_client.sse_client import MCP_CONFIG_TOPLEVEL_KEY, SSEMCPClient
-from letta.functions.mcp_client.stdio_client import StdioMCPClient
 from letta.functions.mcp_client.types import MCPServerType, MCPTool, SSEServerConfig, StdioServerConfig
 from letta.groups.helpers import load_multi_agent
 from letta.helpers.datetime_helpers import get_utc_time
@@ -34,23 +34,23 @@ from letta.interface import AgentInterface  # abstract
 from letta.interface import CLIInterface  # for printing to terminal
 from letta.log import get_logger
 from letta.orm.errors import NoResultFound
+from letta.otel.tracing import log_event, trace_method
 from letta.prompts.gpt_system import get_system_text
 from letta.schemas.agent import AgentState, AgentType, CreateAgent, UpdateAgent
 from letta.schemas.block import Block, BlockUpdate, CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 
 # openai schemas
-from letta.schemas.enums import JobStatus, MessageStreamStatus
+from letta.schemas.enums import JobStatus, MessageStreamStatus, ProviderCategory, ProviderType
 from letta.schemas.environment_variables import SandboxEnvironmentVariableCreate
-from letta.schemas.group import GroupCreate, SleeptimeManager
+from letta.schemas.group import GroupCreate, ManagerType, SleeptimeManager, VoiceSleeptimeManager
 from letta.schemas.job import Job, JobUpdate
-from letta.schemas.letta_message import LegacyLettaMessage, LettaMessage, ToolReturnMessage
+from letta.schemas.letta_message import LegacyLettaMessage, LettaMessage, MessageType, ToolReturnMessage
 from letta.schemas.letta_message_content import TextContent
 from letta.schemas.letta_response import LettaResponse
 from letta.schemas.llm_config import LLMConfig
-from letta.schemas.memory import ArchivalMemorySummary, ContextWindowOverview, Memory, RecallMemorySummary
+from letta.schemas.memory import ArchivalMemorySummary, Memory, RecallMemorySummary
 from letta.schemas.message import Message, MessageCreate, MessageUpdate
-from letta.schemas.organization import Organization
 from letta.schemas.passage import Passage, PassageUpdate
 from letta.schemas.providers import (
     AnthropicBedrockProvider,
@@ -70,7 +70,7 @@ from letta.schemas.providers import (
     VLLMCompletionsProvider,
     XAIProvider,
 )
-from letta.schemas.sandbox_config import SandboxType
+from letta.schemas.sandbox_config import LocalSandboxConfig, SandboxConfigCreate, SandboxType
 from letta.schemas.source import Source
 from letta.schemas.tool import Tool
 from letta.schemas.usage import LettaUsageStatistics
@@ -80,10 +80,16 @@ from letta.server.rest_api.interface import StreamingServerInterface
 from letta.server.rest_api.utils import sse_async_generator
 from letta.services.agent_manager import AgentManager
 from letta.services.block_manager import BlockManager
+from letta.services.files_agents_manager import FileAgentManager
 from letta.services.group_manager import GroupManager
+from letta.services.helpers.tool_execution_helper import prepare_local_sandbox
 from letta.services.identity_manager import IdentityManager
 from letta.services.job_manager import JobManager
 from letta.services.llm_batch_manager import LLMBatchManager
+from letta.services.mcp.base_client import AsyncBaseMCPClient
+from letta.services.mcp.sse_client import MCP_CONFIG_TOPLEVEL_KEY, AsyncSSEMCPClient
+from letta.services.mcp.stdio_client import AsyncStdioMCPClient
+from letta.services.mcp_manager import MCPManager
 from letta.services.message_manager import MessageManager
 from letta.services.organization_manager import OrganizationManager
 from letta.services.passage_manager import PassageManager
@@ -91,11 +97,11 @@ from letta.services.provider_manager import ProviderManager
 from letta.services.sandbox_config_manager import SandboxConfigManager
 from letta.services.source_manager import SourceManager
 from letta.services.step_manager import StepManager
-from letta.services.tool_executor.tool_execution_sandbox import ToolExecutionSandbox
+from letta.services.telemetry_manager import NoopTelemetryManager, TelemetryManager
+from letta.services.tool_executor.tool_execution_manager import ToolExecutionManager
 from letta.services.tool_manager import ToolManager
 from letta.services.user_manager import UserManager
 from letta.settings import model_settings, settings, tool_settings
-from letta.tracing import log_event, trace_method
 from letta.utils import get_friendly_error_msg, get_persona_text, make_key
 
 config = LettaConfig.load()
@@ -199,6 +205,7 @@ class SyncServer(Server):
         self.passage_manager = PassageManager()
         self.user_manager = UserManager()
         self.tool_manager = ToolManager()
+        self.mcp_manager = MCPManager()
         self.block_manager = BlockManager()
         self.source_manager = SourceManager()
         self.sandbox_config_manager = SandboxConfigManager()
@@ -210,12 +217,18 @@ class SyncServer(Server):
         self.identity_manager = IdentityManager()
         self.group_manager = GroupManager()
         self.batch_manager = LLMBatchManager()
+        self.telemetry_manager = TelemetryManager()
+        self.file_agent_manager = FileAgentManager()
+
+        # A resusable httpx client
+        timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+        limits = httpx.Limits(max_connections=100, max_keepalive_connections=80, keepalive_expiry=300)
+        self.httpx_client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, limits=limits)
 
         # Make default user and org
         if init_with_default_org_and_user:
             self.default_org = self.organization_manager.create_default_organization()
             self.default_user = self.user_manager.create_default_user()
-            self.block_manager.add_default_blocks(actor=self.default_user)
             self.tool_manager.upsert_base_tools(actor=self.default_user)
 
             # Add composio keys to the tool sandbox env vars of the org
@@ -229,11 +242,48 @@ class SyncServer(Server):
                     actor=self.default_user,
                 )
 
+            # For OSS users, create a local sandbox config
+            oss_default_user = self.user_manager.get_default_user()
+            use_venv = False if not tool_settings.tool_exec_venv_name else True
+            venv_name = tool_settings.tool_exec_venv_name or "venv"
+            tool_dir = tool_settings.tool_exec_dir or LETTA_TOOL_EXECUTION_DIR
+
+            venv_dir = Path(tool_dir) / venv_name
+            tool_path = Path(tool_dir)
+
+            if tool_path.exists() and not tool_path.is_dir():
+                logger.error(f"LETTA_TOOL_SANDBOX_DIR exists but is not a directory: {tool_dir}")
+            else:
+                if not tool_path.exists():
+                    logger.warning(f"LETTA_TOOL_SANDBOX_DIR does not exist, creating now: {tool_dir}")
+                    tool_path.mkdir(parents=True, exist_ok=True)
+
+                if tool_settings.tool_exec_venv_name and not venv_dir.is_dir():
+                    logger.warning(
+                        f"Provided LETTA_TOOL_SANDBOX_VENV_NAME is not a valid venv ({venv_dir}), one will be created for you during tool execution."
+                    )
+
+                sandbox_config_create = SandboxConfigCreate(
+                    config=LocalSandboxConfig(sandbox_dir=tool_settings.tool_exec_dir, use_venv=use_venv, venv_name=venv_name)
+                )
+                sandbox_config = self.sandbox_config_manager.create_or_update_sandbox_config(
+                    sandbox_config_create=sandbox_config_create, actor=oss_default_user
+                )
+                logger.info(f"Successfully created default local sandbox config:\n{sandbox_config.get_local_config().model_dump()}")
+
+                if use_venv and tool_settings.tool_exec_autoreload_venv:
+                    prepare_local_sandbox(
+                        sandbox_config.get_local_config(),
+                        env=os.environ.copy(),
+                        force_recreate=True,
+                    )
+
         # collect providers (always has Letta as a default)
-        self._enabled_providers: List[Provider] = [LettaProvider()]
+        self._enabled_providers: List[Provider] = [LettaProvider(name="letta")]
         if model_settings.openai_api_key:
             self._enabled_providers.append(
                 OpenAIProvider(
+                    name="openai",
                     api_key=model_settings.openai_api_key,
                     base_url=model_settings.openai_api_base,
                 )
@@ -241,12 +291,14 @@ class SyncServer(Server):
         if model_settings.anthropic_api_key:
             self._enabled_providers.append(
                 AnthropicProvider(
+                    name="anthropic",
                     api_key=model_settings.anthropic_api_key,
                 )
             )
         if model_settings.ollama_base_url:
             self._enabled_providers.append(
                 OllamaProvider(
+                    name="ollama",
                     base_url=model_settings.ollama_base_url,
                     api_key=None,
                     default_prompt_formatter=model_settings.default_prompt_formatter,
@@ -255,12 +307,14 @@ class SyncServer(Server):
         if model_settings.gemini_api_key:
             self._enabled_providers.append(
                 GoogleAIProvider(
+                    name="google_ai",
                     api_key=model_settings.gemini_api_key,
                 )
             )
         if model_settings.google_cloud_location and model_settings.google_cloud_project:
             self._enabled_providers.append(
                 GoogleVertexProvider(
+                    name="google_vertex",
                     google_cloud_project=model_settings.google_cloud_project,
                     google_cloud_location=model_settings.google_cloud_location,
                 )
@@ -269,6 +323,7 @@ class SyncServer(Server):
             assert model_settings.azure_api_version, "AZURE_API_VERSION is required"
             self._enabled_providers.append(
                 AzureProvider(
+                    name="azure",
                     api_key=model_settings.azure_api_key,
                     base_url=model_settings.azure_base_url,
                     api_version=model_settings.azure_api_version,
@@ -277,12 +332,14 @@ class SyncServer(Server):
         if model_settings.groq_api_key:
             self._enabled_providers.append(
                 GroqProvider(
+                    name="groq",
                     api_key=model_settings.groq_api_key,
                 )
             )
         if model_settings.together_api_key:
             self._enabled_providers.append(
                 TogetherProvider(
+                    name="together",
                     api_key=model_settings.together_api_key,
                     default_prompt_formatter=model_settings.default_prompt_formatter,
                 )
@@ -291,6 +348,7 @@ class SyncServer(Server):
             # vLLM exposes both a /chat/completions and a /completions endpoint
             self._enabled_providers.append(
                 VLLMCompletionsProvider(
+                    name="vllm",
                     base_url=model_settings.vllm_api_base,
                     default_prompt_formatter=model_settings.default_prompt_formatter,
                 )
@@ -300,12 +358,14 @@ class SyncServer(Server):
             # e.g. "... --enable-auto-tool-choice --tool-call-parser hermes"
             self._enabled_providers.append(
                 VLLMChatCompletionsProvider(
+                    name="vllm",
                     base_url=model_settings.vllm_api_base,
                 )
             )
         if model_settings.aws_access_key and model_settings.aws_secret_access_key and model_settings.aws_region:
             self._enabled_providers.append(
                 AnthropicBedrockProvider(
+                    name="bedrock",
                     aws_region=model_settings.aws_region,
                 )
             )
@@ -317,37 +377,16 @@ class SyncServer(Server):
                 if model_settings.lmstudio_base_url.endswith("/v1")
                 else model_settings.lmstudio_base_url + "/v1"
             )
-            self._enabled_providers.append(LMStudioOpenAIProvider(base_url=lmstudio_url))
+            self._enabled_providers.append(LMStudioOpenAIProvider(name="lmstudio_openai", base_url=lmstudio_url))
         if model_settings.deepseek_api_key:
-            self._enabled_providers.append(DeepSeekProvider(api_key=model_settings.deepseek_api_key))
+            self._enabled_providers.append(DeepSeekProvider(name="deepseek", api_key=model_settings.deepseek_api_key))
         if model_settings.xai_api_key:
-            self._enabled_providers.append(XAIProvider(api_key=model_settings.xai_api_key))
+            self._enabled_providers.append(XAIProvider(name="xai", api_key=model_settings.xai_api_key))
 
         # For MCP
+        # TODO: remove this
         """Initialize the MCP clients (there may be multiple)"""
-        mcp_server_configs = self.get_mcp_servers()
-        self.mcp_clients: Dict[str, BaseMCPClient] = {}
-
-        for server_name, server_config in mcp_server_configs.items():
-            if server_config.type == MCPServerType.SSE:
-                self.mcp_clients[server_name] = SSEMCPClient(server_config)
-            elif server_config.type == MCPServerType.STDIO:
-                self.mcp_clients[server_name] = StdioMCPClient(server_config)
-            else:
-                raise ValueError(f"Invalid MCP server config: {server_config}")
-
-            try:
-                self.mcp_clients[server_name].connect_to_server()
-            except Exception as e:
-                logger.error(e)
-                self.mcp_clients.pop(server_name)
-
-        # Print out the tools that are connected
-        for server_name, client in self.mcp_clients.items():
-            logger.info(f"Attempting to fetch tools from MCP server: {server_name}")
-            mcp_tools = client.list_tools()
-            logger.info(f"MCP tools connected: {', '.join([t.name for t in mcp_tools])}")
-            logger.debug(f"MCP tools: {', '.join([str(t) for t in mcp_tools])}")
+        self.mcp_clients: Dict[str, AsyncBaseMCPClient] = {}
 
         # TODO: Remove these in memory caches
         self._llm_config_cache = {}
@@ -356,10 +395,37 @@ class SyncServer(Server):
         # TODO: Replace this with the Anthropic client we have in house
         self.anthropic_async_client = AsyncAnthropic()
 
+    async def init_mcp_clients(self):
+        # TODO: remove this
+        mcp_server_configs = self.get_mcp_servers()
+
+        for server_name, server_config in mcp_server_configs.items():
+            if server_config.type == MCPServerType.SSE:
+                self.mcp_clients[server_name] = AsyncSSEMCPClient(server_config)
+            elif server_config.type == MCPServerType.STDIO:
+                self.mcp_clients[server_name] = AsyncStdioMCPClient(server_config)
+            else:
+                raise ValueError(f"Invalid MCP server config: {server_config}")
+
+            try:
+                await self.mcp_clients[server_name].connect_to_server()
+            except Exception as e:
+                logger.error(e)
+                self.mcp_clients.pop(server_name)
+
+        # Print out the tools that are connected
+        for server_name, client in self.mcp_clients.items():
+            logger.info(f"Attempting to fetch tools from MCP server: {server_name}")
+            mcp_tools = await client.list_tools()
+            logger.info(f"MCP tools connected: {', '.join([t.name for t in mcp_tools])}")
+            logger.debug(f"MCP tools: {', '.join([str(t) for t in mcp_tools])}")
+
     def load_agent(self, agent_id: str, actor: User, interface: Union[AgentInterface, None] = None) -> Agent:
         """Updated method to load agents from persisted storage"""
         agent_state = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
-        if agent_state.multi_agent_group:
+        # TODO: Think about how to integrate voice sleeptime into sleeptime
+        # TODO: Voice sleeptime agents turn into normal agents when being messaged
+        if agent_state.multi_agent_group and agent_state.multi_agent_group.manager_type != ManagerType.voice_sleeptime:
             return load_multi_agent(
                 group=agent_state.multi_agent_group, agent_state=agent_state, actor=actor, interface=interface, mcp_clients=self.mcp_clients
             )
@@ -677,17 +743,31 @@ class SyncServer(Server):
         return self._command(user_id=user_id, agent_id=agent_id, command=command)
 
     @trace_method
-    def get_cached_llm_config(self, **kwargs):
+    def get_cached_llm_config(self, actor: User, **kwargs):
         key = make_key(**kwargs)
         if key not in self._llm_config_cache:
-            self._llm_config_cache[key] = self.get_llm_config_from_handle(**kwargs)
+            self._llm_config_cache[key] = self.get_llm_config_from_handle(actor=actor, **kwargs)
         return self._llm_config_cache[key]
 
     @trace_method
-    def get_cached_embedding_config(self, **kwargs):
+    async def get_cached_llm_config_async(self, actor: User, **kwargs):
+        key = make_key(**kwargs)
+        if key not in self._llm_config_cache:
+            self._llm_config_cache[key] = await self.get_llm_config_from_handle_async(actor=actor, **kwargs)
+        return self._llm_config_cache[key]
+
+    @trace_method
+    def get_cached_embedding_config(self, actor: User, **kwargs):
         key = make_key(**kwargs)
         if key not in self._embedding_config_cache:
-            self._embedding_config_cache[key] = self.get_embedding_config_from_handle(**kwargs)
+            self._embedding_config_cache[key] = self.get_embedding_config_from_handle(actor=actor, **kwargs)
+        return self._embedding_config_cache[key]
+
+    @trace_method
+    async def get_cached_embedding_config_async(self, actor: User, **kwargs):
+        key = make_key(**kwargs)
+        if key not in self._embedding_config_cache:
+            self._embedding_config_cache[key] = await self.get_embedding_config_from_handle_async(actor=actor, **kwargs)
         return self._embedding_config_cache[key]
 
     @trace_method
@@ -709,7 +789,7 @@ class SyncServer(Server):
                 "enable_reasoner": request.enable_reasoner,
             }
             log_event(name="start get_cached_llm_config", attributes=config_params)
-            request.llm_config = self.get_cached_llm_config(**config_params)
+            request.llm_config = self.get_cached_llm_config(actor=actor, **config_params)
             log_event(name="end get_cached_llm_config", attributes=config_params)
 
         if request.embedding_config is None:
@@ -720,7 +800,7 @@ class SyncServer(Server):
                 "embedding_chunk_size": request.embedding_chunk_size or constants.DEFAULT_EMBEDDING_CHUNK_SIZE,
             }
             log_event(name="start get_cached_embedding_config", attributes=embedding_config_params)
-            request.embedding_config = self.get_cached_embedding_config(**embedding_config_params)
+            request.embedding_config = self.get_cached_embedding_config(actor=actor, **embedding_config_params)
             log_event(name="end get_cached_embedding_config", attributes=embedding_config_params)
 
         log_event(name="start create_agent db")
@@ -731,7 +811,64 @@ class SyncServer(Server):
         log_event(name="end create_agent db")
 
         if request.enable_sleeptime:
-            main_agent = self.create_sleeptime_agent(main_agent=main_agent, actor=actor)
+            if request.agent_type == AgentType.voice_convo_agent:
+                main_agent = self.create_voice_sleeptime_agent(main_agent=main_agent, actor=actor)
+            else:
+                main_agent = self.create_sleeptime_agent(main_agent=main_agent, actor=actor)
+
+        return main_agent
+
+    @trace_method
+    async def create_agent_async(
+        self,
+        request: CreateAgent,
+        actor: User,
+        # interface
+        interface: Union[AgentInterface, None] = None,
+    ) -> AgentState:
+        if request.llm_config is None:
+            if request.model is None:
+                if settings.default_llm_handle is None:
+                    raise ValueError("Must specify either model or llm_config in request")
+                else:
+                    request.model = settings.default_llm_handle
+            config_params = {
+                "handle": request.model,
+                "context_window_limit": request.context_window_limit,
+                "max_tokens": request.max_tokens,
+                "max_reasoning_tokens": request.max_reasoning_tokens,
+                "enable_reasoner": request.enable_reasoner,
+            }
+            log_event(name="start get_cached_llm_config", attributes=config_params)
+            request.llm_config = await self.get_cached_llm_config_async(actor=actor, **config_params)
+            log_event(name="end get_cached_llm_config", attributes=config_params)
+
+        if request.embedding_config is None:
+            if request.embedding is None:
+                if settings.default_embedding_handle is None:
+                    raise ValueError("Must specify either embedding or embedding_config in request")
+                else:
+                    request.embedding = settings.default_embedding_handle
+            embedding_config_params = {
+                "handle": request.embedding,
+                "embedding_chunk_size": request.embedding_chunk_size or constants.DEFAULT_EMBEDDING_CHUNK_SIZE,
+            }
+            log_event(name="start get_cached_embedding_config", attributes=embedding_config_params)
+            request.embedding_config = await self.get_cached_embedding_config_async(actor=actor, **embedding_config_params)
+            log_event(name="end get_cached_embedding_config", attributes=embedding_config_params)
+
+        log_event(name="start create_agent db")
+        main_agent = await self.agent_manager.create_agent_async(
+            agent_create=request,
+            actor=actor,
+        )
+        log_event(name="end create_agent db")
+
+        if request.enable_sleeptime:
+            if request.agent_type == AgentType.voice_convo_agent:
+                main_agent = await self.create_voice_sleeptime_agent_async(main_agent=main_agent, actor=actor)
+            else:
+                main_agent = await self.create_sleeptime_agent_async(main_agent=main_agent, actor=actor)
 
         return main_agent
 
@@ -742,17 +879,46 @@ class SyncServer(Server):
         actor: User,
     ) -> AgentState:
         if request.model is not None:
-            request.llm_config = self.get_llm_config_from_handle(handle=request.model)
+            request.llm_config = self.get_llm_config_from_handle(handle=request.model, actor=actor)
 
         if request.embedding is not None:
-            request.embedding_config = self.get_embedding_config_from_handle(handle=request.embedding)
+            request.embedding_config = self.get_embedding_config_from_handle(handle=request.embedding, actor=actor)
 
         if request.enable_sleeptime:
             agent = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
             if agent.multi_agent_group is None:
-                self.create_sleeptime_agent(main_agent=agent, actor=actor)
+                if agent.agent_type == AgentType.voice_convo_agent:
+                    self.create_voice_sleeptime_agent(main_agent=agent, actor=actor)
+                else:
+                    self.create_sleeptime_agent(main_agent=agent, actor=actor)
 
         return self.agent_manager.update_agent(
+            agent_id=agent_id,
+            agent_update=request,
+            actor=actor,
+        )
+
+    async def update_agent_async(
+        self,
+        agent_id: str,
+        request: UpdateAgent,
+        actor: User,
+    ) -> AgentState:
+        if request.model is not None:
+            request.llm_config = await self.get_llm_config_from_handle_async(handle=request.model, actor=actor)
+
+        if request.embedding is not None:
+            request.embedding_config = await self.get_embedding_config_from_handle_async(handle=request.embedding, actor=actor)
+
+        if request.enable_sleeptime:
+            agent = await self.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
+            if agent.multi_agent_group is None:
+                if agent.agent_type == AgentType.voice_convo_agent:
+                    await self.create_voice_sleeptime_agent_async(main_agent=agent, actor=actor)
+                else:
+                    await self.create_sleeptime_agent_async(main_agent=agent, actor=actor)
+
+        return await self.agent_manager.update_agent_async(
             agent_id=agent_id,
             agent_update=request,
             actor=actor,
@@ -790,12 +956,117 @@ class SyncServer(Server):
         )
         return self.agent_manager.get_agent_by_id(agent_id=main_agent.id, actor=actor)
 
+    async def create_sleeptime_agent_async(self, main_agent: AgentState, actor: User) -> AgentState:
+        request = CreateAgent(
+            name=main_agent.name + "-sleeptime",
+            agent_type=AgentType.sleeptime_agent,
+            block_ids=[block.id for block in main_agent.memory.blocks],
+            memory_blocks=[
+                CreateBlock(
+                    label="memory_persona",
+                    value=get_persona_text("sleeptime_memory_persona"),
+                ),
+            ],
+            llm_config=main_agent.llm_config,
+            embedding_config=main_agent.embedding_config,
+            project_id=main_agent.project_id,
+        )
+        sleeptime_agent = await self.agent_manager.create_agent_async(
+            agent_create=request,
+            actor=actor,
+        )
+        await self.group_manager.create_group_async(
+            group=GroupCreate(
+                description="",
+                agent_ids=[sleeptime_agent.id],
+                manager_config=SleeptimeManager(
+                    manager_agent_id=main_agent.id,
+                    sleeptime_agent_frequency=5,
+                ),
+            ),
+            actor=actor,
+        )
+        return await self.agent_manager.get_agent_by_id_async(agent_id=main_agent.id, actor=actor)
+
+    def create_voice_sleeptime_agent(self, main_agent: AgentState, actor: User) -> AgentState:
+        # TODO: Inject system
+        request = CreateAgent(
+            name=main_agent.name + "-sleeptime",
+            agent_type=AgentType.voice_sleeptime_agent,
+            block_ids=[block.id for block in main_agent.memory.blocks],
+            memory_blocks=[
+                CreateBlock(
+                    label="memory_persona",
+                    value=get_persona_text("voice_memory_persona"),
+                ),
+            ],
+            llm_config=LLMConfig.default_config("gpt-4.1"),
+            embedding_config=main_agent.embedding_config,
+            project_id=main_agent.project_id,
+        )
+        voice_sleeptime_agent = self.agent_manager.create_agent(
+            agent_create=request,
+            actor=actor,
+        )
+        self.group_manager.create_group(
+            group=GroupCreate(
+                description="Low latency voice chat with async memory management.",
+                agent_ids=[voice_sleeptime_agent.id],
+                manager_config=VoiceSleeptimeManager(
+                    manager_agent_id=main_agent.id,
+                    max_message_buffer_length=constants.DEFAULT_MAX_MESSAGE_BUFFER_LENGTH,
+                    min_message_buffer_length=constants.DEFAULT_MIN_MESSAGE_BUFFER_LENGTH,
+                ),
+            ),
+            actor=actor,
+        )
+        return self.agent_manager.get_agent_by_id(agent_id=main_agent.id, actor=actor)
+
+    async def create_voice_sleeptime_agent_async(self, main_agent: AgentState, actor: User) -> AgentState:
+        # TODO: Inject system
+        request = CreateAgent(
+            name=main_agent.name + "-sleeptime",
+            agent_type=AgentType.voice_sleeptime_agent,
+            block_ids=[block.id for block in main_agent.memory.blocks],
+            memory_blocks=[
+                CreateBlock(
+                    label="memory_persona",
+                    value=get_persona_text("voice_memory_persona"),
+                ),
+            ],
+            llm_config=LLMConfig.default_config("gpt-4.1"),
+            embedding_config=main_agent.embedding_config,
+            project_id=main_agent.project_id,
+        )
+        voice_sleeptime_agent = await self.agent_manager.create_agent_async(
+            agent_create=request,
+            actor=actor,
+        )
+        await self.group_manager.create_group_async(
+            group=GroupCreate(
+                description="Low latency voice chat with async memory management.",
+                agent_ids=[voice_sleeptime_agent.id],
+                manager_config=VoiceSleeptimeManager(
+                    manager_agent_id=main_agent.id,
+                    max_message_buffer_length=constants.DEFAULT_MAX_MESSAGE_BUFFER_LENGTH,
+                    min_message_buffer_length=constants.DEFAULT_MIN_MESSAGE_BUFFER_LENGTH,
+                ),
+            ),
+            actor=actor,
+        )
+        return await self.agent_manager.get_agent_by_id_async(agent_id=main_agent.id, actor=actor)
+
     # convert name->id
 
     # TODO: These can be moved to agent_manager
     def get_agent_memory(self, agent_id: str, actor: User) -> Memory:
         """Return the memory of an agent (core memory)"""
         return self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor).memory
+
+    async def get_agent_memory_async(self, agent_id: str, actor: User) -> Memory:
+        """Return the memory of an agent (core memory)"""
+        agent = await self.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
+        return agent.memory
 
     def get_archival_memory_summary(self, agent_id: str, actor: User) -> ArchivalMemorySummary:
         return ArchivalMemorySummary(size=self.agent_manager.passage_size(actor=actor, agent_id=agent_id))
@@ -830,6 +1101,28 @@ class SyncServer(Server):
         )
         return records
 
+    async def get_agent_archival_async(
+        self,
+        agent_id: str,
+        actor: User,
+        after: Optional[str] = None,
+        before: Optional[str] = None,
+        limit: Optional[int] = 100,
+        query_text: Optional[str] = None,
+        ascending: Optional[bool] = True,
+    ) -> List[Passage]:
+        # iterate over records
+        records = await self.agent_manager.list_agent_passages_async(
+            actor=actor,
+            agent_id=agent_id,
+            after=after,
+            query_text=query_text,
+            before=before,
+            ascending=ascending,
+            limit=limit,
+        )
+        return records
+
     def insert_archival_memory(self, agent_id: str, memory_contents: str, actor: User) -> List[Passage]:
         # Get the agent object (loaded in memory)
         agent_state = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
@@ -839,6 +1132,20 @@ class SyncServer(Server):
 
         # rebuild agent system prompt - force since no archival change
         self.agent_manager.rebuild_system_prompt(agent_id=agent_id, actor=actor, force=True)
+
+        return passages
+
+    async def insert_archival_memory_async(self, agent_id: str, memory_contents: str, actor: User) -> List[Passage]:
+        # Get the agent object (loaded in memory)
+        agent_state = await self.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
+        # Insert into archival memory
+        # TODO: @mindy look at moving this to agent_manager to avoid above extra call
+        passages = await self.passage_manager.insert_passage_async(
+            agent_state=agent_state, agent_id=agent_id, text=memory_contents, actor=actor
+        )
+
+        # rebuild agent system prompt - force since no archival change
+        await self.agent_manager.rebuild_system_prompt_async(agent_id=agent_id, actor=actor, force=True)
 
         return passages
 
@@ -857,6 +1164,17 @@ class SyncServer(Server):
 
         # rebuild system prompt and force
         self.agent_manager.rebuild_system_prompt(agent_id=passage.agent_id, actor=actor, force=True)
+
+    async def delete_archival_memory_async(self, memory_id: str, actor: User):
+        # TODO check if it exists first, and throw error if not
+        # TODO: need to also rebuild the prompt here
+        passage = await self.passage_manager.get_passage_by_id_async(passage_id=memory_id, actor=actor)
+
+        # delete the passage
+        await self.passage_manager.delete_passage_by_id_async(passage_id=memory_id, actor=actor)
+
+        # rebuild system prompt and force
+        await self.agent_manager.rebuild_system_prompt_async(agent_id=passage.agent_id, actor=actor, force=True)
 
     def get_agent_recall(
         self,
@@ -877,6 +1195,44 @@ class SyncServer(Server):
         actor = self.user_manager.get_user_or_default(user_id=user_id)
 
         records = self.message_manager.list_messages_for_agent(
+            agent_id=agent_id,
+            actor=actor,
+            after=after,
+            before=before,
+            limit=limit,
+            ascending=not reverse,
+            group_id=group_id,
+        )
+
+        if not return_message_object:
+            records = Message.to_letta_messages_from_list(
+                messages=records,
+                use_assistant_message=use_assistant_message,
+                assistant_message_tool_name=assistant_message_tool_name,
+                assistant_message_tool_kwarg=assistant_message_tool_kwarg,
+                reverse=reverse,
+            )
+
+        if reverse:
+            records = records[::-1]
+
+        return records
+
+    async def get_agent_recall_async(
+        self,
+        agent_id: str,
+        actor: User,
+        after: Optional[str] = None,
+        before: Optional[str] = None,
+        limit: Optional[int] = 100,
+        group_id: Optional[str] = None,
+        reverse: Optional[bool] = False,
+        return_message_object: bool = True,
+        use_assistant_message: bool = True,
+        assistant_message_tool_name: str = constants.DEFAULT_MESSAGE_TOOL,
+        assistant_message_tool_kwarg: str = constants.DEFAULT_MESSAGE_TOOL_KWARG,
+    ) -> Union[List[Message], List[LettaMessage]]:
+        records = await self.message_manager.list_messages_for_agent_async(
             agent_id=agent_id,
             actor=actor,
             after=after,
@@ -935,76 +1291,179 @@ class SyncServer(Server):
         # rebuild system prompt for agent, potentially changed
         return self.agent_manager.rebuild_system_prompt(agent_id=agent_id, actor=actor).memory
 
-    def delete_source(self, source_id: str, actor: User):
+    async def delete_source(self, source_id: str, actor: User):
         """Delete a data source"""
-        self.source_manager.delete_source(source_id=source_id, actor=actor)
+        await self.source_manager.delete_source(source_id=source_id, actor=actor)
 
         # delete data from passage store
-        passages_to_be_deleted = self.agent_manager.list_passages(actor=actor, source_id=source_id, limit=None)
-        self.passage_manager.delete_passages(actor=actor, passages=passages_to_be_deleted)
+        passages_to_be_deleted = await self.agent_manager.list_passages_async(actor=actor, source_id=source_id, limit=None)
+        await self.passage_manager.delete_source_passages_async(actor=actor, passages=passages_to_be_deleted)
 
         # TODO: delete data from agent passage stores (?)
 
-    def load_file_to_source(self, source_id: str, file_path: str, job_id: str, actor: User) -> Job:
+    async def load_file_to_source(self, source_id: str, file_path: str, job_id: str, actor: User) -> Job:
 
         # update job
-        job = self.job_manager.get_job_by_id(job_id, actor=actor)
+        job = await self.job_manager.get_job_by_id_async(job_id, actor=actor)
         job.status = JobStatus.running
-        self.job_manager.update_job_by_id(job_id=job_id, job_update=JobUpdate(**job.model_dump()), actor=actor)
+        await self.job_manager.update_job_by_id_async(job_id=job_id, job_update=JobUpdate(**job.model_dump()), actor=actor)
 
         # try:
         from letta.data_sources.connectors import DirectoryConnector
 
-        source = self.source_manager.get_source_by_id(source_id=source_id)
+        # TODO: move this into a thread
+        source = await self.source_manager.get_source_by_id(source_id=source_id)
         if source is None:
             raise ValueError(f"Source {source_id} does not exist")
         connector = DirectoryConnector(input_files=[file_path])
-        num_passages, num_documents = self.load_data(user_id=source.created_by_id, source_name=source.name, connector=connector)
+        num_passages, num_documents = await self.load_data(user_id=source.created_by_id, source_name=source.name, connector=connector)
 
         # update all agents who have this source attached
-        agent_states = self.source_manager.list_attached_agents(source_id=source_id, actor=actor)
+        agent_states = await self.source_manager.list_attached_agents(source_id=source_id, actor=actor)
         for agent_state in agent_states:
             agent_id = agent_state.id
 
             # Attach source to agent
-            curr_passage_size = self.agent_manager.passage_size(actor=actor, agent_id=agent_id)
-            agent_state = self.agent_manager.attach_source(agent_id=agent_state.id, source_id=source_id, actor=actor)
-            new_passage_size = self.agent_manager.passage_size(actor=actor, agent_id=agent_id)
+            curr_passage_size = await self.agent_manager.passage_size_async(actor=actor, agent_id=agent_id)
+            agent_state = await self.agent_manager.attach_source_async(agent_id=agent_state.id, source_id=source_id, actor=actor)
+            new_passage_size = await self.agent_manager.passage_size_async(actor=actor, agent_id=agent_id)
             assert new_passage_size >= curr_passage_size  # in case empty files are added
 
             # rebuild system prompt and force
-            agent_state = self.agent_manager.rebuild_system_prompt(agent_id=agent_id, actor=actor, force=True)
+            agent_state = await self.agent_manager.rebuild_system_prompt_async(agent_id=agent_id, actor=actor, force=True)
 
         # update job status
         job.status = JobStatus.completed
         job.metadata["num_passages"] = num_passages
         job.metadata["num_documents"] = num_documents
-        self.job_manager.update_job_by_id(job_id=job_id, job_update=JobUpdate(**job.model_dump()), actor=actor)
+        await self.job_manager.update_job_by_id_async(job_id=job_id, job_update=JobUpdate(**job.model_dump()), actor=actor)
 
         return job
 
-    def sleeptime_document_ingest(self, main_agent: AgentState, source: Source, actor: User, clear_history: bool = False) -> None:
-        sleeptime_agent = self.create_document_sleeptime_agent(main_agent, source, actor, clear_history)
-        agent = self.load_agent(agent_id=sleeptime_agent.id, actor=actor)
-        for passage in self.list_data_source_passages(source_id=source.id, user_id=actor.id):
-            agent.step(
+    async def load_file_to_source_via_mistral(self):
+        pass
+
+    async def sleeptime_document_ingest_async(
+        self, main_agent: AgentState, source: Source, actor: User, clear_history: bool = False
+    ) -> None:
+        sleeptime_agent_state = await self.create_document_sleeptime_agent_async(main_agent, source, actor, clear_history)
+        sleeptime_agent = LettaAgent(
+            agent_id=sleeptime_agent_state.id,
+            message_manager=self.message_manager,
+            agent_manager=self.agent_manager,
+            block_manager=self.block_manager,
+            passage_manager=self.passage_manager,
+            actor=actor,
+            step_manager=self.step_manager,
+            telemetry_manager=self.telemetry_manager if settings.llm_api_logging else NoopTelemetryManager(),
+        )
+        passages = await self.agent_manager.list_passages_async(actor=actor, source_id=source.id)
+        for passage in passages:
+            await sleeptime_agent.step(
                 input_messages=[
                     MessageCreate(role="user", content=passage.text),
                 ]
             )
-        self.agent_manager.delete_agent(agent_id=sleeptime_agent.id, actor=actor)
+        await self.agent_manager.delete_agent_async(agent_id=sleeptime_agent_state.id, actor=actor)
 
-    def create_document_sleeptime_agent(
+    async def _upsert_file_to_agent(self, agent_id: str, text: str, file_id: str, file_name: str, actor: User) -> None:
+        """
+        Internal method to create or update a file <-> agent association
+        """
+        await self.file_agent_manager.attach_file(
+            agent_id=agent_id, file_id=file_id, file_name=file_name, actor=actor, visible_content=text
+        )
+
+    async def _remove_file_from_agent(self, agent_id: str, file_id: str, actor: User) -> None:
+        """
+        Internal method to remove a document block for an agent.
+        """
+        try:
+            await self.file_agent_manager.detach_file(
+                agent_id=agent_id,
+                file_id=file_id,
+                actor=actor,
+            )
+        except NoResultFound:
+            logger.info(f"File {file_id} already removed from agent {agent_id}, skipping...")
+
+    async def insert_file_into_context_windows(
+        self, source_id: str, text: str, file_id: str, file_name: str, actor: User, agent_states: Optional[List[AgentState]] = None
+    ) -> List[AgentState]:
+        """
+        Insert the uploaded document into the context window of all agents
+        attached to the given source.
+        """
+        agent_states = agent_states or await self.source_manager.list_attached_agents(source_id=source_id, actor=actor)
+
+        # Return early
+        if not agent_states:
+            return []
+
+        logger.info(f"Inserting document into context window for source: {source_id}")
+        logger.info(f"Attached agents: {[a.id for a in agent_states]}")
+
+        await asyncio.gather(*(self._upsert_file_to_agent(agent_state.id, text, file_id, file_name, actor) for agent_state in agent_states))
+
+        return agent_states
+
+    async def insert_files_into_context_window(
+        self, agent_state: AgentState, texts: List[str], file_ids: List[str], file_names: List[str], actor: User
+    ) -> None:
+        """
+        Insert the uploaded documents into the context window of an agent
+        attached to the given source.
+        """
+        logger.info(f"Inserting documents into context window for agent_state: {agent_state.id}")
+
+        if len(texts) != len(file_ids):
+            raise ValueError(f"Mismatch between number of texts ({len(texts)}) and file ids ({len(file_ids)})")
+
+        await asyncio.gather(
+            *(
+                self._upsert_file_to_agent(agent_state.id, text, file_id, file_name, actor)
+                for text, file_id, file_name in zip(texts, file_ids, file_names)
+            )
+        )
+
+    async def remove_file_from_context_windows(self, source_id: str, file_id: str, actor: User) -> None:
+        """
+        Remove the document from the context window of all agents
+        attached to the given source.
+        """
+        # TODO: We probably do NOT need to get the entire agent state, we can just get the IDs
+        agent_states = await self.source_manager.list_attached_agents(source_id=source_id, actor=actor)
+
+        # Return early
+        if not agent_states:
+            return
+
+        logger.info(f"Removing file from context window for source: {source_id}")
+        logger.info(f"Attached agents: {[a.id for a in agent_states]}")
+
+        await asyncio.gather(*(self._remove_file_from_agent(agent_state.id, file_id, actor) for agent_state in agent_states))
+
+    async def remove_files_from_context_window(self, agent_state: AgentState, file_ids: List[str], actor: User) -> None:
+        """
+        Remove multiple documents from the context window of an agent
+        attached to the given source.
+        """
+        logger.info(f"Removing files from context window for agent_state: {agent_state.id}")
+        logger.info(f"Files to remove: {file_ids}")
+
+        await asyncio.gather(*(self._remove_file_from_agent(agent_state.id, file_id, actor) for file_id in file_ids))
+
+    async def create_document_sleeptime_agent_async(
         self, main_agent: AgentState, source: Source, actor: User, clear_history: bool = False
     ) -> AgentState:
         try:
-            block = self.agent_manager.get_block_with_label(agent_id=main_agent.id, block_label=source.name, actor=actor)
+            block = await self.agent_manager.get_block_with_label_async(agent_id=main_agent.id, block_label=source.name, actor=actor)
         except:
-            block = self.block_manager.create_or_update_block(Block(label=source.name, value=""), actor=actor)
-            self.agent_manager.attach_block(agent_id=main_agent.id, block_id=block.id, actor=actor)
+            block = await self.block_manager.create_or_update_block_async(Block(label=source.name, value=""), actor=actor)
+            await self.agent_manager.attach_block_async(agent_id=main_agent.id, block_id=block.id, actor=actor)
 
         if clear_history and block.value != "":
-            block = self.block_manager.update_block(block_id=block.id, block=BlockUpdate(value=""))
+            block = await self.block_manager.update_block_async(block_id=block.id, block=BlockUpdate(value=""))
 
         request = CreateAgent(
             name=main_agent.name + "-doc-sleeptime",
@@ -1018,7 +1477,7 @@ class SyncServer(Server):
                 ),
                 CreateBlock(
                     label="instructions",
-                    value=source.description,
+                    value=source.instructions,
                 ),
             ],
             llm_config=main_agent.llm_config,
@@ -1027,12 +1486,12 @@ class SyncServer(Server):
             include_base_tools=False,
             tools=constants.BASE_SLEEPTIME_TOOLS,
         )
-        return self.agent_manager.create_agent(
+        return await self.agent_manager.create_agent_async(
             agent_create=request,
             actor=actor,
         )
 
-    def load_data(
+    async def load_data(
         self,
         user_id: str,
         connector: DataConnector,
@@ -1042,13 +1501,13 @@ class SyncServer(Server):
         # TODO: this should be implemented as a batch job or at least async, since it may take a long time
 
         # load data from a data source into the document store
-        user = self.user_manager.get_user_by_id(user_id=user_id)
-        source = self.source_manager.get_source_by_name(source_name=source_name, actor=user)
+        actor = await self.user_manager.get_actor_by_id_async(actor_id=user_id)
+        source = await self.source_manager.get_source_by_name(source_name=source_name, actor=actor)
         if source is None:
             raise ValueError(f"Data source {source_name} does not exist for user {user_id}")
 
         # load data into the document store
-        passage_count, document_count = load_data(connector, source, self.passage_manager, self.source_manager, actor=user)
+        passage_count, document_count = await load_data(connector, source, self.passage_manager, self.source_manager, actor=actor)
         return passage_count, document_count
 
     def list_data_source_passages(self, user_id: str, source_id: str) -> List[Passage]:
@@ -1056,6 +1515,7 @@ class SyncServer(Server):
         return self.agent_manager.list_passages(actor=self.user_manager.get_user_or_default(user_id=user_id), source_id=source_id)
 
     def list_all_sources(self, actor: User) -> List[Source]:
+        # TODO: legacy: remove
         """List all sources (w/ extra metadata) belonging to a user"""
 
         sources = self.source_manager.list_sources(actor=actor)
@@ -1094,48 +1554,176 @@ class SyncServer(Server):
         # Get the current message
         return self.message_manager.update_message_by_id(message_id=message_id, message_update=request, actor=actor)
 
-    def get_organization_or_default(self, org_id: Optional[str]) -> Organization:
-        """Get the organization object for org_id if it exists, otherwise return the default organization object"""
-        if org_id is None:
-            org_id = self.organization_manager.DEFAULT_ORG_ID
-
-        try:
-            return self.organization_manager.get_organization_by_id(org_id=org_id)
-        except NoResultFound:
-            raise HTTPException(status_code=404, detail=f"Organization with id {org_id} not found")
-
-    def list_llm_models(self) -> List[LLMConfig]:
+    def list_llm_models(
+        self,
+        actor: User,
+        provider_category: Optional[List[ProviderCategory]] = None,
+        provider_name: Optional[str] = None,
+        provider_type: Optional[ProviderType] = None,
+    ) -> List[LLMConfig]:
         """List available models"""
         llm_models = []
-        for provider in self.get_enabled_providers():
+        for provider in self.get_enabled_providers(
+            provider_category=provider_category,
+            provider_name=provider_name,
+            provider_type=provider_type,
+            actor=actor,
+        ):
             try:
                 llm_models.extend(provider.list_llm_models())
             except Exception as e:
+                import traceback
+
+                traceback.print_exc()
                 warnings.warn(f"An error occurred while listing LLM models for provider {provider}: {e}")
 
         llm_models.extend(self.get_local_llm_configs())
 
         return llm_models
 
-    def list_embedding_models(self) -> List[EmbeddingConfig]:
+    @trace_method
+    async def list_llm_models_async(
+        self,
+        actor: User,
+        provider_category: Optional[List[ProviderCategory]] = None,
+        provider_name: Optional[str] = None,
+        provider_type: Optional[ProviderType] = None,
+    ) -> List[LLMConfig]:
+        """Asynchronously list available models with maximum concurrency"""
+        import asyncio
+
+        providers = await self.get_enabled_providers_async(
+            provider_category=provider_category,
+            provider_name=provider_name,
+            provider_type=provider_type,
+            actor=actor,
+        )
+
+        async def get_provider_models(provider: Provider) -> list[LLMConfig]:
+            try:
+                return await provider.list_llm_models_async()
+            except Exception as e:
+                import traceback
+
+                traceback.print_exc()
+                warnings.warn(f"An error occurred while listing LLM models for provider {provider}: {e}")
+                return []
+
+        # Execute all provider model listing tasks concurrently
+        provider_results = await asyncio.gather(*[get_provider_models(provider) for provider in providers])
+
+        # Flatten the results
+        llm_models = []
+        for models in provider_results:
+            llm_models.extend(models)
+
+        # Get local configs - if this is potentially slow, consider making it async too
+        local_configs = self.get_local_llm_configs()
+        llm_models.extend(local_configs)
+
+        return llm_models
+
+    def list_embedding_models(self, actor: User) -> List[EmbeddingConfig]:
         """List available embedding models"""
         embedding_models = []
-        for provider in self.get_enabled_providers():
+        for provider in self.get_enabled_providers(actor):
             try:
                 embedding_models.extend(provider.list_embedding_models())
             except Exception as e:
                 warnings.warn(f"An error occurred while listing embedding models for provider {provider}: {e}")
         return embedding_models
 
-    def get_enabled_providers(self):
-        providers_from_env = {p.name: p for p in self._enabled_providers}
-        providers_from_db = {p.name: p for p in self.provider_manager.list_providers()}
-        # Merge the two dictionaries, keeping the values from providers_from_db where conflicts occur
-        return {**providers_from_env, **providers_from_db}.values()
+    async def list_embedding_models_async(self, actor: User) -> List[EmbeddingConfig]:
+        """Asynchronously list available embedding models with maximum concurrency"""
+        import asyncio
+
+        # Get all eligible providers first
+        providers = await self.get_enabled_providers_async(actor=actor)
+
+        # Fetch embedding models from each provider concurrently
+        async def get_provider_embedding_models(provider):
+            try:
+                # All providers now have list_embedding_models_async
+                return await provider.list_embedding_models_async()
+            except Exception as e:
+                import traceback
+
+                traceback.print_exc()
+                warnings.warn(f"An error occurred while listing embedding models for provider {provider}: {e}")
+                return []
+
+        # Execute all provider model listing tasks concurrently
+        provider_results = await asyncio.gather(*[get_provider_embedding_models(provider) for provider in providers])
+
+        # Flatten the results
+        embedding_models = []
+        for models in provider_results:
+            embedding_models.extend(models)
+
+        return embedding_models
+
+    def get_enabled_providers(
+        self,
+        actor: User,
+        provider_category: Optional[List[ProviderCategory]] = None,
+        provider_name: Optional[str] = None,
+        provider_type: Optional[ProviderType] = None,
+    ) -> List[Provider]:
+        providers = []
+        if not provider_category or ProviderCategory.base in provider_category:
+            providers_from_env = [p for p in self._enabled_providers]
+            providers.extend(providers_from_env)
+
+        if not provider_category or ProviderCategory.byok in provider_category:
+            providers_from_db = self.provider_manager.list_providers(
+                name=provider_name,
+                provider_type=provider_type,
+                actor=actor,
+            )
+            providers_from_db = [p.cast_to_subtype() for p in providers_from_db]
+            providers.extend(providers_from_db)
+
+        if provider_name is not None:
+            providers = [p for p in providers if p.name == provider_name]
+
+        if provider_type is not None:
+            providers = [p for p in providers if p.provider_type == provider_type]
+
+        return providers
+
+    async def get_enabled_providers_async(
+        self,
+        actor: User,
+        provider_category: Optional[List[ProviderCategory]] = None,
+        provider_name: Optional[str] = None,
+        provider_type: Optional[ProviderType] = None,
+    ) -> List[Provider]:
+        providers = []
+        if not provider_category or ProviderCategory.base in provider_category:
+            providers_from_env = [p for p in self._enabled_providers]
+            providers.extend(providers_from_env)
+
+        if not provider_category or ProviderCategory.byok in provider_category:
+            providers_from_db = await self.provider_manager.list_providers_async(
+                name=provider_name,
+                provider_type=provider_type,
+                actor=actor,
+            )
+            providers_from_db = [p.cast_to_subtype() for p in providers_from_db]
+            providers.extend(providers_from_db)
+
+        if provider_name is not None:
+            providers = [p for p in providers if p.name == provider_name]
+
+        if provider_type is not None:
+            providers = [p for p in providers if p.provider_type == provider_type]
+
+        return providers
 
     @trace_method
     def get_llm_config_from_handle(
         self,
+        actor: User,
         handle: str,
         context_window_limit: Optional[int] = None,
         max_tokens: Optional[int] = None,
@@ -1144,7 +1732,7 @@ class SyncServer(Server):
     ) -> LLMConfig:
         try:
             provider_name, model_name = handle.split("/", 1)
-            provider = self.get_provider_from_name(provider_name)
+            provider = self.get_provider_from_name(provider_name, actor)
 
             llm_configs = [config for config in provider.list_llm_models() if config.handle == handle]
             if not llm_configs:
@@ -1181,16 +1769,73 @@ class SyncServer(Server):
             llm_config.max_reasoning_tokens = max_reasoning_tokens
         if enable_reasoner is not None:
             llm_config.enable_reasoner = enable_reasoner
+            if enable_reasoner and llm_config.model_endpoint_type == "anthropic":
+                llm_config.put_inner_thoughts_in_kwargs = False
+
+        return llm_config
+
+    @trace_method
+    async def get_llm_config_from_handle_async(
+        self,
+        actor: User,
+        handle: str,
+        context_window_limit: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        max_reasoning_tokens: Optional[int] = None,
+        enable_reasoner: Optional[bool] = None,
+    ) -> LLMConfig:
+        try:
+            provider_name, model_name = handle.split("/", 1)
+            provider = await self.get_provider_from_name_async(provider_name, actor)
+
+            all_llm_configs = await provider.list_llm_models_async()
+            llm_configs = [config for config in all_llm_configs if config.handle == handle]
+            if not llm_configs:
+                llm_configs = [config for config in all_llm_configs if config.model == model_name]
+            if not llm_configs:
+                available_handles = [config.handle for config in all_llm_configs]
+                raise HandleNotFoundError(handle, available_handles)
+        except ValueError as e:
+            llm_configs = [config for config in self.get_local_llm_configs() if config.handle == handle]
+            if not llm_configs:
+                llm_configs = [config for config in self.get_local_llm_configs() if config.model == model_name]
+            if not llm_configs:
+                raise e
+
+        if len(llm_configs) == 1:
+            llm_config = llm_configs[0]
+        elif len(llm_configs) > 1:
+            raise ValueError(f"Multiple LLM models with name {model_name} supported by {provider_name}")
+        else:
+            llm_config = llm_configs[0]
+
+        if context_window_limit is not None:
+            if context_window_limit > llm_config.context_window:
+                raise ValueError(f"Context window limit ({context_window_limit}) is greater than maximum of ({llm_config.context_window})")
+            llm_config.context_window = context_window_limit
+        else:
+            llm_config.context_window = min(llm_config.context_window, model_settings.global_max_context_window_limit)
+
+        if max_tokens is not None:
+            llm_config.max_tokens = max_tokens
+        if max_reasoning_tokens is not None:
+            if not max_tokens or max_reasoning_tokens > max_tokens:
+                raise ValueError(f"Max reasoning tokens ({max_reasoning_tokens}) must be less than max tokens ({max_tokens})")
+            llm_config.max_reasoning_tokens = max_reasoning_tokens
+        if enable_reasoner is not None:
+            llm_config.enable_reasoner = enable_reasoner
+            if enable_reasoner and llm_config.model_endpoint_type == "anthropic":
+                llm_config.put_inner_thoughts_in_kwargs = False
 
         return llm_config
 
     @trace_method
     def get_embedding_config_from_handle(
-        self, handle: str, embedding_chunk_size: int = constants.DEFAULT_EMBEDDING_CHUNK_SIZE
+        self, actor: User, handle: str, embedding_chunk_size: int = constants.DEFAULT_EMBEDDING_CHUNK_SIZE
     ) -> EmbeddingConfig:
         try:
             provider_name, model_name = handle.split("/", 1)
-            provider = self.get_provider_from_name(provider_name)
+            provider = self.get_provider_from_name(provider_name, actor)
 
             embedding_configs = [config for config in provider.list_embedding_models() if config.handle == handle]
             if not embedding_configs:
@@ -1213,8 +1858,50 @@ class SyncServer(Server):
 
         return embedding_config
 
-    def get_provider_from_name(self, provider_name: str) -> Provider:
-        providers = [provider for provider in self._enabled_providers if provider.name == provider_name]
+    @trace_method
+    async def get_embedding_config_from_handle_async(
+        self, actor: User, handle: str, embedding_chunk_size: int = constants.DEFAULT_EMBEDDING_CHUNK_SIZE
+    ) -> EmbeddingConfig:
+        try:
+            provider_name, model_name = handle.split("/", 1)
+            provider = await self.get_provider_from_name_async(provider_name, actor)
+
+            all_embedding_configs = await provider.list_embedding_models_async()
+            embedding_configs = [config for config in all_embedding_configs if config.handle == handle]
+            if not embedding_configs:
+                raise ValueError(f"Embedding model {model_name} is not supported by {provider_name}")
+        except ValueError as e:
+            # search local configs
+            embedding_configs = [config for config in self.get_local_embedding_configs() if config.handle == handle]
+            if not embedding_configs:
+                raise e
+
+        if len(embedding_configs) == 1:
+            embedding_config = embedding_configs[0]
+        elif len(embedding_configs) > 1:
+            raise ValueError(f"Multiple embedding models with name {model_name} supported by {provider_name}")
+        else:
+            embedding_config = embedding_configs[0]
+
+        if embedding_chunk_size:
+            embedding_config.embedding_chunk_size = embedding_chunk_size
+
+        return embedding_config
+
+    def get_provider_from_name(self, provider_name: str, actor: User) -> Provider:
+        providers = [provider for provider in self.get_enabled_providers(actor) if provider.name == provider_name]
+        if not providers:
+            raise ValueError(f"Provider {provider_name} is not supported")
+        elif len(providers) > 1:
+            raise ValueError(f"Multiple providers with name {provider_name} supported")
+        else:
+            provider = providers[0]
+
+        return provider
+
+    async def get_provider_from_name_async(self, provider_name: str, actor: User) -> Provider:
+        all_providers = await self.get_enabled_providers_async(actor)
+        providers = [provider for provider in all_providers if provider.name == provider_name]
         if not providers:
             raise ValueError(f"Provider {provider_name} is not supported")
         elif len(providers) > 1:
@@ -1268,11 +1955,7 @@ class SyncServer(Server):
     def add_embedding_model(self, request: EmbeddingConfig) -> EmbeddingConfig:
         """Add a new embedding model"""
 
-    def get_agent_context_window(self, agent_id: str, actor: User) -> ContextWindowOverview:
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-        return letta_agent.get_context_window()
-
-    def run_tool_from_source(
+    async def run_tool_from_source(
         self,
         actor: User,
         tool_args: Dict[str, str],
@@ -1305,8 +1988,20 @@ class SyncServer(Server):
 
         # Next, attempt to run the tool with the sandbox
         try:
-            tool_execution_result = ToolExecutionSandbox(tool.name, tool_args, actor, tool_object=tool).run(
-                agent_state=agent_state, additional_env_vars=tool_env_vars
+            tool_execution_manager = ToolExecutionManager(
+                agent_state=agent_state,
+                message_manager=self.message_manager,
+                agent_manager=self.agent_manager,
+                block_manager=self.block_manager,
+                passage_manager=self.passage_manager,
+                actor=actor,
+                sandbox_env_vars=tool_env_vars,
+            )
+            # TODO: Integrate sandbox result
+            tool_execution_result = await tool_execution_manager.execute_tool_async(
+                function_name=tool_name,
+                function_args=tool_args,
+                tool=tool,
             )
             return ToolReturnMessage(
                 id="null",
@@ -1361,7 +2056,8 @@ class SyncServer(Server):
 
         # TODO implement non-flatfile mechanism
         if not tool_settings.mcp_read_from_config:
-            raise RuntimeError("MCP config file disabled. Enable it in settings.")
+            return {}
+            # raise RuntimeError("MCP config file disabled. Enable it in settings.")
 
         mcp_server_list = {}
 
@@ -1405,6 +2101,7 @@ class SyncServer(Server):
                                     server_name=server_name,
                                     command=server_params_raw["command"],
                                     args=server_params_raw.get("args", []),
+                                    env=server_params_raw.get("env", {}),
                                 )
                                 mcp_server_list[server_name] = server_params
                             except Exception as e:
@@ -1414,14 +2111,14 @@ class SyncServer(Server):
         # If the file doesn't exist, return empty dictionary
         return mcp_server_list
 
-    def get_tools_from_mcp_server(self, mcp_server_name: str) -> List[MCPTool]:
+    async def get_tools_from_mcp_server(self, mcp_server_name: str) -> List[MCPTool]:
         """List the tools in an MCP server. Requires a client to be created."""
         if mcp_server_name not in self.mcp_clients:
             raise ValueError(f"No client was created for MCP server: {mcp_server_name}")
 
-        return self.mcp_clients[mcp_server_name].list_tools()
+        return await self.mcp_clients[mcp_server_name].list_tools()
 
-    def add_mcp_server_to_config(
+    async def add_mcp_server_to_config(
         self, server_config: Union[SSEServerConfig, StdioServerConfig], allow_upsert: bool = True
     ) -> List[Union[SSEServerConfig, StdioServerConfig]]:
         """Add a new server config to the MCP config file"""
@@ -1450,19 +2147,19 @@ class SyncServer(Server):
 
         # Attempt to initialize the connection to the server
         if server_config.type == MCPServerType.SSE:
-            new_mcp_client = SSEMCPClient(server_config)
+            new_mcp_client = AsyncSSEMCPClient(server_config)
         elif server_config.type == MCPServerType.STDIO:
-            new_mcp_client = StdioMCPClient(server_config)
+            new_mcp_client = AsyncStdioMCPClient(server_config)
         else:
             raise ValueError(f"Invalid MCP server config: {server_config}")
         try:
-            new_mcp_client.connect_to_server()
+            await new_mcp_client.connect_to_server()
         except:
             logger.exception(f"Failed to connect to MCP server: {server_config.server_name}")
             raise RuntimeError(f"Failed to connect to MCP server: {server_config.server_name}")
         # Print out the tools that are connected
         logger.info(f"Attempting to fetch tools from MCP server: {server_config.server_name}")
-        new_mcp_tools = new_mcp_client.list_tools()
+        new_mcp_tools = await new_mcp_client.list_tools()
         logger.info(f"MCP tools connected: {', '.join([t.name for t in new_mcp_tools])}")
         logger.debug(f"MCP tools: {', '.join([str(t) for t in new_mcp_tools])}")
 
@@ -1539,6 +2236,8 @@ class SyncServer(Server):
         assistant_message_tool_name: str = constants.DEFAULT_MESSAGE_TOOL,
         assistant_message_tool_kwarg: str = constants.DEFAULT_MESSAGE_TOOL_KWARG,
         metadata: Optional[dict] = None,
+        request_start_timestamp_ns: Optional[int] = None,
+        include_return_message_types: Optional[List[MessageType]] = None,
     ) -> Union[StreamingResponse, LettaResponse]:
         """Split off into a separate function so that it can be imported in the /chat/completion proxy."""
         # TODO: @charles is this the correct way to handle?
@@ -1562,7 +2261,8 @@ class SyncServer(Server):
             # supports_token_streaming = ["openai", "anthropic", "xai", "deepseek"]
             supports_token_streaming = ["openai", "anthropic", "deepseek"]  # TODO re-enable xAI once streaming is patched
             if stream_tokens and (
-                llm_config.model_endpoint_type not in supports_token_streaming or "inference.memgpt.ai" in llm_config.model_endpoint
+                llm_config.model_endpoint_type not in supports_token_streaming
+                or llm_config.model_endpoint == constants.LETTA_MODEL_ENDPOINT
             ):
                 warnings.warn(
                     f"Token streaming is only supported for models with type {' or '.join(supports_token_streaming)} in the model_endpoint: agent has endpoint type {llm_config.model_endpoint_type} and {llm_config.model_endpoint}. Setting stream_tokens to False."
@@ -1622,6 +2322,8 @@ class SyncServer(Server):
                         streaming_interface.get_generator(),
                         usage_task=task,
                         finish_message=include_final_message,
+                        request_start_timestamp_ns=request_start_timestamp_ns,
+                        llm_config=llm_config,
                     ),
                     media_type="text/event-stream",
                 )
@@ -1641,6 +2343,11 @@ class SyncServer(Server):
 
                 # Get rid of the stream status messages
                 filtered_stream = [d for d in generated_stream if not isinstance(d, MessageStreamStatus)]
+
+                # Apply message type filtering if specified
+                if include_return_message_types is not None:
+                    filtered_stream = [msg for msg in filtered_stream if msg.message_type in include_return_message_types]
+
                 usage = await task
 
                 # By default the stream will be messages of type LettaMessage or LettaLegacyMessage
@@ -1685,7 +2392,7 @@ class SyncServer(Server):
         llm_config = letta_multi_agent.agent_state.llm_config
         supports_token_streaming = ["openai", "anthropic", "deepseek"]
         if stream_tokens and (
-            llm_config.model_endpoint_type not in supports_token_streaming or "inference.memgpt.ai" in llm_config.model_endpoint
+            llm_config.model_endpoint_type not in supports_token_streaming or llm_config.model_endpoint == constants.LETTA_MODEL_ENDPOINT
         ):
             warnings.warn(
                 f"Token streaming is only supported for models with type {' or '.join(supports_token_streaming)} in the model_endpoint: agent has endpoint type {llm_config.model_endpoint_type} and {llm_config.model_endpoint}. Setting stream_tokens to False."

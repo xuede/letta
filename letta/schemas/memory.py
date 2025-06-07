@@ -65,13 +65,21 @@ class Memory(BaseModel, validate_assignment=True):
 
     # Memory.block contains the list of memory blocks in the core memory
     blocks: List[Block] = Field(..., description="Memory blocks contained in the agent's in-context memory")
+    file_blocks: List[Block] = Field(
+        default_factory=list, description="Blocks representing the agent's in-context memory of an attached file"
+    )
 
     # Memory.template is a Jinja2 template for compiling memory module into a prompt string.
     prompt_template: str = Field(
         default="{% for block in blocks %}"
-        '<{{ block.label }} characters="{{ block.value|length }}/{{ block.limit }}">\n'
+        "<{{ block.label }}>\n"
+        "<metadata>"
+        'read_only="{{ block.read_only}}" chars_current="{{ block.value|length }}" chars_limit="{{ block.limit }}"'
+        "</metadata>"
+        "<value>"
         "{{ block.value }}\n"
-        "</{{ block.label }}>"
+        "</value>"
+        "</{{ block.label }}>\n"
         "{% if not loop.last %}\n{% endif %}"
         "{% endfor %}",
         description="Jinja2 template for compiling memory blocks into a prompt string",
@@ -91,7 +99,7 @@ class Memory(BaseModel, validate_assignment=True):
             Template(prompt_template)
 
             # Validate compatibility with current memory structure
-            Template(prompt_template).render(blocks=self.blocks)
+            Template(prompt_template).render(blocks=self.blocks, file_blocks=self.file_blocks)
 
             # If we get here, the template is valid and compatible
             self.prompt_template = prompt_template
@@ -103,7 +111,7 @@ class Memory(BaseModel, validate_assignment=True):
     def compile(self) -> str:
         """Generate a string representation of the memory in-context using the Jinja2 template"""
         template = Template(self.prompt_template)
-        return template.render(blocks=self.blocks)
+        return template.render(blocks=self.blocks, file_blocks=self.file_blocks)
 
     def list_block_labels(self) -> List[str]:
         """Return a list of the block names held inside the memory object"""

@@ -1,15 +1,22 @@
+import json
 from abc import abstractmethod
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from anthropic.types.beta.messages import BetaMessageBatch
 from openai import AsyncStream, Stream
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
 from letta.errors import LLMError
+from letta.otel.tracing import log_event, trace_method
+from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse
-from letta.tracing import log_event
+from letta.schemas.provider_trace import ProviderTraceCreate
+from letta.services.telemetry_manager import TelemetryManager
+
+if TYPE_CHECKING:
+    from letta.orm import User
 
 
 class LLMClientBase:
@@ -22,17 +29,21 @@ class LLMClientBase:
         self,
         put_inner_thoughts_first: Optional[bool] = True,
         use_tool_naming: bool = True,
+        actor: Optional["User"] = None,
     ):
+        self.actor = actor
         self.put_inner_thoughts_first = put_inner_thoughts_first
         self.use_tool_naming = use_tool_naming
 
+    @trace_method
     def send_llm_request(
         self,
         messages: List[Message],
         llm_config: LLMConfig,
         tools: Optional[List[dict]] = None,  # TODO: change to Tool object
-        stream: bool = False,
         force_tool_call: Optional[str] = None,
+        telemetry_manager: Optional["TelemetryManager"] = None,
+        step_id: Optional[str] = None,
     ) -> Union[ChatCompletionResponse, Stream[ChatCompletionChunk]]:
         """
         Issues a request to the downstream model endpoint and parses response.
@@ -43,37 +54,51 @@ class LLMClientBase:
 
         try:
             log_event(name="llm_request_sent", attributes=request_data)
-            if stream:
-                return self.stream(request_data, llm_config)
-            else:
-                response_data = self.request(request_data, llm_config)
+            response_data = self.request(request_data, llm_config)
+            if step_id and telemetry_manager:
+                telemetry_manager.create_provider_trace(
+                    actor=self.actor,
+                    provider_trace_create=ProviderTraceCreate(
+                        request_json=request_data,
+                        response_json=response_data,
+                        step_id=step_id,
+                        organization_id=self.actor.organization_id,
+                    ),
+                )
             log_event(name="llm_response_received", attributes=response_data)
         except Exception as e:
             raise self.handle_llm_error(e)
 
         return self.convert_response_to_chat_completion(response_data, messages, llm_config)
 
+    @trace_method
     async def send_llm_request_async(
         self,
+        request_data: dict,
         messages: List[Message],
         llm_config: LLMConfig,
-        tools: Optional[List[dict]] = None,  # TODO: change to Tool object
-        stream: bool = False,
-        force_tool_call: Optional[str] = None,
+        telemetry_manager: "TelemetryManager | None" = None,
+        step_id: str | None = None,
     ) -> Union[ChatCompletionResponse, AsyncStream[ChatCompletionChunk]]:
         """
         Issues a request to the downstream model endpoint.
         If stream=True, returns an AsyncStream[ChatCompletionChunk] that can be async iterated over.
         Otherwise returns a ChatCompletionResponse.
         """
-        request_data = self.build_request_data(messages, llm_config, tools, force_tool_call)
 
         try:
             log_event(name="llm_request_sent", attributes=request_data)
-            if stream:
-                return await self.stream_async(request_data, llm_config)
-            else:
-                response_data = await self.request_async(request_data, llm_config)
+            response_data = await self.request_async(request_data, llm_config)
+            await telemetry_manager.create_provider_trace_async(
+                actor=self.actor,
+                provider_trace_create=ProviderTraceCreate(
+                    request_json=request_data,
+                    response_json=response_data,
+                    step_id=step_id,
+                    organization_id=self.actor.organization_id,
+                ),
+            )
+
             log_event(name="llm_response_received", attributes=response_data)
         except Exception as e:
             raise self.handle_llm_error(e)
@@ -116,6 +141,20 @@ class LLMClientBase:
         raise NotImplementedError
 
     @abstractmethod
+    async def request_embeddings(self, texts: List[str], embedding_config: EmbeddingConfig) -> List[List[float]]:
+        """
+        Generate embeddings for a batch of texts.
+
+        Args:
+            texts (List[str]): List of texts to generate embeddings for.
+            embedding_config (EmbeddingConfig): Configuration for the embedding model.
+
+        Returns:
+            embeddings (List[List[float]]): List of embeddings for the input texts.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def convert_response_to_chat_completion(
         self,
         response_data: dict,
@@ -127,13 +166,6 @@ class LLMClientBase:
         ChatCompletionsResponse object.
         """
         raise NotImplementedError
-
-    @abstractmethod
-    def stream(self, request_data: dict, llm_config: LLMConfig) -> Stream[ChatCompletionChunk]:
-        """
-        Performs underlying streaming request to llm and returns raw response.
-        """
-        raise NotImplementedError(f"Streaming is not supported for {llm_config.model_endpoint_type}")
 
     @abstractmethod
     async def stream_async(self, request_data: dict, llm_config: LLMConfig) -> AsyncStream[ChatCompletionChunk]:
@@ -155,3 +187,30 @@ class LLMClientBase:
             An LLMError subclass that represents the error in a provider-agnostic way
         """
         return LLMError(f"Unhandled LLM error: {str(e)}")
+
+    def _fix_truncated_json_response(self, response: ChatCompletionResponse) -> ChatCompletionResponse:
+        """
+        Fixes truncated JSON responses by ensuring the content is properly formatted.
+        This is a workaround for some providers that may return incomplete JSON.
+        """
+        if response.choices and response.choices[0].message and response.choices[0].message.tool_calls:
+            tool_call_args_str = response.choices[0].message.tool_calls[0].function.arguments
+            try:
+                json.loads(tool_call_args_str)
+            except json.JSONDecodeError:
+                try:
+                    json_str_end = ""
+                    quote_count = tool_call_args_str.count('"')
+                    if quote_count % 2 != 0:
+                        json_str_end = json_str_end + '"'
+
+                    open_braces = tool_call_args_str.count("{")
+                    close_braces = tool_call_args_str.count("}")
+                    missing_braces = open_braces - close_braces
+                    json_str_end += "}" * missing_braces
+                    fixed_tool_call_args_str = tool_call_args_str[: -len(json_str_end)] + json_str_end
+                    json.loads(fixed_tool_call_args_str)
+                    response.choices[0].message.tool_calls[0].function.arguments = fixed_tool_call_args_str
+                except json.JSONDecodeError:
+                    pass
+        return response

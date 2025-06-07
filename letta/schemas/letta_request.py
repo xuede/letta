@@ -3,6 +3,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, HttpUrl
 
 from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
+from letta.schemas.letta_message import MessageType
 from letta.schemas.message import MessageCreate
 
 
@@ -21,6 +22,11 @@ class LettaRequest(BaseModel):
         description="The name of the message argument in the designated message tool.",
     )
 
+    # filter to only return specific message types
+    include_return_message_types: Optional[List[MessageType]] = Field(
+        default=None, description="Only return specified message types in the response. If `None` (default) returns all messages."
+    )
+
 
 class LettaStreamingRequest(LettaRequest):
     stream_tokens: bool = Field(
@@ -35,4 +41,11 @@ class LettaBatchRequest(LettaRequest):
 
 class CreateBatch(BaseModel):
     requests: List[LettaBatchRequest] = Field(..., description="List of requests to be processed in batch.")
-    callback_url: Optional[HttpUrl] = Field(None, description="Optional URL to call via POST when the batch completes.")
+    callback_url: Optional[HttpUrl] = Field(
+        None,
+        description="Optional URL to call via POST when the batch completes. The callback payload will be a JSON object with the following fields: "
+        "{'job_id': string, 'status': string, 'completed_at': string}. "
+        "Where 'job_id' is the unique batch job identifier, "
+        "'status' is the final batch status (e.g., 'completed', 'failed'), and "
+        "'completed_at' is an ISO 8601 timestamp indicating when the batch job completed.",
+    )

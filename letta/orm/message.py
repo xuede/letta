@@ -22,6 +22,7 @@ class Message(SqlalchemyBase, OrganizationMixin, AgentMixin):
         Index("ix_messages_agent_created_at", "agent_id", "created_at"),
         Index("ix_messages_created_at", "created_at", "id"),
         Index("ix_messages_agent_sequence", "agent_id", "sequence_id"),
+        Index("ix_messages_org_agent", "organization_id", "agent_id"),
     )
     __pydantic_model__ = PydanticMessage
 
@@ -43,6 +44,10 @@ class Message(SqlalchemyBase, OrganizationMixin, AgentMixin):
     group_id: Mapped[Optional[str]] = mapped_column(nullable=True, doc="The multi-agent group that the message was sent in")
     sender_id: Mapped[Optional[str]] = mapped_column(
         nullable=True, doc="The id of the sender of the message, can be an identity id or agent id"
+    )
+    batch_item_id: Mapped[Optional[str]] = mapped_column(
+        nullable=True,
+        doc="The id of the LLMBatchItem that this message is associated with",
     )
 
     # Monotonically increasing sequence for efficient/correct listing

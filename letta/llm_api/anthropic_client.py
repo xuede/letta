@@ -27,14 +27,16 @@ from letta.llm_api.helpers import add_inner_thoughts_to_functions, unpack_all_in
 from letta.llm_api.llm_client_base import LLMClientBase
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG, INNER_THOUGHTS_KWARG_DESCRIPTION
 from letta.log import get_logger
+from letta.otel.tracing import trace_method
+from letta.schemas.enums import ProviderCategory
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message as PydanticMessage
-from letta.schemas.openai.chat_completion_request import Tool
+from letta.schemas.openai.chat_completion_request import Tool as OpenAITool
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse, Choice, FunctionCall
 from letta.schemas.openai.chat_completion_response import Message as ChoiceMessage
 from letta.schemas.openai.chat_completion_response import ToolCall, UsageStatistics
 from letta.services.provider_manager import ProviderManager
-from letta.tracing import trace_method
+from letta.settings import model_settings
 
 DUMMY_FIRST_USER_MESSAGE = "User initializing bootup sequence."
 
@@ -43,19 +45,21 @@ logger = get_logger(__name__)
 
 class AnthropicClient(LLMClientBase):
 
+    @trace_method
     def request(self, request_data: dict, llm_config: LLMConfig) -> dict:
-        client = self._get_anthropic_client(async_client=False)
+        client = self._get_anthropic_client(llm_config, async_client=False)
         response = client.beta.messages.create(**request_data, betas=["tools-2024-04-04"])
         return response.model_dump()
 
+    @trace_method
     async def request_async(self, request_data: dict, llm_config: LLMConfig) -> dict:
-        client = self._get_anthropic_client(async_client=True)
+        client = await self._get_anthropic_client_async(llm_config, async_client=True)
         response = await client.beta.messages.create(**request_data, betas=["tools-2024-04-04"])
         return response.model_dump()
 
     @trace_method
     async def stream_async(self, request_data: dict, llm_config: LLMConfig) -> AsyncStream[BetaRawMessageStreamEvent]:
-        client = self._get_anthropic_client(async_client=True)
+        client = await self._get_anthropic_client_async(llm_config, async_client=True)
         request_data["stream"] = True
         return await client.beta.messages.create(**request_data, betas=["tools-2024-04-04"])
 
@@ -95,7 +99,7 @@ class AnthropicClient(LLMClientBase):
                 for agent_id in agent_messages_mapping
             }
 
-            client = self._get_anthropic_client(async_client=True)
+            client = await self._get_anthropic_client_async(list(agent_llm_config_mapping.values())[0], async_client=True)
 
             anthropic_requests = [
                 Request(custom_id=agent_id, params=MessageCreateParamsNonStreaming(**params)) for agent_id, params in requests.items()
@@ -111,11 +115,44 @@ class AnthropicClient(LLMClientBase):
             raise self.handle_llm_error(e)
 
     @trace_method
-    def _get_anthropic_client(self, async_client: bool = False) -> Union[anthropic.AsyncAnthropic, anthropic.Anthropic]:
-        override_key = ProviderManager().get_anthropic_override_key()
+    def _get_anthropic_client(
+        self, llm_config: LLMConfig, async_client: bool = False
+    ) -> Union[anthropic.AsyncAnthropic, anthropic.Anthropic]:
+        override_key = None
+        if llm_config.provider_category == ProviderCategory.byok:
+            override_key = ProviderManager().get_override_key(llm_config.provider_name, actor=self.actor)
+
         if async_client:
-            return anthropic.AsyncAnthropic(api_key=override_key) if override_key else anthropic.AsyncAnthropic()
-        return anthropic.Anthropic(api_key=override_key) if override_key else anthropic.Anthropic()
+            return (
+                anthropic.AsyncAnthropic(api_key=override_key, max_retries=model_settings.anthropic_max_retries)
+                if override_key
+                else anthropic.AsyncAnthropic(max_retries=model_settings.anthropic_max_retries)
+            )
+        return (
+            anthropic.Anthropic(api_key=override_key, max_retries=model_settings.anthropic_max_retries)
+            if override_key
+            else anthropic.Anthropic(max_retries=model_settings.anthropic_max_retries)
+        )
+
+    @trace_method
+    async def _get_anthropic_client_async(
+        self, llm_config: LLMConfig, async_client: bool = False
+    ) -> Union[anthropic.AsyncAnthropic, anthropic.Anthropic]:
+        override_key = None
+        if llm_config.provider_category == ProviderCategory.byok:
+            override_key = await ProviderManager().get_override_key_async(llm_config.provider_name, actor=self.actor)
+
+        if async_client:
+            return (
+                anthropic.AsyncAnthropic(api_key=override_key, max_retries=model_settings.anthropic_max_retries)
+                if override_key
+                else anthropic.AsyncAnthropic(max_retries=model_settings.anthropic_max_retries)
+            )
+        return (
+            anthropic.Anthropic(api_key=override_key, max_retries=model_settings.anthropic_max_retries)
+            if override_key
+            else anthropic.Anthropic(max_retries=model_settings.anthropic_max_retries)
+        )
 
     @trace_method
     def build_request_data(
@@ -162,10 +199,10 @@ class AnthropicClient(LLMClientBase):
         elif llm_config.enable_reasoner:
             # NOTE: reasoning models currently do not allow for `any`
             tool_choice = {"type": "auto", "disable_parallel_tool_use": True}
-            tools_for_request = [Tool(function=f) for f in tools]
+            tools_for_request = [OpenAITool(function=f) for f in tools]
         elif force_tool_call is not None:
             tool_choice = {"type": "tool", "name": force_tool_call}
-            tools_for_request = [Tool(function=f) for f in tools if f["name"] == force_tool_call]
+            tools_for_request = [OpenAITool(function=f) for f in tools if f["name"] == force_tool_call]
 
             # need to have this setting to be able to put inner thoughts in kwargs
             if not llm_config.put_inner_thoughts_in_kwargs:
@@ -179,7 +216,7 @@ class AnthropicClient(LLMClientBase):
                 tool_choice = {"type": "any", "disable_parallel_tool_use": True}
             else:
                 tool_choice = {"type": "auto", "disable_parallel_tool_use": True}
-            tools_for_request = [Tool(function=f) for f in tools] if tools is not None else None
+            tools_for_request = [OpenAITool(function=f) for f in tools] if tools is not None else None
 
         # Add tool choice
         if tool_choice:
@@ -193,7 +230,7 @@ class AnthropicClient(LLMClientBase):
                 inner_thoughts_key=INNER_THOUGHTS_KWARG,
                 inner_thoughts_description=INNER_THOUGHTS_KWARG_DESCRIPTION,
             )
-            tools_for_request = [Tool(function=f) for f in tools_with_inner_thoughts]
+            tools_for_request = [OpenAITool(function=f) for f in tools_with_inner_thoughts]
 
         if tools_for_request and len(tools_for_request) > 0:
             # TODO eventually enable parallel tool use
@@ -233,6 +270,33 @@ class AnthropicClient(LLMClientBase):
 
         return data
 
+    async def count_tokens(self, messages: List[dict] = None, model: str = None, tools: List[OpenAITool] = None) -> int:
+        client = anthropic.AsyncAnthropic()
+        if messages and len(messages) == 0:
+            messages = None
+        if tools and len(tools) > 0:
+            anthropic_tools = convert_tools_to_anthropic_format(tools)
+        else:
+            anthropic_tools = None
+
+        try:
+            result = await client.beta.messages.count_tokens(
+                model=model or "claude-3-7-sonnet-20250219",
+                messages=messages or [{"role": "user", "content": "hi"}],
+                tools=anthropic_tools or [],
+            )
+        except:
+            import ipdb
+
+            ipdb.set_trace()
+            raise
+
+        token_count = result.input_tokens
+        if messages is None:
+            token_count -= 8
+        return token_count
+
+    @trace_method
     def handle_llm_error(self, e: Exception) -> Exception:
         if isinstance(e, anthropic.APIConnectionError):
             logger.warning(f"[Anthropic] API connection error: {e.__cause__}")
@@ -306,6 +370,7 @@ class AnthropicClient(LLMClientBase):
 
     # TODO: Input messages doesn't get used here
     # TODO: Clean up this interface
+    @trace_method
     def convert_response_to_chat_completion(
         self,
         response_data: dict,
@@ -362,12 +427,18 @@ class AnthropicClient(LLMClientBase):
                 if content_part.type == "text":
                     content = strip_xml_tags(string=content_part.text, tag="thinking")
                 if content_part.type == "tool_use":
-                    # hack for tool rules
-                    input = json.loads(json.dumps(content_part.input))
-                    if "id" in input and input["id"].startswith("toolu_") and "function" in input:
-                        arguments = str(input["function"]["arguments"])
+                    # hack for incorrect tool format
+                    tool_input = json.loads(json.dumps(content_part.input))
+                    if "id" in tool_input and tool_input["id"].startswith("toolu_") and "function" in tool_input:
+                        arguments = json.dumps(tool_input["function"]["arguments"], indent=2)
+                        try:
+                            args_json = json.loads(arguments)
+                            if not isinstance(args_json, dict):
+                                raise ValueError("Expected parseable json object for arguments")
+                        except:
+                            arguments = str(tool_input["function"]["arguments"])
                     else:
-                        arguments = json.dumps(content_part.input, indent=2)
+                        arguments = json.dumps(tool_input, indent=2)
                     tool_calls = [
                         ToolCall(
                             id=content_part.id,
@@ -420,7 +491,7 @@ class AnthropicClient(LLMClientBase):
         return chat_completion_response
 
 
-def convert_tools_to_anthropic_format(tools: List[Tool]) -> List[dict]:
+def convert_tools_to_anthropic_format(tools: List[OpenAITool]) -> List[dict]:
     """See: https://docs.anthropic.com/claude/docs/tool-use
 
     OpenAI style:
@@ -470,7 +541,7 @@ def convert_tools_to_anthropic_format(tools: List[Tool]) -> List[dict]:
     for tool in tools:
         formatted_tool = {
             "name": tool.function.name,
-            "description": tool.function.description,
+            "description": tool.function.description if tool.function.description else "",
             "input_schema": tool.function.parameters or {"type": "object", "properties": {}, "required": []},
         }
         formatted_tools.append(formatted_tool)

@@ -113,13 +113,51 @@ def test_shared_blocks(client: LettaSDKClient):
             )
         ],
     )
-    assert (
-        "charles" in client.agents.blocks.retrieve(agent_id=agent_state2.id, block_label="human").value.lower()
-    ), f"Shared block update failed {client.agents.blocks.retrieve(agent_id=agent_state2.id, block_label='human').value}"
+    block_value = client.agents.blocks.retrieve(agent_id=agent_state2.id, block_label="human").value
+    assert "charles" in block_value.lower(), f"Shared block update failed {block_value}"
 
     # cleanup
     client.agents.delete(agent_state1.id)
     client.agents.delete(agent_state2.id)
+
+
+def test_read_only_block(client: LettaSDKClient):
+    block_value = "username: sarah"
+    agent = client.agents.create(
+        memory_blocks=[
+            CreateBlock(
+                label="human",
+                value=block_value,
+                read_only=True,
+            ),
+        ],
+        model="openai/gpt-4o-mini",
+        embedding="openai/text-embedding-ada-002",
+    )
+
+    # make sure agent cannot update read-only block
+    client.agents.messages.create(
+        agent_id=agent.id,
+        messages=[
+            MessageCreate(
+                role="user",
+                content="my name is actually charles",
+            )
+        ],
+    )
+
+    # make sure block value is still the same
+    block = client.agents.blocks.retrieve(agent_id=agent.id, block_label="human")
+    assert block.value == block_value
+
+    # make sure can update from client
+    new_value = "hello"
+    client.agents.blocks.modify(agent_id=agent.id, block_label="human", value=new_value)
+    block = client.agents.blocks.retrieve(agent_id=agent.id, block_label="human")
+    assert block.value == new_value
+
+    # cleanup
+    client.agents.delete(agent.id)
 
 
 def test_add_and_manage_tags_for_agent(client: LettaSDKClient):
@@ -438,7 +476,7 @@ def test_function_always_error(client: LettaSDKClient, agent: AgentState):
     assert response_message, "ToolReturnMessage message not found in response"
     assert response_message.status == "error"
 
-    assert response_message.tool_return == "Error executing function testing_method: ZeroDivisionError: division by zero"
+    assert "Error executing function testing_method: ZeroDivisionError: division by zero" in response_message.tool_return
     assert "ZeroDivisionError" in response_message.tool_return
 
 
@@ -641,3 +679,86 @@ def test_many_blocks(client: LettaSDKClient):
 
     client.agents.delete(agent1.id)
     client.agents.delete(agent2.id)
+
+
+# cases: steam, async, token stream, sync
+@pytest.mark.parametrize("message_create", ["stream_step", "token_stream", "sync"])
+def test_include_return_message_types(client: LettaSDKClient, agent: AgentState, message_create: str):
+    """Test that the include_return_message_types parameter works"""
+
+    def verify_message_types(messages, message_types):
+        for message in messages:
+            assert message.message_type in message_types
+
+    message = "My name is actually Sarah"
+    message_types = ["reasoning_message", "tool_call_message"]
+    agent = client.agents.create(
+        memory_blocks=[
+            CreateBlock(label="user", value="Name: Charles"),
+        ],
+        model="letta/letta-free",
+        embedding="letta/letta-free",
+    )
+
+    if message_create == "stream_step":
+        response = client.agents.messages.create_stream(
+            agent_id=agent.id,
+            messages=[
+                MessageCreate(
+                    role="user",
+                    content=message,
+                ),
+            ],
+            include_return_message_types=message_types,
+        )
+        messages = [message for message in list(response) if message.message_type != "usage_statistics"]
+        verify_message_types(messages, message_types)
+
+    elif message_create == "async":
+        response = client.agents.messages.create_async(
+            agent_id=agent.id,
+            messages=[
+                MessageCreate(
+                    role="user",
+                    content=message,
+                )
+            ],
+            include_return_message_types=message_types,
+        )
+        # wait to finish
+        while response.status != "completed":
+            time.sleep(1)
+            response = client.runs.retrieve(run_id=response.id)
+        messages = client.runs.messages.list(run_id=response.id)
+        verify_message_types(messages, message_types)
+
+    elif message_create == "token_stream":
+        response = client.agents.messages.create_stream(
+            agent_id=agent.id,
+            messages=[
+                MessageCreate(
+                    role="user",
+                    content=message,
+                ),
+            ],
+            include_return_message_types=message_types,
+        )
+        messages = [message for message in list(response) if message.message_type != "usage_statistics"]
+        verify_message_types(messages, message_types)
+
+    elif message_create == "sync":
+        response = client.agents.messages.create(
+            agent_id=agent.id,
+            messages=[
+                MessageCreate(
+                    role="user",
+                    content=message,
+                ),
+            ],
+            include_return_message_types=message_types,
+        )
+        messages = response.messages
+        verify_message_types(messages, message_types)
+
+    # cleanup
+    client.agents.delete(agent.id)

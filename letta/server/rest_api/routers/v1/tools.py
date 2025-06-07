@@ -9,7 +9,7 @@ from composio.exceptions import (
     EnumMetadataNotFound,
     EnumStringNotFound,
 )
-from fastapi import APIRouter, Body, Depends, Header, HTTPException
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 
 from letta.errors import LettaToolCreateError
 from letta.functions.mcp_client.exceptions import MCPTimeoutError
@@ -21,6 +21,7 @@ from letta.schemas.letta_message import ToolReturnMessage
 from letta.schemas.tool import Tool, ToolCreate, ToolRunFromSource, ToolUpdate
 from letta.server.rest_api.utils import get_letta_server
 from letta.server.server import SyncServer
+from letta.settings import tool_settings
 
 router = APIRouter(prefix="/tools", tags=["tools"])
 
@@ -28,7 +29,7 @@ logger = get_logger(__name__)
 
 
 @router.delete("/{tool_id}", operation_id="delete_tool")
-def delete_tool(
+async def delete_tool(
     tool_id: str,
     server: SyncServer = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -36,12 +37,29 @@ def delete_tool(
     """
     Delete a tool by name
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    server.tool_manager.delete_tool_by_id(tool_id=tool_id, actor=actor)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+    await server.tool_manager.delete_tool_by_id_async(tool_id=tool_id, actor=actor)
+
+
+@router.get("/count", response_model=int, operation_id="count_tools")
+async def count_tools(
+    server: SyncServer = Depends(get_letta_server),
+    actor_id: Optional[str] = Header(None, alias="user_id"),
+    include_base_tools: Optional[bool] = Query(False, description="Include built-in Letta tools in the count"),
+):
+    """
+    Get a count of all tools available to agents belonging to the org of the user.
+    """
+    try:
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+        return await server.tool_manager.size_async(actor=actor, include_base_tools=include_base_tools)
+    except Exception as e:
+        print(f"Error occurred: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/{tool_id}", response_model=Tool, operation_id="retrieve_tool")
-def retrieve_tool(
+async def retrieve_tool(
     tool_id: str,
     server: SyncServer = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -49,8 +67,8 @@ def retrieve_tool(
     """
     Get a tool by ID
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    tool = server.tool_manager.get_tool_by_id(tool_id=tool_id, actor=actor)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+    tool = await server.tool_manager.get_tool_by_id_async(tool_id=tool_id, actor=actor)
     if tool is None:
         # return 404 error
         raise HTTPException(status_code=404, detail=f"Tool with id {tool_id} not found.")
@@ -58,7 +76,7 @@ def retrieve_tool(
 
 
 @router.get("/", response_model=List[Tool], operation_id="list_tools")
-def list_tools(
+async def list_tools(
     after: Optional[str] = None,
     limit: Optional[int] = 50,
     name: Optional[str] = None,
@@ -69,11 +87,11 @@ def list_tools(
     Get a list of all tools available to agents belonging to the org of the user
     """
     try:
-        actor = server.user_manager.get_user_or_default(user_id=actor_id)
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
         if name is not None:
-            tool = server.tool_manager.get_tool_by_name(tool_name=name, actor=actor)
+            tool = await server.tool_manager.get_tool_by_name_async(tool_name=name, actor=actor)
             return [tool] if tool else []
-        return server.tool_manager.list_tools(actor=actor, after=after, limit=limit)
+        return await server.tool_manager.list_tools_async(actor=actor, after=after, limit=limit)
     except Exception as e:
         # Log or print the full exception here for debugging
         print(f"Error occurred: {e}")
@@ -96,7 +114,7 @@ def count_tools(
 
 
 @router.post("/", response_model=Tool, operation_id="create_tool")
-def create_tool(
+async def create_tool(
     request: ToolCreate = Body(...),
     server: SyncServer = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -105,9 +123,9 @@ def create_tool(
     Create a new tool
     """
     try:
-        actor = server.user_manager.get_user_or_default(user_id=actor_id)
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
         tool = Tool(**request.model_dump())
-        return server.tool_manager.create_tool(pydantic_tool=tool, actor=actor)
+        return await server.tool_manager.create_tool_async(pydantic_tool=tool, actor=actor)
     except UniqueConstraintViolationError as e:
         # Log or print the full exception here for debugging
         print(f"Error occurred: {e}")
@@ -128,7 +146,7 @@ def create_tool(
 
 
 @router.put("/", response_model=Tool, operation_id="upsert_tool")
-def upsert_tool(
+async def upsert_tool(
     request: ToolCreate = Body(...),
     server: SyncServer = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),
@@ -137,8 +155,8 @@ def upsert_tool(
     Create or update a tool
     """
     try:
-        actor = server.user_manager.get_user_or_default(user_id=actor_id)
-        tool = server.tool_manager.create_or_update_tool(pydantic_tool=Tool(**request.model_dump()), actor=actor)
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+        tool = await server.tool_manager.create_or_update_tool_async(pydantic_tool=Tool(**request.model_dump()), actor=actor)
         return tool
     except UniqueConstraintViolationError as e:
         # Log the error and raise a conflict exception
@@ -155,7 +173,7 @@ def upsert_tool(
 
 
 @router.patch("/{tool_id}", response_model=Tool, operation_id="modify_tool")
-def modify_tool(
+async def modify_tool(
     tool_id: str,
     request: ToolUpdate = Body(...),
     server: SyncServer = Depends(get_letta_server),
@@ -165,8 +183,8 @@ def modify_tool(
     Update an existing tool
     """
     try:
-        actor = server.user_manager.get_user_or_default(user_id=actor_id)
-        return server.tool_manager.update_tool_by_id(tool_id=tool_id, tool_update=request, actor=actor)
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+        return await server.tool_manager.update_tool_by_id_async(tool_id=tool_id, tool_update=request, actor=actor)
     except LettaToolCreateError as e:
         # HTTP 400 == Bad Request
         print(f"Error occurred during tool update: {e}")
@@ -178,19 +196,19 @@ def modify_tool(
 
 
 @router.post("/add-base-tools", response_model=List[Tool], operation_id="add_base_tools")
-def upsert_base_tools(
+async def upsert_base_tools(
     server: SyncServer = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
 ):
     """
     Upsert base tools
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    return server.tool_manager.upsert_base_tools(actor=actor)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+    return await server.tool_manager.upsert_base_tools_async(actor=actor)
 
 
 @router.post("/run", response_model=ToolReturnMessage, operation_id="run_tool_from_source")
-def run_tool_from_source(
+async def run_tool_from_source(
     server: SyncServer = Depends(get_letta_server),
     request: ToolRunFromSource = Body(...),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -198,10 +216,10 @@ def run_tool_from_source(
     """
     Attempt to build a tool from source, then run it on the provided arguments
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
 
     try:
-        return server.run_tool_from_source(
+        return await server.run_tool_from_source(
             tool_source=request.source_code,
             tool_source_type=request.source_type,
             tool_args=request.args,
@@ -262,7 +280,7 @@ def list_composio_actions_by_app(
 
 
 @router.post("/composio/{composio_action_name}", response_model=Tool, operation_id="add_composio_tool")
-def add_composio_tool(
+async def add_composio_tool(
     composio_action_name: str,
     server: SyncServer = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),
@@ -270,11 +288,11 @@ def add_composio_tool(
     """
     Add a new Composio tool by action name (Composio refers to each tool as an `Action`)
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
 
     try:
         tool_create = ToolCreate.from_composio(action_name=composio_action_name)
-        return server.tool_manager.create_or_update_composio_tool(tool_create=tool_create, actor=actor)
+        return await server.tool_manager.create_or_update_composio_tool_async(tool_create=tool_create, actor=actor)
     except ConnectedAccountNotFoundError as e:
         raise HTTPException(
             status_code=400,  # Bad Request
@@ -351,18 +369,22 @@ def add_composio_tool(
 
 # Specific routes for MCP
 @router.get("/mcp/servers", response_model=dict[str, Union[SSEServerConfig, StdioServerConfig]], operation_id="list_mcp_servers")
-def list_mcp_servers(server: SyncServer = Depends(get_letta_server), user_id: Optional[str] = Header(None, alias="user_id")):
+async def list_mcp_servers(server: SyncServer = Depends(get_letta_server), user_id: Optional[str] = Header(None, alias="user_id")):
     """
     Get a list of all configured MCP servers
     """
-    actor = server.user_manager.get_user_or_default(user_id=user_id)
-    return server.get_mcp_servers()
+    if tool_settings.mcp_read_from_config:
+        return server.get_mcp_servers()
+    else:
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=user_id)
+        mcp_servers = await server.mcp_manager.list_mcp_servers(actor=actor)
+        return {server.server_name: server.to_config() for server in mcp_servers}
 
 
 # NOTE: async because the MCP client/session calls are async
 # TODO: should we make the return type MCPTool, not Tool (since we don't have ID)?
 @router.get("/mcp/servers/{mcp_server_name}/tools", response_model=List[MCPTool], operation_id="list_mcp_tools_by_server")
-def list_mcp_tools_by_server(
+async def list_mcp_tools_by_server(
     mcp_server_name: str,
     server: SyncServer = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),
@@ -370,32 +392,36 @@ def list_mcp_tools_by_server(
     """
     Get a list of all tools for a specific MCP server
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    try:
-        return server.get_tools_from_mcp_server(mcp_server_name=mcp_server_name)
-    except ValueError as e:
-        # ValueError means that the MCP server name doesn't exist
-        raise HTTPException(
-            status_code=400,  # Bad Request
-            detail={
-                "code": "MCPServerNotFoundError",
-                "message": str(e),
-                "mcp_server_name": mcp_server_name,
-            },
-        )
-    except MCPTimeoutError as e:
-        raise HTTPException(
-            status_code=408,  # Timeout
-            detail={
-                "code": "MCPTimeoutError",
-                "message": str(e),
-                "mcp_server_name": mcp_server_name,
-            },
-        )
+    if tool_settings.mcp_read_from_config:
+        try:
+            return await server.get_tools_from_mcp_server(mcp_server_name=mcp_server_name)
+        except ValueError as e:
+            # ValueError means that the MCP server name doesn't exist
+            raise HTTPException(
+                status_code=400,  # Bad Request
+                detail={
+                    "code": "MCPServerNotFoundError",
+                    "message": str(e),
+                    "mcp_server_name": mcp_server_name,
+                },
+            )
+        except MCPTimeoutError as e:
+            raise HTTPException(
+                status_code=408,  # Timeout
+                detail={
+                    "code": "MCPTimeoutError",
+                    "message": str(e),
+                    "mcp_server_name": mcp_server_name,
+                },
+            )
+    else:
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+        mcp_tools = await server.mcp_manager.list_mcp_server_tools(mcp_server_name=mcp_server_name, actor=actor)
+        return mcp_tools
 
 
 @router.post("/mcp/servers/{mcp_server_name}/{mcp_tool_name}", response_model=Tool, operation_id="add_mcp_tool")
-def add_mcp_tool(
+async def add_mcp_tool(
     mcp_server_name: str,
     mcp_tool_name: str,
     server: SyncServer = Depends(get_letta_server),
@@ -406,50 +432,55 @@ def add_mcp_tool(
     """
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
 
-    try:
-        available_tools = server.get_tools_from_mcp_server(mcp_server_name=mcp_server_name)
-    except ValueError as e:
-        # ValueError means that the MCP server name doesn't exist
-        raise HTTPException(
-            status_code=400,  # Bad Request
-            detail={
-                "code": "MCPServerNotFoundError",
-                "message": str(e),
-                "mcp_server_name": mcp_server_name,
-            },
-        )
-    except MCPTimeoutError as e:
-        raise HTTPException(
-            status_code=408,  # Timeout
-            detail={
-                "code": "MCPTimeoutError",
-                "message": str(e),
-                "mcp_server_name": mcp_server_name,
-            },
-        )
+    if tool_settings.mcp_read_from_config:
 
-    # See if the tool is in the available list
-    mcp_tool = None
-    for tool in available_tools:
-        if tool.name == mcp_tool_name:
-            mcp_tool = tool
-            break
-    if not mcp_tool:
-        raise HTTPException(
-            status_code=400,  # Bad Request
-            detail={
-                "code": "MCPToolNotFoundError",
-                "message": f"Tool {mcp_tool_name} not found in MCP server {mcp_server_name} - available tools: {', '.join([tool.name for tool in available_tools])}",
-                "mcp_tool_name": mcp_tool_name,
-            },
-        )
+        try:
+            available_tools = await server.get_tools_from_mcp_server(mcp_server_name=mcp_server_name)
+        except ValueError as e:
+            # ValueError means that the MCP server name doesn't exist
+            raise HTTPException(
+                status_code=400,  # Bad Request
+                detail={
+                    "code": "MCPServerNotFoundError",
+                    "message": str(e),
+                    "mcp_server_name": mcp_server_name,
+                },
+            )
+        except MCPTimeoutError as e:
+            raise HTTPException(
+                status_code=408,  # Timeout
+                detail={
+                    "code": "MCPTimeoutError",
+                    "message": str(e),
+                    "mcp_server_name": mcp_server_name,
+                },
+            )
 
-    tool_create = ToolCreate.from_mcp(mcp_server_name=mcp_server_name, mcp_tool=mcp_tool)
-    return server.tool_manager.create_or_update_mcp_tool(tool_create=tool_create, mcp_server_name=mcp_server_name, actor=actor)
+        # See if the tool is in the available list
+        mcp_tool = None
+        for tool in available_tools:
+            if tool.name == mcp_tool_name:
+                mcp_tool = tool
+                break
+        if not mcp_tool:
+            raise HTTPException(
+                status_code=400,  # Bad Request
+                detail={
+                    "code": "MCPToolNotFoundError",
+                    "message": f"Tool {mcp_tool_name} not found in MCP server {mcp_server_name} - available tools: {', '.join([tool.name for tool in available_tools])}",
+                    "mcp_tool_name": mcp_tool_name,
+                },
+            )
+
+        tool_create = ToolCreate.from_mcp(mcp_server_name=mcp_server_name, mcp_tool=mcp_tool)
+        return await server.tool_manager.create_mcp_tool_async(tool_create=tool_create, mcp_server_name=mcp_server_name, actor=actor)
+
+    else:
+        return await server.mcp_manager.add_tool_from_mcp_server(mcp_server_name=mcp_server_name, mcp_tool_name=mcp_tool_name, actor=actor)
 
 
 @router.put("/mcp/servers", response_model=List[Union[StdioServerConfig, SSEServerConfig]], operation_id="add_mcp_server")
-def add_mcp_server_to_config(
+async def add_mcp_server_to_config(
     request: Union[StdioServerConfig, SSEServerConfig] = Body(...),
     server: SyncServer = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),
@@ -457,14 +488,35 @@ def add_mcp_server_to_config(
     """
     Add a new MCP server to the Letta MCP server config
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    return server.add_mcp_server_to_config(server_config=request, allow_upsert=True)
+
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+
+    if tool_settings.mcp_read_from_config:
+        # write to config file
+        return await server.add_mcp_server_to_config(server_config=request, allow_upsert=True)
+    else:
+        # log to DB
+        from letta.schemas.mcp import MCPServer
+
+        if isinstance(request, StdioServerConfig):
+            mapped_request = MCPServer(server_name=request.server_name, server_type=request.type, stdio_config=request)
+            # don't allow stdio servers
+            if tool_settings.mcp_disable_stdio:  # protected server
+                raise HTTPException(status_code=400, detail="StdioServerConfig is not supported")
+        elif isinstance(request, SSEServerConfig):
+            mapped_request = MCPServer(server_name=request.server_name, server_type=request.type, server_url=request.server_url)
+        # TODO: add HTTP streaming
+        mcp_server = await server.mcp_manager.create_or_update_mcp_server(mapped_request, actor=actor)
+
+        # TODO: don't do this in the future (just return MCPServer)
+        all_servers = await server.mcp_manager.list_mcp_servers(actor=actor)
+        return [server.to_config() for server in all_servers]
 
 
 @router.delete(
     "/mcp/servers/{mcp_server_name}", response_model=List[Union[StdioServerConfig, SSEServerConfig]], operation_id="delete_mcp_server"
 )
-def delete_mcp_server_from_config(
+async def delete_mcp_server_from_config(
     mcp_server_name: str,
     server: SyncServer = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),
@@ -472,5 +524,15 @@ def delete_mcp_server_from_config(
     """
     Add a new MCP server to the Letta MCP server config
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    return server.delete_mcp_server_from_config(server_name=mcp_server_name)
+    if tool_settings.mcp_read_from_config:
+        # write to config file
+        return server.delete_mcp_server_from_config(server_name=mcp_server_name)
+    else:
+        # log to DB
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+        mcp_server_id = await server.mcp_manager.get_mcp_server_id_by_name(mcp_server_name, actor)
+        await server.mcp_manager.delete_mcp_server_by_id(mcp_server_id, actor=actor)
+
+        # TODO: don't do this in the future (just return MCPServer)
+        all_servers = await server.mcp_manager.list_mcp_servers(actor=actor)
+        return [server.to_config() for server in all_servers]

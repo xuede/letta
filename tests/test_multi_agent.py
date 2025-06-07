@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import delete
 
 from letta.config import LettaConfig
-from letta.orm import Provider, Step
+from letta.orm import Provider, ProviderTrace, Step
 from letta.schemas.agent import CreateAgent
 from letta.schemas.block import CreateBlock
 from letta.schemas.group import (
@@ -15,6 +15,7 @@ from letta.schemas.group import (
     SupervisorManager,
 )
 from letta.schemas.message import MessageCreate
+from letta.server.db import db_registry
 from letta.server.server import SyncServer
 
 
@@ -36,7 +37,8 @@ def org_id(server):
     yield org.id
 
     # cleanup
-    with server.organization_manager.session_maker() as session:
+    with db_registry.session() as session:
+        session.execute(delete(ProviderTrace))
         session.execute(delete(Step))
         session.execute(delete(Provider))
         session.commit()
@@ -145,7 +147,7 @@ def manager_agent(server, actor):
     server.agent_manager.delete_agent(agent_scooby.id, actor=actor)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_empty_group(server, actor):
     group = server.group_manager.create_group(
         group=GroupCreate(
@@ -170,7 +172,7 @@ async def test_empty_group(server, actor):
     server.group_manager.delete_group(group_id=group.id, actor=actor)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_modify_group_pattern(server, actor, participant_agents, manager_agent):
     group = server.group_manager.create_group(
         group=GroupCreate(
@@ -180,7 +182,7 @@ async def test_modify_group_pattern(server, actor, participant_agents, manager_a
         actor=actor,
     )
     with pytest.raises(ValueError, match="Cannot change group pattern"):
-        server.group_manager.modify_group(
+        await server.group_manager.modify_group_async(
             group_id=group.id,
             group_update=GroupUpdate(
                 manager_config=DynamicManagerUpdate(
@@ -194,7 +196,7 @@ async def test_modify_group_pattern(server, actor, participant_agents, manager_a
     server.group_manager.delete_group(group_id=group.id, actor=actor)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_list_agent_groups(server, actor, participant_agents):
     group_a = server.group_manager.create_group(
         group=GroupCreate(
@@ -220,7 +222,7 @@ async def test_list_agent_groups(server, actor, participant_agents):
     server.group_manager.delete_group(group_id=group_b.id, actor=actor)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_round_robin(server, actor, participant_agents):
     description = (
         "This is a group chat between best friends all like to hang out together. In their free time they like to solve mysteries."
@@ -237,7 +239,7 @@ async def test_round_robin(server, actor, participant_agents):
     assert group.manager_type == ManagerType.round_robin
     assert group.description == description
     assert group.agent_ids == [agent.id for agent in participant_agents]
-    assert group.max_turns == None
+    assert group.max_turns is None
     assert group.manager_agent_id is None
     assert group.termination_token is None
 
@@ -279,7 +281,7 @@ async def test_round_robin(server, actor, participant_agents):
         assert len(messages) == (len(group.agent_ids) + 2) * len(group.agent_ids)
 
         max_turns = 3
-        group = server.group_manager.modify_group(
+        group = await server.group_manager.modify_group_async(
             group_id=group.id,
             group_update=GroupUpdate(
                 agent_ids=[agent.id for agent in participant_agents][::-1],
@@ -332,7 +334,7 @@ async def test_round_robin(server, actor, participant_agents):
         server.group_manager.delete_group(group_id=group.id, actor=actor)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_supervisor(server, actor, participant_agents):
     agent_scrappy = server.create_agent(
         request=CreateAgent(
@@ -396,7 +398,7 @@ async def test_supervisor(server, actor, participant_agents):
         server.agent_manager.delete_agent(agent_id=agent_scrappy.id, actor=actor)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_dynamic_group_chat(server, actor, manager_agent, participant_agents):
     description = (
         "This is a group chat between best friends all like to hang out together. In their free time they like to solve mysteries."

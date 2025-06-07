@@ -1,13 +1,14 @@
 from enum import Enum
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from letta.constants import CORE_MEMORY_LINE_NUMBER_WARNING, DEFAULT_EMBEDDING_CHUNK_SIZE
 from letta.helpers import ToolRulesSolver
 from letta.schemas.block import CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.environment_variables import AgentEnvironmentVariable
+from letta.schemas.file import FileStatus
 from letta.schemas.group import Group
 from letta.schemas.letta_base import OrmMetadataBase
 from letta.schemas.llm_config import LLMConfig
@@ -27,8 +28,11 @@ class AgentType(str, Enum):
     """
 
     memgpt_agent = "memgpt_agent"
+    memgpt_v2_agent = "memgpt_v2_agent"
     split_thread_agent = "split_thread_agent"
     sleeptime_agent = "sleeptime_agent"
+    voice_convo_agent = "voice_convo_agent"
+    voice_sleeptime_agent = "voice_sleeptime_agent"
 
 
 class AgentState(OrmMetadataBase, validate_assignment=True):
@@ -54,7 +58,6 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     name: str = Field(..., description="The name of the agent.")
     # tool rules
     tool_rules: Optional[List[ToolRule]] = Field(default=None, description="The list of tool rules.")
-
     # in-context memory
     message_ids: Optional[List[str]] = Field(default=None, description="The ids of the messages in the agent's in-context memory.")
 
@@ -230,6 +233,17 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
 
         return embedding
 
+    @model_validator(mode="after")
+    def validate_sleeptime_for_agent_type(self) -> "CreateAgent":
+        """Validate that enable_sleeptime is True when agent_type is a specific value"""
+        AGENT_TYPES_REQUIRING_SLEEPTIME = {AgentType.voice_convo_agent}
+
+        if self.agent_type in AGENT_TYPES_REQUIRING_SLEEPTIME:
+            if not self.enable_sleeptime:
+                raise ValueError(f"Agent type {self.agent_type} requires enable_sleeptime to be True")
+
+        return self
+
 
 class UpdateAgent(BaseModel):
     name: Optional[str] = Field(None, description="The name of the agent.")
@@ -286,23 +300,96 @@ class AgentStepState(BaseModel):
 
 
 def get_prompt_template_for_agent_type(agent_type: Optional[AgentType] = None):
-    if agent_type == AgentType.sleeptime_agent:
+
+    # Sleeptime agents use the MemGPT v2 memory tools (line numbers)
+    # MemGPT v2 tools use line-number, so core memory blocks should have line numbers
+    if agent_type == AgentType.sleeptime_agent or agent_type == AgentType.memgpt_v2_agent:
         return (
+            "<memory_blocks>\nThe following memory blocks are currently engaged in your core memory unit:\n\n"
             "{% for block in blocks %}"
-            '<{{ block.label }} characters="{{ block.value|length }}/{{ block.limit }}">\n'
-            f"{CORE_MEMORY_LINE_NUMBER_WARNING}"
+            "<{{ block.label }}>\n"
+            "<description>\n"
+            "{{ block.description }}\n"
+            "</description>\n"
+            "<metadata>"
+            "{% if block.read_only %}\n- read_only=true{% endif %}\n"
+            "- chars_current={{ block.value|length }}\n"
+            "- chars_limit={{ block.limit }}\n"
+            "</metadata>\n"
+            "<value>\n"
+            f"{CORE_MEMORY_LINE_NUMBER_WARNING}\n"
             "{% for line in block.value.split('\\n') %}"
             "Line {{ loop.index }}: {{ line }}\n"
             "{% endfor %}"
-            "</{{ block.label }}>"
+            "</value>\n"
+            "</{{ block.label }}>\n"
             "{% if not loop.last %}\n{% endif %}"
             "{% endfor %}"
+            "\n</memory_blocks>"
+            "<files>\nThe following memory files are currently accessible:\n\n"
+            "{% for block in file_blocks %}"
+            f"<file status=\"{{{{ '{FileStatus.open.value}' if block.value else '{FileStatus.closed.value}' }}}}\">\n"
+            "<{{ block.label }}>\n"
+            "<description>\n"
+            "{{ block.description }}\n"
+            "</description>\n"
+            "<metadata>"
+            "{% if block.read_only %}\n- read_only=true{% endif %}\n"
+            "- chars_current={{ block.value|length }}\n"
+            "- chars_limit={{ block.limit }}\n"
+            "</metadata>\n"
+            "<value>\n"
+            f"{CORE_MEMORY_LINE_NUMBER_WARNING}\n"
+            "{% for line in block.value.split('\\n') %}"
+            "Line {{ loop.index }}: {{ line }}\n"
+            "{% endfor %}"
+            "</value>\n"
+            "</{{ block.label }}>\n"
+            "</file>\n"
+            "{% if not loop.last %}\n{% endif %}"
+            "{% endfor %}"
+            "\n</files>"
         )
-    return (
-        "{% for block in blocks %}"
-        '<{{ block.label }} characters="{{ block.value|length }}/{{ block.limit }}">\n'
-        "{{ block.value }}\n"
-        "</{{ block.label }}>"
-        "{% if not loop.last %}\n{% endif %}"
-        "{% endfor %}"
-    )
+
+    # Default setup (MemGPT), no line numbers
+    else:
+        return (
+            "<memory_blocks>\nThe following memory blocks are currently engaged in your core memory unit:\n\n"
+            "{% for block in blocks %}"
+            "<{{ block.label }}>\n"
+            "<description>\n"
+            "{{ block.description }}\n"
+            "</description>\n"
+            "<metadata>"
+            "{% if block.read_only %}\n- read_only=true{% endif %}\n"
+            "- chars_current={{ block.value|length }}\n"
+            "- chars_limit={{ block.limit }}\n"
+            "</metadata>\n"
+            "<value>\n"
+            "{{ block.value }}\n"
+            "</value>\n"
+            "</{{ block.label }}>\n"
+            "{% if not loop.last %}\n{% endif %}"
+            "{% endfor %}"
+            "\n</memory_blocks>"
+            "<files>\nThe following memory files are currently accessible:\n\n"
+            "{% for block in file_blocks %}"
+            f"<file status=\"{{{{ '{FileStatus.open.value}' if block.value else '{FileStatus.closed.value}' }}}}\">\n"
+            "<{{ block.label }}>\n"
+            "<description>\n"
+            "{{ block.description }}\n"
+            "</description>\n"
+            "<metadata>"
+            "{% if block.read_only %}\n- read_only=true{% endif %}\n"
+            "- chars_current={{ block.value|length }}\n"
+            "- chars_limit={{ block.limit }}\n"
+            "</metadata>\n"
+            "<value>\n"
+            "{{ block.value }}\n"
+            "</value>\n"
+            "</{{ block.label }}>\n"
+            "</file>\n"
+            "{% if not loop.last %}\n{% endif %}"
+            "{% endfor %}"
+            "\n</files>"
+        )

@@ -5,18 +5,16 @@ from pydantic import Field, model_validator
 from letta.constants import (
     COMPOSIO_TOOL_TAG_NAME,
     FUNCTION_RETURN_CHAR_LIMIT,
+    LETTA_BUILTIN_TOOL_MODULE_NAME,
     LETTA_CORE_TOOL_MODULE_NAME,
+    LETTA_FILES_TOOL_MODULE_NAME,
     LETTA_MULTI_AGENT_TOOL_MODULE_NAME,
+    LETTA_VOICE_TOOL_MODULE_NAME,
     MCP_TOOL_TAG_NAME_PREFIX,
 )
-from letta.functions.ast_parsers import get_function_name_and_description
+from letta.functions.ast_parsers import get_function_name_and_docstring
+from letta.functions.composio_helpers import generate_composio_tool_wrapper
 from letta.functions.functions import derive_openai_json_schema, get_json_schema_from_module
-from letta.functions.helpers import (
-    generate_composio_tool_wrapper,
-    generate_langchain_tool_wrapper,
-    generate_mcp_tool_wrapper,
-    generate_model_from_args_json_schema,
-)
 from letta.functions.mcp_client.types import MCPTool
 from letta.functions.schema_generator import (
     generate_schema_from_args_schema_v2,
@@ -73,40 +71,48 @@ class Tool(BaseTool):
         """
         Refresh name, description, source_code, and json_schema.
         """
-        if self.tool_type == ToolType.CUSTOM:
-            # If it's a custom tool, we need to ensure source_code is present
+        from letta.functions.helpers import generate_model_from_args_json_schema
+
+        if self.tool_type is ToolType.CUSTOM:
             if not self.source_code:
                 error_msg = f"Custom tool with id={self.id} is missing source_code field."
                 logger.error(error_msg)
                 raise ValueError(error_msg)
 
             # Always derive json_schema for freshest possible json_schema
-            # TODO: Instead of checking the tag, we should having `COMPOSIO` as a specific ToolType
-            # TODO: We skip this for Composio bc composio json schemas are derived differently
-            if not (COMPOSIO_TOOL_TAG_NAME in self.tags):
-                if self.args_json_schema is not None:
-                    name, description = get_function_name_and_description(self.source_code, self.name)
-                    args_schema = generate_model_from_args_json_schema(self.args_json_schema)
-                    self.json_schema = generate_schema_from_args_schema_v2(
-                        args_schema=args_schema,
-                        name=name,
-                        description=description,
-                    )
-                else:
-                    try:
-                        self.json_schema = derive_openai_json_schema(source_code=self.source_code)
-                    except Exception as e:
-                        error_msg = f"Failed to derive json schema for tool with id={self.id} name={self.name}. Error: {str(e)}"
-                        logger.error(error_msg)
-        elif self.tool_type in {ToolType.LETTA_CORE, ToolType.LETTA_MEMORY_CORE}:
+            if self.args_json_schema is not None:
+                name, description = get_function_name_and_docstring(self.source_code, self.name)
+                args_schema = generate_model_from_args_json_schema(self.args_json_schema)
+                self.json_schema = generate_schema_from_args_schema_v2(
+                    args_schema=args_schema,
+                    name=name,
+                    description=description,
+                    append_heartbeat=False,
+                )
+            else:
+                try:
+                    self.json_schema = derive_openai_json_schema(source_code=self.source_code)
+                except Exception as e:
+                    error_msg = f"Failed to derive json schema for tool with id={self.id} name={self.name}. Error: {str(e)}"
+                    logger.error(error_msg)
+        elif self.tool_type in {ToolType.LETTA_CORE, ToolType.LETTA_MEMORY_CORE, ToolType.LETTA_SLEEPTIME_CORE}:
             # If it's letta core tool, we generate the json_schema on the fly here
             self.json_schema = get_json_schema_from_module(module_name=LETTA_CORE_TOOL_MODULE_NAME, function_name=self.name)
         elif self.tool_type in {ToolType.LETTA_MULTI_AGENT_CORE}:
             # If it's letta multi-agent tool, we also generate the json_schema on the fly here
             self.json_schema = get_json_schema_from_module(module_name=LETTA_MULTI_AGENT_TOOL_MODULE_NAME, function_name=self.name)
-        elif self.tool_type in {ToolType.LETTA_SLEEPTIME_CORE}:
-            # If it's letta sleeptime core tool, we generate the json_schema on the fly here
-            self.json_schema = get_json_schema_from_module(module_name=LETTA_CORE_TOOL_MODULE_NAME, function_name=self.name)
+        elif self.tool_type in {ToolType.LETTA_VOICE_SLEEPTIME_CORE}:
+            # If it's letta voice tool, we generate the json_schema on the fly here
+            self.json_schema = get_json_schema_from_module(module_name=LETTA_VOICE_TOOL_MODULE_NAME, function_name=self.name)
+        elif self.tool_type in {ToolType.LETTA_BUILTIN}:
+            # If it's letta voice tool, we generate the json_schema on the fly here
+            self.json_schema = get_json_schema_from_module(module_name=LETTA_BUILTIN_TOOL_MODULE_NAME, function_name=self.name)
+        elif self.tool_type in {ToolType.LETTA_FILES_CORE}:
+            # If it's letta files tool, we generate the json_schema on the fly here
+            self.json_schema = get_json_schema_from_module(module_name=LETTA_FILES_TOOL_MODULE_NAME, function_name=self.name)
+        elif self.tool_type in {ToolType.EXTERNAL_COMPOSIO}:
+            # Composio schemas handled separately
+            pass
 
         # At this point, we need to validate that at least json_schema is populated
         if not self.json_schema:
@@ -145,6 +151,8 @@ class ToolCreate(LettaBase):
 
     @classmethod
     def from_mcp(cls, mcp_server_name: str, mcp_tool: MCPTool) -> "ToolCreate":
+        from letta.functions.helpers import generate_mcp_tool_wrapper
+
         # Pass the MCP tool to the schema generator
         json_schema = generate_tool_schema_for_mcp(mcp_tool=mcp_tool)
 
@@ -175,8 +183,7 @@ class ToolCreate(LettaBase):
         Returns:
             Tool: A Letta Tool initialized with attributes derived from the Composio tool.
         """
-        from composio import LogLevel
-        from composio_langchain import ComposioToolSet
+        from composio import ComposioToolSet, LogLevel
 
         composio_toolset = ComposioToolSet(logging_level=LogLevel.ERROR, lock=False)
         composio_action_schemas = composio_toolset.get_action_schemas(actions=[action_name], check_connected_accounts=False)
@@ -218,6 +225,8 @@ class ToolCreate(LettaBase):
         Returns:
             Tool: A Letta Tool initialized with attributes derived from the provided LangChain BaseTool object.
         """
+        from letta.functions.helpers import generate_langchain_tool_wrapper
+
         description = langchain_tool.description
         source_type = "python"
         tags = ["langchain"]

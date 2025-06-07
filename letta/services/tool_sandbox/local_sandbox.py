@@ -1,9 +1,14 @@
 import asyncio
+import hashlib
 import os
+import struct
 import sys
 import tempfile
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
+from pydantic.config import JsonDict
+
+from letta.otel.tracing import log_event, trace_method
 from letta.schemas.agent import AgentState
 from letta.schemas.sandbox_config import SandboxConfig, SandboxType
 from letta.schemas.tool import Tool
@@ -13,10 +18,10 @@ from letta.services.helpers.tool_execution_helper import (
     find_python_executable,
     install_pip_requirements_for_sandbox,
 )
+from letta.services.helpers.tool_parser_helper import parse_stdout_best_effort
 from letta.services.tool_sandbox.base import AsyncToolSandboxBase
 from letta.settings import tool_settings
-from letta.tracing import log_event, trace_method
-from letta.utils import get_friendly_error_msg
+from letta.utils import get_friendly_error_msg, parse_stderr_error_msg
 
 
 class AsyncToolSandboxLocal(AsyncToolSandboxBase):
@@ -26,7 +31,7 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
     def __init__(
         self,
         tool_name: str,
-        args: dict,
+        args: JsonDict,
         user,
         force_recreate_venv=False,
         tool_object: Optional[Tool] = None,
@@ -60,23 +65,27 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
         additional_env_vars: Optional[Dict],
     ) -> ToolExecutionResult:
         """
-        Unified asynchronougit pus method to run the tool in a local sandbox environment,
+        Unified asynchronous method to run the tool in a local sandbox environment,
         always via subprocess for multi-core parallelism.
         """
         # Get sandbox configuration
         if self.provided_sandbox_config:
             sbx_config = self.provided_sandbox_config
         else:
-            sbx_config = self.sandbox_config_manager.get_or_create_default_sandbox_config(sandbox_type=SandboxType.LOCAL, actor=self.user)
+            sbx_config = await self.sandbox_config_manager.get_or_create_default_sandbox_config_async(
+                sandbox_type=SandboxType.LOCAL, actor=self.user
+            )
         local_configs = sbx_config.get_local_config()
-        force_create_venv = local_configs.force_create_venv
+        use_venv = local_configs.use_venv
 
         # Prepare environment variables
         env = os.environ.copy()
         if self.provided_sandbox_env_vars:
             env.update(self.provided_sandbox_env_vars)
         else:
-            env_vars = self.sandbox_config_manager.get_sandbox_env_vars_as_dict(sandbox_config_id=sbx_config.id, actor=self.user, limit=100)
+            env_vars = await self.sandbox_config_manager.get_sandbox_env_vars_as_dict_async(
+                sandbox_config_id=sbx_config.id, actor=self.user, limit=100
+            )
             env.update(env_vars)
 
         if agent_state:
@@ -92,7 +101,7 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
 
         # If using a virtual environment, ensure it's prepared in parallel
         venv_preparation_task = None
-        if force_create_venv:
+        if use_venv:
             venv_path = str(os.path.join(sandbox_dir, local_configs.venv_name))
             venv_preparation_task = asyncio.create_task(self._prepare_venv(local_configs, venv_path, env))
 
@@ -110,7 +119,7 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
 
             # Determine the python executable and environment for the subprocess
             exec_env = env.copy()
-            if force_create_venv:
+            if use_venv:
                 venv_path = str(os.path.join(sandbox_dir, local_configs.venv_name))
                 python_executable = find_python_executable(local_configs)
                 exec_env["VIRTUAL_ENV"] = venv_path
@@ -119,7 +128,15 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
                 # If not using venv, use whatever Python we are running on
                 python_executable = sys.executable
 
-            exec_env["PYTHONWARNINGS"] = "ignore"
+            # handle unwanted terminal behavior
+            exec_env.update(
+                {
+                    "PYTHONWARNINGS": "ignore",
+                    "NO_COLOR": "1",
+                    "TERM": "dumb",
+                    "PYTHONUNBUFFERED": "1",
+                }
+            )
 
             # Execute in subprocess
             return await self._execute_tool_subprocess(
@@ -135,8 +152,11 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
             print(f"Auto-generated code for debugging:\n\n{code}")
             raise e
         finally:
-            # Clean up the temp file
-            os.remove(temp_file_path)
+            # Clean up the temp file if not debugging
+            from letta.settings import settings
+
+            if not settings.debug:
+                os.remove(temp_file_path)
 
     async def _prepare_venv(self, local_configs, venv_path: str, env: Dict[str, str]):
         """
@@ -166,6 +186,7 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
         Execute user code in a subprocess, always capturing stdout and stderr.
         We parse special markers to extract the pickled result string.
         """
+        stdout_text = ""
         try:
             log_event(name="start subprocess")
 
@@ -174,7 +195,7 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
             )
 
             try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=tool_settings.local_sandbox_timeout)
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=tool_settings.tool_sandbox_timeout)
             except asyncio.TimeoutError:
                 # Terminate the process on timeout
                 if process.returncode is None:
@@ -186,13 +207,20 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
 
                 raise TimeoutError(f"Executing tool {self.tool_name} timed out after 60 seconds.")
 
-            stdout = stdout_bytes.decode("utf-8") if stdout_bytes else ""
             stderr = stderr_bytes.decode("utf-8") if stderr_bytes else ""
             log_event(name="finish subprocess")
 
             # Parse markers to isolate the function result
-            func_result, stdout_text = self.parse_out_function_results_markers(stdout)
-            func_return, agent_state = self.parse_best_effort(func_result)
+            func_result_bytes, stdout_text = self.parse_out_function_results_markers(stdout_bytes)
+            func_return, agent_state = parse_stdout_best_effort(func_result_bytes)
+
+            if process.returncode != 0 and func_return is None:
+                exception_name, msg = parse_stderr_error_msg(stderr)
+                func_return = get_friendly_error_msg(
+                    function_name=self.tool_name,
+                    exception_name=exception_name,
+                    exception_message=msg,
+                )
 
             return ToolExecutionResult(
                 func_return=func_return,
@@ -209,6 +237,8 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
                 raise e
 
             print(f"Subprocess execution for tool {self.tool_name} encountered an error: {e}")
+            print(e.__class__.__name__)
+            print(e.__traceback__)
             func_return = get_friendly_error_msg(
                 function_name=self.tool_name,
                 exception_name=type(e).__name__,
@@ -217,27 +247,32 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
             return ToolExecutionResult(
                 func_return=func_return,
                 agent_state=None,
-                stdout=[],
+                stdout=[stdout_text],
                 stderr=[str(e)],
                 status="error",
                 sandbox_config_fingerprint=sbx_config.fingerprint(),
             )
 
-    def parse_out_function_results_markers(self, text: str) -> Tuple[str, str]:
+    def parse_out_function_results_markers(self, data: bytes) -> tuple[bytes, str]:
         """
         Parse the function results out of the stdout using special markers.
-        Returns (function_result_str, stripped_stdout).
+        Returns (function_results_bytes, stripped_stdout_bytes).
         """
-        if self.LOCAL_SANDBOX_RESULT_START_MARKER not in text:
-            # No markers found, so nothing to parse
-            return "", text
+        pos = data.find(self.LOCAL_SANDBOX_RESULT_START_MARKER)
+        if pos < 0:
+            return b"", data.decode("utf-8") if data else ""
 
-        marker_len = len(self.LOCAL_SANDBOX_RESULT_START_MARKER)
-        start_index = text.index(self.LOCAL_SANDBOX_RESULT_START_MARKER) + marker_len
-        end_index = text.index(self.LOCAL_SANDBOX_RESULT_END_MARKER)
+        DATA_LENGTH_INDICATOR = 4
+        CHECKSUM_LENGTH = 32
+        pos_start = pos + len(self.LOCAL_SANDBOX_RESULT_START_MARKER)
+        checksum_start = pos_start + DATA_LENGTH_INDICATOR
+        message_start = checksum_start + CHECKSUM_LENGTH
 
-        # The actual pickled base64 is between start_index and end_index
-        results_str = text[start_index:end_index]
-        # The rest of stdout (minus the markers)
-        remainder = text[: start_index - marker_len] + text[end_index + marker_len :]
-        return results_str, remainder
+        message_len = struct.unpack(">I", data[pos_start:checksum_start])[0]
+        checksum = data[checksum_start:message_start]
+        message_data = data[message_start : message_start + message_len]
+        actual_checksum = hashlib.md5(message_data).hexdigest().encode("ascii")
+        if actual_checksum == checksum:
+            remainder = data[:pos] + data[message_start + message_len :]
+            return message_data, (remainder.decode("utf-8") if remainder else "")
+        raise Exception("Function ran, but output is corrupted.")

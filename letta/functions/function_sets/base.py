@@ -186,16 +186,6 @@ def rethink_memory(agent_state: "AgentState", new_memory: str, target_block_labe
     return None
 
 
-def finish_rethinking_memory(agent_state: "AgentState") -> None:  # type: ignore
-    """
-    This function is called when the agent is done rethinking the memory.
-
-    Returns:
-        Optional[str]: None is always returned as this function does not produce a response.
-    """
-    return None
-
-
 ## Attempted v2 of sleep-time function set, meant to work better across all types
 
 SNIPPET_LINES: int = 4
@@ -298,7 +288,9 @@ def memory_insert(agent_state: "AgentState", label: str, new_str: str, insert_li
     n_lines = len(current_value_lines)
 
     # Check if we're in range, from 0 (pre-line), to 1 (first line), to n_lines (last line)
-    if insert_line < 0 or insert_line > n_lines:
+    if insert_line == -1:
+        insert_line = n_lines
+    elif insert_line < 0 or insert_line > n_lines:
         raise ValueError(
             f"Invalid `insert_line` parameter: {insert_line}. It should be within the range of lines of the memory block: {[0, n_lines]}, or -1 to append to the end of the memory block."
         )
