@@ -1,0 +1,48 @@
+steps:
+# Install dependencies
+- name: 'gcr.io/cloud-builders/docker'
+  entrypoint: 'bash'
+  args:
+    - -c
+    - |
+      docker buildx create --use
+# Extract version from pyproject.toml
+- name: 'bash'
+  id: 'extract_version'
+  entrypoint: 'bash'
+  args:
+    - -c
+    - |
+      VERSION=$(awk -F '"' '/version =/ { print $2 }' pyproject.toml | head -n 1)
+      echo -n "$$VERSION" > /workspace/version.txt
+      echo "Extracted version: $$VERSION"
+# Login to Docker Hub
+- name: 'gcr.io/cloud-builders/docker'
+  entrypoint: 'bash'
+  args:
+    - -c
+    - |
+      echo "$$DOCKERHUB_TOKEN" | docker login --username "$$DOCKERHUB_USERNAME" --password-stdin
+  secretEnv: ['DOCKERHUB_USERNAME', 'DOCKERHUB_TOKEN']
+# Build and push multi-platform image
+- name: 'gcr.io/cloud-builders/docker'
+  entrypoint: 'bash'
+  args:
+    - -c'
+    - |
+      VERSION=$(cat /workspace/version.txt)
+      docker buildx build \
+        --platform linux/amd64,linux/arm64 \
+        --tag "letta/letta:$$VERSION" \
+        --tag "letta/letta:latest" \
+        --tag "memgpt/letta:$$VERSION" \
+        --tag "memgpt/letta:latest" \
+        --push \
+        .
+# Available Secrets
+availableSecrets:
+  secretManager:
+  - versionName: projects/$PROJECT_ID/secrets/DOCKERHUB_USERNAME/versions/latest
+    env: 'DOCKERHUB_USERNAME'
+  - versionName: projects/$PROJECT_ID/secrets/DOCKERHUB_TOKEN/versions/latest
+    env: 'DOCKERHUB_TOKEN'
