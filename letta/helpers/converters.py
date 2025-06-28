@@ -8,10 +8,11 @@ from openai.types.chat.chat_completion_message_tool_call import Function as Open
 from sqlalchemy import Dialect
 
 from letta.functions.mcp_client.types import StdioServerConfig
-from letta.schemas.agent import AgentStepState
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import ProviderType, ToolRuleType
 from letta.schemas.letta_message_content import (
+    ImageContent,
+    ImageSourceType,
     MessageContent,
     MessageContentType,
     OmittedReasoningContent,
@@ -21,6 +22,7 @@ from letta.schemas.letta_message_content import (
     ToolCallContent,
     ToolReturnContent,
 )
+from letta.schemas.llm_batch_job import AgentStepState
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import ToolReturn
 from letta.schemas.response_format import (
@@ -37,6 +39,7 @@ from letta.schemas.tool_rule import (
     InitToolRule,
     MaxCountPerStepToolRule,
     ParentToolRule,
+    RequiredBeforeExitToolRule,
     TerminalToolRule,
     ToolRule,
 )
@@ -129,6 +132,8 @@ def deserialize_tool_rule(
         return MaxCountPerStepToolRule(**data)
     elif rule_type == ToolRuleType.parent_last_tool:
         return ParentToolRule(**data)
+    elif rule_type == ToolRuleType.required_before_exit:
+        return RequiredBeforeExitToolRule(**data)
     raise ValueError(f"Unknown ToolRule type: {rule_type}")
 
 
@@ -216,12 +221,13 @@ def serialize_message_content(message_content: Optional[List[Union[MessageConten
     serialized_message_content = []
     for content in message_content:
         if isinstance(content, MessageContent):
+            if content.type == MessageContentType.image:
+                assert content.source.type == ImageSourceType.letta, f"Invalid image source type: {content.source.type}"
             serialized_message_content.append(content.model_dump(mode="json"))
         elif isinstance(content, dict):
             serialized_message_content.append(content)  # Already a dictionary, leave it as-is
         else:
             raise TypeError(f"Unexpected message content type: {type(content)}")
-
     return serialized_message_content
 
 
@@ -238,6 +244,9 @@ def deserialize_message_content(data: Optional[List[Dict]]) -> List[MessageConte
         content_type = item.get("type")
         if content_type == MessageContentType.text:
             content = TextContent(**item)
+        elif content_type == MessageContentType.image:
+            assert item["source"]["type"] == ImageSourceType.letta, f'Invalid image source type: {item["source"]["type"]}'
+            content = ImageContent(**item)
         elif content_type == MessageContentType.tool_call:
             content = ToolCallContent(**item)
         elif content_type == MessageContentType.tool_return:

@@ -11,8 +11,9 @@ from starlette import status
 import letta.constants as constants
 from letta.log import get_logger
 from letta.schemas.agent import AgentState
+from letta.schemas.embedding_config import EmbeddingConfig
+from letta.schemas.enums import FileProcessingStatus
 from letta.schemas.file import FileMetadata
-from letta.schemas.job import Job
 from letta.schemas.passage import Passage
 from letta.schemas.source import Source, SourceCreate, SourceUpdate
 from letta.schemas.user import User
@@ -21,16 +22,20 @@ from letta.server.server import SyncServer
 from letta.services.file_processor.chunker.llama_index_chunker import LlamaIndexChunker
 from letta.services.file_processor.embedder.openai_embedder import OpenAIEmbedder
 from letta.services.file_processor.file_processor import FileProcessor
+from letta.services.file_processor.file_types import (
+    get_allowed_media_types,
+    get_extension_to_mime_type_map,
+    is_simple_text_mime_type,
+    register_mime_types,
+)
 from letta.services.file_processor.parser.mistral_parser import MistralFileParser
-from letta.settings import model_settings, settings
+from letta.settings import settings
 from letta.utils import safe_create_task, sanitize_filename
 
 logger = get_logger(__name__)
 
-mimetypes.add_type("text/markdown", ".md")
-mimetypes.add_type("text/markdown", ".markdown")
-mimetypes.add_type("application/jsonl", ".jsonl")
-mimetypes.add_type("application/x-jsonlines", ".jsonl")
+# Register all supported file types with Python's mimetypes module
+register_mime_types()
 
 
 router = APIRouter(prefix="/sources", tags=["sources"])
@@ -154,7 +159,7 @@ async def delete_source(
     actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
     source = await server.source_manager.get_source_by_id(source_id=source_id, actor=actor)
     agent_states = await server.source_manager.list_attached_agents(source_id=source_id, actor=actor)
-    files = await server.source_manager.list_files(source_id, actor)
+    files = await server.file_manager.list_files(source_id, actor)
     file_ids = [f.id for f in files]
 
     for agent_state in agent_states:
@@ -169,7 +174,7 @@ async def delete_source(
     await server.delete_source(source_id=source_id, actor=actor)
 
 
-@router.post("/{source_id}/upload", response_model=Job, operation_id="upload_file_to_source")
+@router.post("/{source_id}/upload", response_model=FileMetadata, operation_id="upload_file_to_source")
 async def upload_file_to_source(
     file: UploadFile,
     source_id: str,
@@ -179,21 +184,13 @@ async def upload_file_to_source(
     """
     Upload a file to a data source.
     """
-    allowed_media_types = {
-        "application/pdf",
-        "text/plain",
-        "text/markdown",
-        "text/x-markdown",
-        "application/json",
-        "application/jsonl",
-        "application/x-jsonlines",
-    }
+    allowed_media_types = get_allowed_media_types()
 
     # Normalize incoming Content-Type header (strip charset or any parameters).
     raw_ct = file.content_type or ""
     media_type = raw_ct.split(";", 1)[0].strip().lower()
 
-    # If client didn’t supply a Content-Type or it’s not one of the allowed types,
+    # If client didn't supply a Content-Type or it's not one of the allowed types,
     #    attempt to infer from filename extension.
     if media_type not in allowed_media_types and file.filename:
         guessed, _ = mimetypes.guess_type(file.filename)
@@ -201,21 +198,18 @@ async def upload_file_to_source(
 
         if media_type not in allowed_media_types:
             ext = Path(file.filename).suffix.lower()
-            ext_map = {
-                ".pdf": "application/pdf",
-                ".txt": "text/plain",
-                ".json": "application/json",
-                ".md": "text/markdown",
-                ".markdown": "text/markdown",
-                ".jsonl": "application/jsonl",
-            }
+            ext_map = get_extension_to_mime_type_map()
             media_type = ext_map.get(ext, media_type)
 
     # If still not allowed, reject with 415.
     if media_type not in allowed_media_types:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=(f"Unsupported file type: {media_type or 'unknown'} " f"(filename: {file.filename}). Only PDF, .txt, or .json allowed."),
+            detail=(
+                f"Unsupported file type: {media_type or 'unknown'} "
+                f"(filename: {file.filename}). "
+                f"Supported types: PDF, text files (.txt, .md), JSON, and code files (.py, .js, .java, etc.)."
+            ),
         )
 
     actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
@@ -223,40 +217,50 @@ async def upload_file_to_source(
     source = await server.source_manager.get_source_by_id(source_id=source_id, actor=actor)
     if source is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Source with id={source_id} not found.")
+
     content = await file.read()
 
     # sanitize filename
     file.filename = sanitize_filename(file.filename)
 
-    # create job
-    job = Job(
-        user_id=actor.id,
-        metadata={"type": "embedding", "filename": file.filename, "source_id": source_id},
-        completed_at=None,
+    # create file metadata
+    file_metadata = FileMetadata(
+        source_id=source_id,
+        file_name=file.filename,
+        file_path=None,
+        file_type=mimetypes.guess_type(file.filename)[0] or file.content_type or "unknown",
+        file_size=file.size if file.size is not None else None,
+        processing_status=FileProcessingStatus.PARSING,
     )
-    job = await server.job_manager.create_job_async(job, actor=actor)
+    file_metadata = await server.file_manager.create_file(file_metadata, actor=actor)
 
     # TODO: Do we need to pull in the full agent_states? Can probably simplify here right?
     agent_states = await server.source_manager.list_attached_agents(source_id=source_id, actor=actor)
 
     # NEW: Cloud based file processing
-    if settings.mistral_api_key and model_settings.openai_api_key:
-        logger.info("Running experimental cloud based file processing...")
-        safe_create_task(
-            load_file_to_source_cloud(server, agent_states, content, file, job, source_id, actor),
-            logger=logger,
-            label="file_processor.process",
+    # Determine file's MIME type
+    file_mime_type = mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
+
+    # Check if it's a simple text file
+    is_simple_file = is_simple_text_mime_type(file_mime_type)
+
+    # For complex files, require Mistral API key
+    if not is_simple_file and not settings.mistral_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Mistral API key is required to process this file type {file_mime_type}. Please configure your Mistral API key to upload complex file formats.",
         )
-    else:
-        # create background tasks
-        safe_create_task(
-            load_file_to_source_async(server, source_id=source.id, filename=file.filename, job_id=job.id, bytes=content, actor=actor),
-            logger=logger,
-            label="load_file_to_source_async",
-        )
+
+    # Use cloud processing for all files (simple files always, complex files with Mistral key)
+    logger.info("Running experimental cloud based file processing...")
+    safe_create_task(
+        load_file_to_source_cloud(server, agent_states, content, source_id, actor, source.embedding_config, file_metadata),
+        logger=logger,
+        label="file_processor.process",
+    )
     safe_create_task(sleeptime_document_ingest_async(server, source_id, actor), logger=logger, label="sleeptime_document_ingest_async")
 
-    return job
+    return file_metadata
 
 
 @router.get("/{source_id}/passages", response_model=List[Passage], operation_id="list_source_passages")
@@ -294,13 +298,44 @@ async def list_source_files(
     List paginated files associated with a data source.
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
-    return await server.source_manager.list_files(
+    return await server.file_manager.list_files(
         source_id=source_id,
         limit=limit,
         after=after,
         actor=actor,
         include_content=include_content,
     )
+
+
+@router.get("/{source_id}/files/{file_id}", response_model=FileMetadata, operation_id="get_file_metadata")
+async def get_file_metadata(
+    source_id: str,
+    file_id: str,
+    include_content: bool = Query(False, description="Whether to include full file content"),
+    server: "SyncServer" = Depends(get_letta_server),
+    actor_id: Optional[str] = Header(None, alias="user_id"),
+):
+    """
+    Retrieve metadata for a specific file by its ID.
+    """
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+
+    # Verify the source exists and user has access
+    source = await server.source_manager.get_source_by_id(source_id=source_id, actor=actor)
+    if not source:
+        raise HTTPException(status_code=404, detail=f"Source with id={source_id} not found.")
+
+    # Get file metadata using the file manager
+    file_metadata = await server.file_manager.get_file_by_id(file_id=file_id, actor=actor, include_content=include_content)
+
+    if not file_metadata:
+        raise HTTPException(status_code=404, detail=f"File with id={file_id} not found.")
+
+    # Verify the file belongs to the specified source
+    if file_metadata.source_id != source_id:
+        raise HTTPException(status_code=404, detail=f"File with id={file_id} not found in source {source_id}.")
+
+    return file_metadata
 
 
 # it's redundant to include /delete in the URL path. The HTTP verb DELETE already implies that action.
@@ -317,7 +352,7 @@ async def delete_file_from_source(
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
 
-    deleted_file = await server.source_manager.delete_file(file_id=file_id, actor=actor)
+    deleted_file = await server.file_manager.delete_file(file_id=file_id, actor=actor)
 
     await server.remove_file_from_context_windows(source_id=source_id, file_id=deleted_file.id, actor=actor)
 
@@ -348,10 +383,18 @@ async def sleeptime_document_ingest_async(server: SyncServer, source_id: str, ac
 
 
 async def load_file_to_source_cloud(
-    server: SyncServer, agent_states: List[AgentState], content: bytes, file: UploadFile, job: Job, source_id: str, actor: User
+    server: SyncServer,
+    agent_states: List[AgentState],
+    content: bytes,
+    source_id: str,
+    actor: User,
+    embedding_config: EmbeddingConfig,
+    file_metadata: FileMetadata,
 ):
     file_processor = MistralFileParser()
-    text_chunker = LlamaIndexChunker()
-    embedder = OpenAIEmbedder()
+    text_chunker = LlamaIndexChunker(chunk_size=embedding_config.embedding_chunk_size)
+    embedder = OpenAIEmbedder(embedding_config=embedding_config)
     file_processor = FileProcessor(file_parser=file_processor, text_chunker=text_chunker, embedder=embedder, actor=actor)
-    await file_processor.process(server=server, agent_states=agent_states, source_id=source_id, content=content, file=file, job=job)
+    await file_processor.process(
+        server=server, agent_states=agent_states, source_id=source_id, content=content, file_metadata=file_metadata
+    )

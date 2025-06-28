@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
@@ -7,6 +7,7 @@ from letta.orm.errors import NoResultFound
 from letta.schemas.step import Step
 from letta.server.rest_api.utils import get_letta_server
 from letta.server.server import SyncServer
+from letta.services.step_manager import FeedbackType
 
 router = APIRouter(prefix="/steps", tags=["steps"])
 
@@ -22,6 +23,9 @@ async def list_steps(
     model: Optional[str] = Query(None, description="Filter by the name of the model used for the step"),
     agent_id: Optional[str] = Query(None, description="Filter by the ID of the agent that performed the step"),
     trace_ids: Optional[list[str]] = Query(None, description="Filter by trace ids returned by the server"),
+    feedback: Optional[Literal["positive", "negative"]] = Query(None, description="Filter by feedback"),
+    has_feedback: Optional[bool] = Query(None, description="Filter by whether steps have feedback (true) or not (false)"),
+    tags: Optional[list[str]] = Query(None, description="Filter by tags"),
     server: SyncServer = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),
 ):
@@ -46,6 +50,9 @@ async def list_steps(
         model=model,
         agent_id=agent_id,
         trace_ids=trace_ids,
+        feedback=feedback,
+        has_feedback=has_feedback,
+        tags=tags,
     )
 
 
@@ -61,6 +68,23 @@ async def retrieve_step(
     try:
         actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
         return await server.step_manager.get_step_async(step_id=step_id, actor=actor)
+    except NoResultFound:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+
+@router.patch("/{step_id}/feedback", response_model=Step, operation_id="add_feedback")
+async def add_feedback(
+    step_id: str,
+    feedback: Optional[FeedbackType],
+    actor_id: Optional[str] = Header(None, alias="user_id"),
+    server: SyncServer = Depends(get_letta_server),
+):
+    """
+    Add feedback to a step.
+    """
+    try:
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+        return await server.step_manager.add_feedback_async(step_id=step_id, feedback=feedback, actor=actor)
     except NoResultFound:
         raise HTTPException(status_code=404, detail="Step not found")
 

@@ -1,9 +1,8 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import openai
 from fastapi import APIRouter, Body, Depends, Header
 from fastapi.responses import StreamingResponse
-from openai.types.chat.completion_create_params import CompletionCreateParams
 
 from letta.agents.voice_agent import VoiceAgent
 from letta.log import get_logger
@@ -32,7 +31,7 @@ logger = get_logger(__name__)
 )
 async def create_voice_chat_completions(
     agent_id: str,
-    completion_request: CompletionCreateParams = Body(...),
+    completion_request: Dict[str, Any] = Body(...),  # The validation is soft in case providers like VAPI send extra params
     server: "SyncServer" = Depends(get_letta_server),
     user_id: Optional[str] = Header(None, alias="user_id"),
 ):
@@ -52,6 +51,7 @@ async def create_voice_chat_completions(
         message_manager=server.message_manager,
         agent_manager=server.agent_manager,
         block_manager=server.block_manager,
+        job_manager=server.job_manager,
         passage_manager=server.passage_manager,
         actor=actor,
     )

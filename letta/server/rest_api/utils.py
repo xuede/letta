@@ -13,7 +13,13 @@ from openai.types.chat.chat_completion_message_tool_call import Function as Open
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from pydantic import BaseModel
 
-from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG, FUNC_FAILED_HEARTBEAT_MESSAGE, REQ_HEARTBEAT_MESSAGE
+from letta.constants import (
+    DEFAULT_MESSAGE_TOOL,
+    DEFAULT_MESSAGE_TOOL_KWARG,
+    FUNC_FAILED_HEARTBEAT_MESSAGE,
+    REQ_HEARTBEAT_MESSAGE,
+    REQUEST_HEARTBEAT_PARAM,
+)
 from letta.errors import ContextWindowExceededError, RateLimitExceededError
 from letta.helpers.datetime_helpers import get_utc_time, get_utc_timestamp_ns, ns_to_ms
 from letta.helpers.message_helper import convert_message_creates_to_messages
@@ -88,7 +94,7 @@ async def sse_async_generator(
                 metric_attributes = get_ctx_attributes()
                 if llm_config:
                     metric_attributes["model.name"] = llm_config.model
-                    MetricRegistry().ttft_ms_histogram.record(ns_to_ms(ttft_ns), metric_attributes)
+                MetricRegistry().ttft_ms_histogram.record(ns_to_ms(ttft_ns), metric_attributes)
                 first_chunk = False
 
             # yield f"data: {json.dumps(chunk)}\n\n"
@@ -169,7 +175,7 @@ def log_error_to_sentry(e):
         sentry_sdk.capture_exception(e)
 
 
-def create_input_messages(input_messages: List[MessageCreate], agent_id: str, actor: User) -> List[Message]:
+def create_input_messages(input_messages: List[MessageCreate], agent_id: str, timezone: str, actor: User) -> List[Message]:
     """
     Converts a user input message into the internal structured format.
 
@@ -177,7 +183,7 @@ def create_input_messages(input_messages: List[MessageCreate], agent_id: str, ac
     we should unify this when it's clear what message attributes we need.
     """
 
-    messages = convert_message_creates_to_messages(input_messages, agent_id, wrap_user_message=False, wrap_system_message=False)
+    messages = convert_message_creates_to_messages(input_messages, agent_id, timezone, wrap_user_message=False, wrap_system_message=False)
     for message in messages:
         message.organization_id = actor.organization_id
     return messages
@@ -192,17 +198,19 @@ def create_letta_messages_from_llm_response(
     tool_call_id: str,
     function_call_success: bool,
     function_response: Optional[str],
+    timezone: str,
     actor: User,
-    add_heartbeat_request_system_message: bool = False,
+    continue_stepping: bool = False,
+    heartbeat_reason: Optional[str] = None,
     reasoning_content: Optional[List[Union[TextContent, ReasoningContent, RedactedReasoningContent, OmittedReasoningContent]]] = None,
     pre_computed_assistant_message_id: Optional[str] = None,
     llm_batch_item_id: Optional[str] = None,
     step_id: str | None = None,
 ) -> List[Message]:
     messages = []
-
     # Construct the tool call with the assistant's message
-    function_arguments["request_heartbeat"] = True
+    # Force set request_heartbeat in tool_args to calculated continue_stepping
+    function_arguments[REQUEST_HEARTBEAT_PARAM] = continue_stepping
     tool_call = OpenAIToolCall(
         id=tool_call_id,
         function=OpenAIFunction(
@@ -232,7 +240,7 @@ def create_letta_messages_from_llm_response(
     # TODO: This helps preserve ordering
     tool_message = Message(
         role=MessageRole.tool,
-        content=[TextContent(text=package_function_response(function_call_success, function_response))],
+        content=[TextContent(text=package_function_response(function_call_success, function_response, timezone))],
         organization_id=actor.organization_id,
         agent_id=agent_id,
         model=model,
@@ -252,9 +260,14 @@ def create_letta_messages_from_llm_response(
     )
     messages.append(tool_message)
 
-    if add_heartbeat_request_system_message:
+    if continue_stepping:
         heartbeat_system_message = create_heartbeat_system_message(
-            agent_id=agent_id, model=model, function_call_success=function_call_success, actor=actor, llm_batch_item_id=llm_batch_item_id
+            agent_id=agent_id,
+            model=model,
+            function_call_success=function_call_success,
+            actor=actor,
+            timezone=timezone,
+            heartbeat_reason=heartbeat_reason,
         )
         messages.append(heartbeat_system_message)
 
@@ -265,12 +278,22 @@ def create_letta_messages_from_llm_response(
 
 
 def create_heartbeat_system_message(
-    agent_id: str, model: str, function_call_success: bool, actor: User, llm_batch_item_id: Optional[str] = None
+    agent_id: str,
+    model: str,
+    function_call_success: bool,
+    timezone: str,
+    actor: User,
+    llm_batch_item_id: Optional[str] = None,
+    heartbeat_reason: Optional[str] = None,
 ) -> Message:
-    text_content = REQ_HEARTBEAT_MESSAGE if function_call_success else FUNC_FAILED_HEARTBEAT_MESSAGE
+    if heartbeat_reason:
+        text_content = heartbeat_reason
+    else:
+        text_content = REQ_HEARTBEAT_MESSAGE if function_call_success else FUNC_FAILED_HEARTBEAT_MESSAGE
+
     heartbeat_system_message = Message(
         role=MessageRole.user,
-        content=[TextContent(text=get_heartbeat(text_content))],
+        content=[TextContent(text=get_heartbeat(timezone, text_content))],
         organization_id=actor.organization_id,
         agent_id=agent_id,
         model=model,
@@ -287,6 +310,7 @@ def create_assistant_messages_from_openai_response(
     agent_id: str,
     model: str,
     actor: User,
+    timezone: str,
 ) -> List[Message]:
     """
     Converts an OpenAI response into Messages that follow the internal
@@ -303,8 +327,9 @@ def create_assistant_messages_from_openai_response(
         tool_call_id=tool_call_id,
         function_call_success=True,
         function_response=None,
+        timezone=timezone,
         actor=actor,
-        add_heartbeat_request_system_message=False,
+        continue_stepping=False,
     )
 
 

@@ -9,14 +9,9 @@ import openai
 from letta.agents.base_agent import BaseAgent
 from letta.agents.exceptions import IncompatibleAgentType
 from letta.agents.voice_sleeptime_agent import VoiceSleeptimeAgent
-from letta.constants import NON_USER_MSG_PREFIX
+from letta.constants import DEFAULT_MAX_STEPS, NON_USER_MSG_PREFIX, PRE_EXECUTION_MESSAGE_ARG, REQUEST_HEARTBEAT_PARAM
 from letta.helpers.datetime_helpers import get_utc_time
-from letta.helpers.tool_execution_helper import (
-    add_pre_execution_message,
-    enable_strict_mode,
-    execute_external_tool,
-    remove_request_heartbeat,
-)
+from letta.helpers.tool_execution_helper import add_pre_execution_message, enable_strict_mode, remove_request_heartbeat
 from letta.interfaces.openai_chat_completions_streaming_interface import OpenAIChatCompletionsStreamingInterface
 from letta.log import get_logger
 from letta.orm.enums import ToolType
@@ -43,10 +38,12 @@ from letta.server.rest_api.utils import (
 from letta.services.agent_manager import AgentManager
 from letta.services.block_manager import BlockManager
 from letta.services.helpers.agent_manager_helper import compile_system_message
+from letta.services.job_manager import JobManager
 from letta.services.message_manager import MessageManager
 from letta.services.passage_manager import PassageManager
 from letta.services.summarizer.enums import SummarizationMode
 from letta.services.summarizer.summarizer import Summarizer
+from letta.services.tool_executor.tool_execution_manager import ToolExecutionManager
 from letta.settings import model_settings
 
 logger = get_logger(__name__)
@@ -68,6 +65,7 @@ class VoiceAgent(BaseAgent):
         message_manager: MessageManager,
         agent_manager: AgentManager,
         block_manager: BlockManager,
+        job_manager: JobManager,
         passage_manager: PassageManager,
         actor: User,
     ):
@@ -77,6 +75,7 @@ class VoiceAgent(BaseAgent):
 
         # Summarizer settings
         self.block_manager = block_manager
+        self.job_manager = job_manager
         self.passage_manager = passage_manager
         # TODO: This is not guaranteed to exist!
         self.summary_block_label = "human"
@@ -102,6 +101,7 @@ class VoiceAgent(BaseAgent):
                 agent_manager=self.agent_manager,
                 actor=self.actor,
                 block_manager=self.block_manager,
+                job_manager=self.job_manager,
                 passage_manager=self.passage_manager,
                 target_block_label=self.summary_block_label,
             ),
@@ -111,10 +111,10 @@ class VoiceAgent(BaseAgent):
 
         return summarizer
 
-    async def step(self, input_messages: List[MessageCreate], max_steps: int = 10) -> LettaResponse:
+    async def step(self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS) -> LettaResponse:
         raise NotImplementedError("VoiceAgent does not have a synchronous step implemented currently.")
 
-    async def step_stream(self, input_messages: List[MessageCreate], max_steps: int = 10) -> AsyncGenerator[str, None]:
+    async def step_stream(self, input_messages: List[MessageCreate], max_steps: int = DEFAULT_MAX_STEPS) -> AsyncGenerator[str, None]:
         """
         Main streaming loop that yields partial tokens.
         Whenever we detect a tool call, we yield from _handle_ai_response as well.
@@ -124,7 +124,11 @@ class VoiceAgent(BaseAgent):
 
         user_query = input_messages[0].content[0].text
 
-        agent_state = await self.agent_manager.get_agent_by_id_async(self.agent_id, actor=self.actor)
+        agent_state = await self.agent_manager.get_agent_by_id_async(
+            agent_id=self.agent_id,
+            include_relationships=["tools", "memory", "tool_exec_environment_variables", "multi_agent_group"],
+            actor=self.actor,
+        )
 
         # TODO: Refactor this so it uses our in-house clients
         # TODO: For now, piggyback off of OpenAI client for ease
@@ -146,10 +150,13 @@ class VoiceAgent(BaseAgent):
             system_prompt=agent_state.system,
             in_context_memory=agent_state.memory,
             in_context_memory_last_edit=memory_edit_timestamp,
+            timezone=agent_state.timezone,
             previous_message_count=self.num_messages,
             archival_memory_size=self.num_archival_memories,
         )
-        letta_message_db_queue = create_input_messages(input_messages=input_messages, agent_id=agent_state.id, actor=self.actor)
+        letta_message_db_queue = create_input_messages(
+            input_messages=input_messages, agent_id=agent_state.id, timezone=agent_state.timezone, actor=self.actor
+        )
         in_memory_message_history = self.pre_process_input_message(input_messages)
 
         # TODO: Define max steps here
@@ -208,6 +215,7 @@ class VoiceAgent(BaseAgent):
                 agent_id=agent_state.id,
                 model=agent_state.llm_config.model,
                 actor=self.actor,
+                timezone=agent_state.timezone,
             )
             letta_message_db_queue.extend(assistant_msgs)
 
@@ -268,8 +276,9 @@ class VoiceAgent(BaseAgent):
                 function_call_success=success_flag,
                 function_response=tool_result,
                 tool_execution_result=tool_execution_result,
+                timezone=agent_state.timezone,
                 actor=self.actor,
-                add_heartbeat_request_system_message=True,
+                continue_stepping=True,
             )
             letta_message_db_queue.extend(tool_call_messages)
 
@@ -332,7 +341,12 @@ class VoiceAgent(BaseAgent):
 
     def _build_tool_schemas(self, agent_state: AgentState, external_tools_only=True) -> List[Tool]:
         if external_tools_only:
-            tools = [t for t in agent_state.tools if t.tool_type in {ToolType.EXTERNAL_COMPOSIO, ToolType.CUSTOM}]
+            tools = [
+                t
+                for t in agent_state.tools
+                if t.tool_type
+                in {ToolType.EXTERNAL_COMPOSIO, ToolType.CUSTOM, ToolType.LETTA_FILES_CORE, ToolType.LETTA_BUILTIN, ToolType.EXTERNAL_MCP}
+            ]
         else:
             tools = agent_state.tools
 
@@ -401,11 +415,9 @@ class VoiceAgent(BaseAgent):
 
     async def _execute_tool(self, user_query: str, tool_name: str, tool_args: dict, agent_state: AgentState) -> "ToolExecutionResult":
         """
-        Executes a tool and returns (result, success_flag).
+        Executes a tool and returns the ToolExecutionResult.
         """
         from letta.schemas.tool_execution_result import ToolExecutionResult
-
-        print("EXECUTING TOOL")
 
         # Special memory case
         if tool_name == "search_memory":
@@ -420,26 +432,40 @@ class VoiceAgent(BaseAgent):
                 func_return=tool_result,
                 status="success",
             )
-        else:
-            target_tool = next((x for x in agent_state.tools if x.name == tool_name), None)
-            if not target_tool:
-                return ToolExecutionResult(
-                    func_return=f"Tool not found: {tool_name}",
-                    status="error",
-                )
 
-            try:
-                tool_result, _ = execute_external_tool(
-                    agent_state=agent_state,
-                    function_name=tool_name,
-                    function_args=tool_args,
-                    target_letta_tool=target_tool,
-                    actor=self.actor,
-                    allow_agent_state_modifications=False,
-                )
-                return ToolExecutionResult(func_return=tool_result, status="success")
-            except Exception as e:
-                return ToolExecutionResult(func_return=f"Failed to call tool. Error: {e}", status="error")
+        # Find the target tool
+        target_tool = next((x for x in agent_state.tools if x.name == tool_name), None)
+        if not target_tool:
+            return ToolExecutionResult(
+                func_return=f"Tool {tool_name} not found",
+                status="error",
+            )
+
+        # Use ToolExecutionManager for modern tool execution
+        sandbox_env_vars = {var.key: var.value for var in agent_state.tool_exec_environment_variables}
+        tool_execution_manager = ToolExecutionManager(
+            agent_state=agent_state,
+            message_manager=self.message_manager,
+            agent_manager=self.agent_manager,
+            block_manager=self.block_manager,
+            job_manager=self.job_manager,
+            passage_manager=self.passage_manager,
+            sandbox_env_vars=sandbox_env_vars,
+            actor=self.actor,
+        )
+
+        # Remove request heartbeat / pre_exec_message
+        tool_args.pop(PRE_EXECUTION_MESSAGE_ARG, None)
+        tool_args.pop(REQUEST_HEARTBEAT_PARAM, None)
+
+        tool_execution_result = await tool_execution_manager.execute_tool_async(
+            function_name=tool_name,
+            function_args=tool_args,
+            tool=target_tool,
+            step_id=None,  # VoiceAgent doesn't use step tracking currently
+        )
+
+        return tool_execution_result
 
     async def _search_memory(
         self,

@@ -4,10 +4,9 @@ from typing import TYPE_CHECKING, List, Optional
 from sqlalchemy import JSON, Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from letta.orm.enums import JobType
 from letta.orm.mixins import UserMixin
 from letta.orm.sqlalchemy_base import SqlalchemyBase
-from letta.schemas.enums import JobStatus
+from letta.schemas.enums import JobStatus, JobType
 from letta.schemas.job import Job as PydanticJob
 from letta.schemas.job import LettaRequestConfig
 
@@ -43,6 +42,9 @@ class Job(SqlalchemyBase, UserMixin):
     callback_url: Mapped[Optional[str]] = mapped_column(String, nullable=True, doc="When set, POST to this URL after job completion.")
     callback_sent_at: Mapped[Optional[datetime]] = mapped_column(nullable=True, doc="Timestamp when the callback was last attempted.")
     callback_status_code: Mapped[Optional[int]] = mapped_column(nullable=True, doc="HTTP status code returned by the callback endpoint.")
+    callback_error: Mapped[Optional[str]] = mapped_column(
+        nullable=True, doc="Optional error message from attempting to POST the callback endpoint."
+    )
 
     # relationships
     user: Mapped["User"] = relationship("User", back_populates="jobs")

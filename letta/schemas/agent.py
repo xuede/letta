@@ -1,10 +1,15 @@
+from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from letta.constants import CORE_MEMORY_LINE_NUMBER_WARNING, DEFAULT_EMBEDDING_CHUNK_SIZE
-from letta.helpers import ToolRulesSolver
+from letta.constants import (
+    CORE_MEMORY_LINE_NUMBER_WARNING,
+    DEFAULT_EMBEDDING_CHUNK_SIZE,
+    FILE_MEMORY_EMPTY_MESSAGE,
+    FILE_MEMORY_EXISTS_MESSAGE,
+)
 from letta.schemas.block import CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.environment_variables import AgentEnvironmentVariable
@@ -27,8 +32,10 @@ class AgentType(str, Enum):
     Enum to represent the type of agent.
     """
 
-    memgpt_agent = "memgpt_agent"
-    memgpt_v2_agent = "memgpt_v2_agent"
+    memgpt_agent = "memgpt_agent"  # the OG set of memgpt tools
+    memgpt_v2_agent = "memgpt_v2_agent"  # memgpt style tools, but refreshed
+    react_agent = "react_agent"  # basic react agent, no memory tools
+    workflow_agent = "workflow_agent"  # workflow with auto-clearing message buffer
     split_thread_agent = "split_thread_agent"
     sleeptime_agent = "sleeptime_agent"
     voice_convo_agent = "voice_convo_agent"
@@ -105,6 +112,13 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
 
     multi_agent_group: Optional[Group] = Field(None, description="The multi-agent group that this agent manages")
 
+    # Run metrics
+    last_run_completion: Optional[datetime] = Field(None, description="The timestamp when the agent last completed a run.")
+    last_run_duration_ms: Optional[int] = Field(None, description="The duration in milliseconds of the agent's last run.")
+
+    # timezone
+    timezone: Optional[str] = Field(None, description="The timezone of the agent (IANA format).")
+
     def get_agent_env_vars_as_dict(self) -> Dict[str, str]:
         # Get environment variables for this agent specifically
         per_agent_env_vars = {}
@@ -138,14 +152,15 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
     initial_message_sequence: Optional[List[MessageCreate]] = Field(
         None, description="The initial set of messages to put in the agent's in-context memory."
     )
-    include_base_tools: bool = Field(
-        True, description="If true, attaches the Letta core tools (e.g. archival_memory and core_memory related functions)."
-    )
+    include_base_tools: bool = Field(True, description="If true, attaches the Letta core tools (e.g. core_memory related functions).")
     include_multi_agent_tools: bool = Field(
         False, description="If true, attaches the Letta multi-agent tools (e.g. sending a message to another agent)."
     )
     include_base_tool_rules: bool = Field(
         True, description="If true, attaches the Letta base tool rules (e.g. deny all tools not explicitly allowed)."
+    )
+    include_default_source: bool = Field(
+        False, description="If true, automatically creates and attaches a default data source for this agent."
     )
     description: Optional[str] = Field(None, description="The description of the agent.")
     metadata: Optional[Dict] = Field(None, description="The metadata of the agent.")
@@ -188,6 +203,7 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
     )
     enable_sleeptime: Optional[bool] = Field(None, description="If set to True, memory management will move to a background agent thread.")
     response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the agent.")
+    timezone: Optional[str] = Field(None, description="The timezone of the agent (IANA format).")
 
     @field_validator("name")
     @classmethod
@@ -279,6 +295,9 @@ class UpdateAgent(BaseModel):
     )
     enable_sleeptime: Optional[bool] = Field(None, description="If set to True, memory management will move to a background agent thread.")
     response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the agent.")
+    last_run_completion: Optional[datetime] = Field(None, description="The timestamp when the agent last completed a run.")
+    last_run_duration_ms: Optional[int] = Field(None, description="The duration in milliseconds of the agent's last run.")
+    timezone: Optional[str] = Field(None, description="The timezone of the agent (IANA format).")
 
     class Config:
         extra = "ignore"  # Ignores extra fields
@@ -294,16 +313,37 @@ class AgentStepResponse(BaseModel):
     usage: UsageStatistics = Field(..., description="Usage statistics of the LLM call during the agent's step.")
 
 
-class AgentStepState(BaseModel):
-    step_number: int = Field(..., description="The current step number in the agent loop")
-    tool_rules_solver: ToolRulesSolver = Field(..., description="The current state of the ToolRulesSolver")
-
-
 def get_prompt_template_for_agent_type(agent_type: Optional[AgentType] = None):
+
+    # Workflow agents and ReAct agents don't use memory blocks
+    # However, they still allow files to be injected into the context
+    if agent_type == AgentType.react_agent or agent_type == AgentType.workflow_agent:
+        return (
+            f"<files>\n{{% if file_blocks %}}{FILE_MEMORY_EXISTS_MESSAGE}\n{{% else %}}{FILE_MEMORY_EMPTY_MESSAGE}{{% endif %}}"
+            "{% for block in file_blocks %}"
+            f"<file status=\"{{{{ '{FileStatus.open.value}' if block.value else '{FileStatus.closed.value}' }}}}\">\n"
+            "<{{ block.label }}>\n"
+            "<description>\n"
+            "{{ block.description }}\n"
+            "</description>\n"
+            "<metadata>"
+            "{% if block.read_only %}\n- read_only=true{% endif %}\n"
+            "- chars_current={{ block.value|length }}\n"
+            "- chars_limit={{ block.limit }}\n"
+            "</metadata>\n"
+            "<value>\n"
+            "{{ block.value }}\n"
+            "</value>\n"
+            "</{{ block.label }}>\n"
+            "</file>\n"
+            "{% if not loop.last %}\n{% endif %}"
+            "{% endfor %}"
+            "\n</files>"
+        )
 
     # Sleeptime agents use the MemGPT v2 memory tools (line numbers)
     # MemGPT v2 tools use line-number, so core memory blocks should have line numbers
-    if agent_type == AgentType.sleeptime_agent or agent_type == AgentType.memgpt_v2_agent:
+    elif agent_type == AgentType.sleeptime_agent or agent_type == AgentType.memgpt_v2_agent:
         return (
             "<memory_blocks>\nThe following memory blocks are currently engaged in your core memory unit:\n\n"
             "{% for block in blocks %}"
@@ -326,24 +366,31 @@ def get_prompt_template_for_agent_type(agent_type: Optional[AgentType] = None):
             "{% if not loop.last %}\n{% endif %}"
             "{% endfor %}"
             "\n</memory_blocks>"
-            "<files>\nThe following memory files are currently accessible:\n\n"
+            "\n\n{% if tool_usage_rules %}"
+            "<tool_usage_rules>\n"
+            "{{ tool_usage_rules.description }}\n\n"
+            "{{ tool_usage_rules.value }}\n"
+            "</tool_usage_rules>"
+            "{% endif %}"
+            f"\n\n<files>\n{{% if file_blocks %}}{FILE_MEMORY_EXISTS_MESSAGE}\n{{% else %}}{FILE_MEMORY_EMPTY_MESSAGE}{{% endif %}}"
             "{% for block in file_blocks %}"
             f"<file status=\"{{{{ '{FileStatus.open.value}' if block.value else '{FileStatus.closed.value}' }}}}\">\n"
             "<{{ block.label }}>\n"
+            "{% if block.description %}"
             "<description>\n"
             "{{ block.description }}\n"
             "</description>\n"
+            "{% endif %}"
             "<metadata>"
             "{% if block.read_only %}\n- read_only=true{% endif %}\n"
             "- chars_current={{ block.value|length }}\n"
             "- chars_limit={{ block.limit }}\n"
             "</metadata>\n"
+            "{% if block.value %}"
             "<value>\n"
-            f"{CORE_MEMORY_LINE_NUMBER_WARNING}\n"
-            "{% for line in block.value.split('\\n') %}"
-            "Line {{ loop.index }}: {{ line }}\n"
-            "{% endfor %}"
+            "{{ block.value }}\n"
             "</value>\n"
+            "{% endif %}"
             "</{{ block.label }}>\n"
             "</file>\n"
             "{% if not loop.last %}\n{% endif %}"
@@ -372,21 +419,31 @@ def get_prompt_template_for_agent_type(agent_type: Optional[AgentType] = None):
             "{% if not loop.last %}\n{% endif %}"
             "{% endfor %}"
             "\n</memory_blocks>"
-            "<files>\nThe following memory files are currently accessible:\n\n"
+            "\n\n{% if tool_usage_rules %}"
+            "<tool_usage_rules>\n"
+            "{{ tool_usage_rules.description }}\n\n"
+            "{{ tool_usage_rules.value }}\n"
+            "</tool_usage_rules>"
+            "{% endif %}"
+            f"\n\n<files>\n{{% if file_blocks %}}{FILE_MEMORY_EXISTS_MESSAGE}\n{{% else %}}{FILE_MEMORY_EMPTY_MESSAGE}{{% endif %}}"
             "{% for block in file_blocks %}"
             f"<file status=\"{{{{ '{FileStatus.open.value}' if block.value else '{FileStatus.closed.value}' }}}}\">\n"
             "<{{ block.label }}>\n"
+            "{% if block.description %}"
             "<description>\n"
             "{{ block.description }}\n"
             "</description>\n"
+            "{% endif %}"
             "<metadata>"
             "{% if block.read_only %}\n- read_only=true{% endif %}\n"
             "- chars_current={{ block.value|length }}\n"
             "- chars_limit={{ block.limit }}\n"
             "</metadata>\n"
+            "{% if block.value %}"
             "<value>\n"
             "{{ block.value }}\n"
             "</value>\n"
+            "{% endif %}"
             "</{{ block.label }}>\n"
             "</file>\n"
             "{% if not loop.last %}\n{% endif %}"

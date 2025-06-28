@@ -1,12 +1,12 @@
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
 from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
-from letta.orm.enums import JobType
-from letta.schemas.enums import JobStatus
+from letta.schemas.enums import JobStatus, JobType
 from letta.schemas.letta_base import OrmMetadataBase
+from letta.schemas.letta_message import MessageType
 
 
 class JobBase(OrmMetadataBase):
@@ -19,6 +19,7 @@ class JobBase(OrmMetadataBase):
     callback_url: Optional[str] = Field(None, description="If set, POST to this URL when the job completes.")
     callback_sent_at: Optional[datetime] = Field(None, description="Timestamp when the callback was last attempted.")
     callback_status_code: Optional[int] = Field(None, description="HTTP status code returned by the callback endpoint.")
+    callback_error: Optional[str] = Field(None, description="Optional error message from attempting to POST the callback endpoint.")
 
 
 class Job(JobBase):
@@ -92,4 +93,7 @@ class LettaRequestConfig(BaseModel):
     assistant_message_tool_kwarg: str = Field(
         default=DEFAULT_MESSAGE_TOOL_KWARG,
         description="The name of the message argument in the designated message tool.",
+    )
+    include_return_message_types: Optional[List[MessageType]] = Field(
+        default=None, description="Only return specified message types in the response. If `None` (default) returns all messages."
     )

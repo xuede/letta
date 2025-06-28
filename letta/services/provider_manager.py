@@ -1,4 +1,4 @@
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 from letta.orm.provider import Provider as ProviderModel
 from letta.otel.tracing import trace_method
@@ -69,6 +69,25 @@ class ProviderManager:
 
             # Commit the updated provider
             existing_provider.update(session, actor=actor)
+            return existing_provider.to_pydantic()
+
+    @enforce_types
+    @trace_method
+    async def update_provider_async(self, provider_id: str, provider_update: ProviderUpdate, actor: PydanticUser) -> PydanticProvider:
+        """Update provider details."""
+        async with db_registry.async_session() as session:
+            # Retrieve the existing provider by ID
+            existing_provider = await ProviderModel.read_async(
+                db_session=session, identifier=provider_id, actor=actor, check_is_deleted=True
+            )
+
+            # Update only the fields that are provided in ProviderUpdate
+            update_data = provider_update.model_dump(to_orm=True, exclude_unset=True, exclude_none=True)
+            for key, value in update_data.items():
+                setattr(existing_provider, key, value)
+
+            # Commit the updated provider
+            await existing_provider.update_async(session, actor=actor)
             return existing_provider.to_pydantic()
 
     @enforce_types
@@ -177,12 +196,25 @@ class ProviderManager:
 
     @enforce_types
     @trace_method
+    async def get_bedrock_credentials_async(
+        self, provider_name: Union[str, None], actor: PydanticUser
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        providers = await self.list_providers_async(name=provider_name, actor=actor)
+        access_key = providers[0].access_key if providers else None
+        secret_key = providers[0].api_key if providers else None
+        region = providers[0].region if providers else None
+        return access_key, secret_key, region
+
+    @enforce_types
+    @trace_method
     def check_provider_api_key(self, provider_check: ProviderCheck) -> None:
         provider = PydanticProvider(
             name=provider_check.provider_type.value,
             provider_type=provider_check.provider_type,
             api_key=provider_check.api_key,
             provider_category=ProviderCategory.byok,
+            secret_key=provider_check.api_secret,
+            region=provider_check.region,
         ).cast_to_subtype()
 
         # TODO: add more string sanity checks here before we hit actual endpoints

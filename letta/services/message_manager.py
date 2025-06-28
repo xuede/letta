@@ -1,4 +1,5 @@
 import json
+import uuid
 from typing import List, Optional, Sequence
 
 from sqlalchemy import delete, exists, func, select, text
@@ -10,10 +11,12 @@ from letta.orm.message import Message as MessageModel
 from letta.otel.tracing import trace_method
 from letta.schemas.enums import MessageRole
 from letta.schemas.letta_message import LettaMessageUpdateUnion
+from letta.schemas.letta_message_content import ImageSourceType, LettaImage, MessageContentType
 from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.message import MessageUpdate
 from letta.schemas.user import User as PydanticUser
 from letta.server.db import db_registry
+from letta.services.file_manager import FileManager
 from letta.utils import enforce_types
 
 logger = get_logger(__name__)
@@ -21,6 +24,10 @@ logger = get_logger(__name__)
 
 class MessageManager:
     """Manager class to handle business logic related to Messages."""
+
+    def __init__(self):
+        """Initialize the MessageManager."""
+        self.file_manager = FileManager()
 
     @enforce_types
     @trace_method
@@ -131,6 +138,31 @@ class MessageManager:
         if not pydantic_msgs:
             return []
 
+        for message in pydantic_msgs:
+            if isinstance(message.content, list):
+                for content in message.content:
+                    if content.type == MessageContentType.image and content.source.type == ImageSourceType.base64:
+                        # TODO: actually persist image files in db
+                        # file = await self.file_manager.create_file( # TODO: use batch create to prevent multiple db round trips
+                        #     db_session=session,
+                        #     image_create=FileMetadata(
+                        #         user_id=actor.id, # TODO: add field
+                        #         source_id= '' # TODO: make optional
+                        #         organization_id=actor.organization_id,
+                        #         file_type=content.source.media_type,
+                        #         processing_status=FileProcessingStatus.COMPLETED,
+                        #         content= '' # TODO: should content be added here or in top level text field?
+                        #     ),
+                        #     actor=actor,
+                        #     text=content.source.data,
+                        # )
+                        file_id_placeholder = "file-" + str(uuid.uuid4())
+                        content.source = LettaImage(
+                            file_id=file_id_placeholder,
+                            data=content.source.data,
+                            media_type=content.source.media_type,
+                            detail=content.source.detail,
+                        )
         orm_messages = self._create_many_preprocess(pydantic_msgs, actor)
         async with db_registry.async_session() as session:
             created_messages = await MessageModel.batch_create_async(orm_messages, session, actor=actor)
@@ -571,10 +603,11 @@ class MessageManager:
 
     @enforce_types
     @trace_method
-    async def delete_all_messages_for_agent_async(self, agent_id: str, actor: PydanticUser) -> int:
+    async def delete_all_messages_for_agent_async(self, agent_id: str, actor: PydanticUser, exclude_ids: Optional[List[str]] = None) -> int:
         """
         Efficiently deletes all messages associated with a given agent_id,
         while enforcing permission checks and avoiding any ORM‑level loads.
+        Optionally excludes specific message IDs from deletion.
         """
         async with db_registry.async_session() as session:
             # 1) verify the agent exists and the actor has access
@@ -584,10 +617,36 @@ class MessageManager:
             stmt = (
                 delete(MessageModel).where(MessageModel.agent_id == agent_id).where(MessageModel.organization_id == actor.organization_id)
             )
+
+            # 3) exclude specific message IDs if provided
+            if exclude_ids:
+                stmt = stmt.where(~MessageModel.id.in_(exclude_ids))
+
             result = await session.execute(stmt)
 
-            # 3) commit once
+            # 4) commit once
             await session.commit()
 
-            # 4) return the number of rows deleted
+            # 5) return the number of rows deleted
+            return result.rowcount
+
+    @enforce_types
+    @trace_method
+    async def delete_messages_by_ids_async(self, message_ids: List[str], actor: PydanticUser) -> int:
+        """
+        Efficiently deletes messages by their specific IDs,
+        while enforcing permission checks.
+        """
+        if not message_ids:
+            return 0
+
+        async with db_registry.async_session() as session:
+            # issue a CORE DELETE against the mapped class for specific message IDs
+            stmt = delete(MessageModel).where(MessageModel.id.in_(message_ids)).where(MessageModel.organization_id == actor.organization_id)
+            result = await session.execute(stmt)
+
+            # commit once
+            await session.commit()
+
+            # return the number of rows deleted
             return result.rowcount

@@ -7,9 +7,9 @@ from letta.functions.mcp_client.types import StdioServerConfig
 from letta.orm.custom_columns import MCPStdioServerConfigColumn
 
 # TODO everything in functions should live in this model
-from letta.orm.enums import MCPServerType
 from letta.orm.mixins import OrganizationMixin
 from letta.orm.sqlalchemy_base import SqlalchemyBase
+from letta.schemas.enums import MCPServerType
 from letta.schemas.mcp import MCPServer
 
 if TYPE_CHECKING:
@@ -35,6 +35,9 @@ class MCPServer(SqlalchemyBase, OrganizationMixin):
     server_url: Mapped[Optional[str]] = mapped_column(
         String, nullable=True, doc="The URL of the server (MCP SSE client will connect to this URL)"
     )
+
+    # access token / api key for MCP servers that require authentication
+    token: Mapped[Optional[str]] = mapped_column(String, nullable=True, doc="The access token or api key for the MCP server")
 
     # stdio server
     stdio_config: Mapped[Optional[StdioServerConfig]] = mapped_column(

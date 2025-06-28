@@ -2,6 +2,7 @@ from typing import AsyncGenerator, List, Optional, Tuple, Union
 
 from letta.agents.helpers import _create_letta_response, serialize_message_history
 from letta.agents.letta_agent import LettaAgent
+from letta.constants import DEFAULT_MAX_STEPS
 from letta.orm.enums import ToolType
 from letta.otel.tracing import trace_method
 from letta.schemas.agent import AgentState
@@ -14,6 +15,7 @@ from letta.schemas.tool_rule import ChildToolRule, ContinueToolRule, InitToolRul
 from letta.schemas.user import User
 from letta.services.agent_manager import AgentManager
 from letta.services.block_manager import BlockManager
+from letta.services.job_manager import JobManager
 from letta.services.message_manager import MessageManager
 from letta.services.passage_manager import PassageManager
 from letta.services.summarizer.enums import SummarizationMode
@@ -33,6 +35,7 @@ class VoiceSleeptimeAgent(LettaAgent):
         message_manager: MessageManager,
         agent_manager: AgentManager,
         block_manager: BlockManager,
+        job_manager: JobManager,
         passage_manager: PassageManager,
         target_block_label: str,
         actor: User,
@@ -42,6 +45,7 @@ class VoiceSleeptimeAgent(LettaAgent):
             message_manager=message_manager,
             agent_manager=agent_manager,
             block_manager=block_manager,
+            job_manager=job_manager,
             passage_manager=passage_manager,
             actor=actor,
         )
@@ -62,8 +66,10 @@ class VoiceSleeptimeAgent(LettaAgent):
     async def step(
         self,
         input_messages: List[MessageCreate],
-        max_steps: int = 20,
+        max_steps: int = DEFAULT_MAX_STEPS,
+        run_id: Optional[str] = None,
         use_assistant_message: bool = True,
+        request_start_timestamp_ns: Optional[int] = None,
         include_return_message_types: Optional[List[MessageType]] = None,
     ) -> LettaResponse:
         """
@@ -81,7 +87,7 @@ class VoiceSleeptimeAgent(LettaAgent):
         ]
 
         # Summarize
-        current_in_context_messages, new_in_context_messages, usage = await super()._step(
+        current_in_context_messages, new_in_context_messages, stop_reason, usage = await super()._step(
             agent_state=agent_state, input_messages=input_messages, max_steps=max_steps
         )
         new_in_context_messages, updated = self.summarizer.summarize(
@@ -94,6 +100,7 @@ class VoiceSleeptimeAgent(LettaAgent):
         return _create_letta_response(
             new_in_context_messages=new_in_context_messages,
             use_assistant_message=use_assistant_message,
+            stop_reason=stop_reason,
             usage=usage,
             include_return_message_types=include_return_message_types,
         )
@@ -170,7 +177,12 @@ class VoiceSleeptimeAgent(LettaAgent):
             return f"Failed to store memory given start_index {start_index} and end_index {end_index}: {e}", False
 
     async def step_stream(
-        self, input_messages: List[MessageCreate], max_steps: int = 10, use_assistant_message: bool = True
+        self,
+        input_messages: List[MessageCreate],
+        max_steps: int = DEFAULT_MAX_STEPS,
+        use_assistant_message: bool = True,
+        request_start_timestamp_ns: Optional[int] = None,
+        include_return_message_types: Optional[List[MessageType]] = None,
     ) -> AsyncGenerator[Union[LettaMessage, LegacyLettaMessage, MessageStreamStatus], None]:
         """
         This agent is synchronous-only. If called in an async context, raise an error.

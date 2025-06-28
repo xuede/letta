@@ -46,7 +46,7 @@ from letta.schemas.agent import AgentState, AgentStepResponse, UpdateAgent, get_
 from letta.schemas.block import BlockUpdate
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import MessageRole, ProviderType
-from letta.schemas.letta_message_content import TextContent
+from letta.schemas.letta_message_content import ImageContent, TextContent
 from letta.schemas.memory import ContextWindowOverview, Memory
 from letta.schemas.message import Message, MessageCreate, ToolReturn
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse
@@ -255,7 +255,7 @@ class Agent(BaseAgent):
         self.tool_rules_solver.register_tool_call(function_name)
 
         # Extend conversation with function response
-        function_response = package_function_response(False, error_msg)
+        function_response = package_function_response(False, error_msg, self.agent_state.timezone)
         new_message = Message(
             agent_id=self.agent_state.id,
             # Base info OpenAI-style
@@ -369,6 +369,16 @@ class Agent(BaseAgent):
                     )
                 else:
                     # Fallback to existing flow
+                    for message in message_sequence:
+                        if isinstance(message.content, list):
+
+                            def get_fallback_text_content(content):
+                                if isinstance(content, ImageContent):
+                                    return TextContent(text="[Image Here]")
+                                return content
+
+                            message.content = [get_fallback_text_content(content) for content in message.content]
+
                     response = create(
                         llm_config=self.agent_state.llm_config,
                         messages=message_sequence,
@@ -630,7 +640,7 @@ class Agent(BaseAgent):
                     function_response, return_char_limit=return_char_limit, truncate=truncate
                 )
                 function_args.pop("self", None)
-                function_response = package_function_response(True, function_response_string)
+                function_response = package_function_response(True, function_response_string, self.agent_state.timezone)
                 function_failed = False
             except Exception as e:
                 function_args.pop("self", None)
@@ -753,7 +763,7 @@ class Agent(BaseAgent):
         self.tool_rules_solver.clear_tool_history()
 
         # Convert MessageCreate objects to Message objects
-        next_input_messages = convert_message_creates_to_messages(input_messages, self.agent_state.id)
+        next_input_messages = convert_message_creates_to_messages(input_messages, self.agent_state.id, self.agent_state.timezone)
         counter = 0
         total_usage = UsageStatistics()
         step_count = 0
@@ -813,7 +823,7 @@ class Agent(BaseAgent):
                         model=self.model,
                         openai_message_dict={
                             "role": "user",  # TODO: change to system?
-                            "content": get_heartbeat(FUNC_FAILED_HEARTBEAT_MESSAGE),
+                            "content": get_heartbeat(self.agent_state.timezone, FUNC_FAILED_HEARTBEAT_MESSAGE),
                         },
                     )
                 ]
@@ -826,7 +836,7 @@ class Agent(BaseAgent):
                         model=self.model,
                         openai_message_dict={
                             "role": "user",  # TODO: change to system?
-                            "content": get_heartbeat(REQ_HEARTBEAT_MESSAGE),
+                            "content": get_heartbeat(self.agent_state.timezone, REQ_HEARTBEAT_MESSAGE),
                         },
                     )
                 ]
@@ -990,11 +1000,12 @@ class Agent(BaseAgent):
             )
             if job_id:
                 for message in all_new_messages:
-                    self.job_manager.add_message_to_job(
-                        job_id=job_id,
-                        message_id=message.id,
-                        actor=self.user,
-                    )
+                    if message.role != "user":
+                        self.job_manager.add_message_to_job(
+                            job_id=job_id,
+                            message_id=message.id,
+                            actor=self.user,
+                        )
 
             return AgentStepResponse(
                 messages=all_new_messages,
@@ -1069,7 +1080,7 @@ class Agent(BaseAgent):
         assert user_message_str and isinstance(
             user_message_str, str
         ), f"user_message_str should be a non-empty string, got {type(user_message_str)}"
-        user_message_json_str = package_user_message(user_message_str)
+        user_message_json_str = package_user_message(user_message_str, self.agent_state.timezone)
 
         # Validate JSON via save/load
         user_message = validate_json(user_message_json_str)
@@ -1132,7 +1143,9 @@ class Agent(BaseAgent):
         remaining_message_count = 1 + len(in_context_messages) - cutoff  # System + remaining
         hidden_message_count = all_time_message_count - remaining_message_count
         summary_message_count = len(message_sequence_to_summarize)
-        summary_message = package_summarize_message(summary, summary_message_count, hidden_message_count, all_time_message_count)
+        summary_message = package_summarize_message(
+            summary, summary_message_count, hidden_message_count, all_time_message_count, self.agent_state.timezone
+        )
         logger.info(f"Packaged into message: {summary_message}")
 
         prior_len = len(in_context_messages_openai)
@@ -1233,6 +1246,7 @@ class Agent(BaseAgent):
         message_manager_size = self.message_manager.size(actor=self.user, agent_id=self.agent_state.id)
         external_memory_summary = compile_memory_metadata_block(
             memory_edit_timestamp=get_utc_time(),
+            timezone=self.agent_state.timezone,
             previous_message_count=self.message_manager.size(actor=self.user, agent_id=self.agent_state.id),
             archival_memory_size=self.agent_manager.passage_size(actor=self.user, agent_id=self.agent_state.id),
         )

@@ -6,6 +6,7 @@ LETTA_DIR = os.path.join(os.path.expanduser("~"), ".letta")
 LETTA_TOOL_EXECUTION_DIR = os.path.join(LETTA_DIR, "tool_execution_dir")
 
 LETTA_MODEL_ENDPOINT = "https://inference.letta.com"
+DEFAULT_TIMEZONE = "UTC"
 
 ADMIN_PREFIX = "/v1/admin"
 API_PREFIX = "/v1"
@@ -31,6 +32,9 @@ LETTA_TOOL_MODULE_NAMES = [
     LETTA_FILES_TOOL_MODULE_NAME,
 ]
 
+DEFAULT_ORG_ID = "org-00000000-0000-4000-8000-000000000000"
+DEFAULT_ORG_NAME = "default_org"
+
 
 # String in the error message for when the context window is too large
 # Example full message:
@@ -42,6 +46,9 @@ IN_CONTEXT_MEMORY_KEYWORD = "CORE_MEMORY"
 
 # OpenAI error message: Invalid 'messages[1].tool_calls[0].id': string too long. Expected a string with maximum length 29, but got a string with length 36 instead.
 TOOL_CALL_ID_MAX_LEN = 29
+
+# Max steps for agent loop
+DEFAULT_MAX_STEPS = 50
 
 # minimum context window size
 MIN_CONTEXT_WINDOW = 4096
@@ -59,7 +66,7 @@ DEFAULT_EMBEDDING_CHUNK_SIZE = 300
 
 # tokenizers
 EMBEDDING_TO_TOKENIZER_MAP = {
-    "text-embedding-ada-002": "cl100k_base",
+    "text-embedding-3-small": "cl100k_base",
 }
 EMBEDDING_TO_TOKENIZER_DEFAULT = "cl100k_base"
 
@@ -76,6 +83,7 @@ SEND_MESSAGE_TOOL_NAME = "send_message"
 # Base tools that cannot be edited, as they access agent state directly
 # Note that we don't include "conversation_search_date" for now
 BASE_TOOLS = [SEND_MESSAGE_TOOL_NAME, "conversation_search", "archival_memory_insert", "archival_memory_search"]
+DEPRECATED_BASE_TOOLS = ["archival_memory_insert", "archival_memory_search"]
 # Base memory tools CAN be edited, and are added by default by the server
 BASE_MEMORY_TOOLS = ["core_memory_append", "core_memory_replace"]
 # New v2 collection of the base memory tools (effecitvely same as sleeptime set), to pair with memgpt_v2 prompt
@@ -107,7 +115,7 @@ BASE_VOICE_SLEEPTIME_TOOLS = [
     "finish_rethinking_memory",
 ]
 # Multi agent tools
-MULTI_AGENT_TOOLS = ["send_message_to_agent_and_wait_for_reply", "send_message_to_agents_matching_tags", "send_message_to_agent_async"]
+MULTI_AGENT_TOOLS = ["send_message_to_agent_and_wait_for_reply", "send_message_to_agents_matching_tags"]
 
 # Used to catch if line numbers are pushed in
 # MEMORY_TOOLS_LINE_NUMBER_PREFIX_REGEX = re.compile(r"^Line \d+: ", re.MULTILINE)
@@ -122,7 +130,12 @@ MEMORY_TOOLS_LINE_NUMBER_PREFIX_REGEX = re.compile(
 BUILTIN_TOOLS = ["run_code", "web_search"]
 
 # Built in tools
-FILES_TOOLS = ["open_file", "close_file", "grep", "search_files"]
+FILES_TOOLS = ["open_files", "grep_files", "search_files"]
+
+FILE_MEMORY_EXISTS_MESSAGE = "The following files are currently accessible in memory:"
+FILE_MEMORY_EMPTY_MESSAGE = (
+    "There are no files currently available in memory. Files will appear here once they are uploaded directly to your system."
+)
 
 # Set of all built-in Letta tools
 LETTA_TOOL_SET = set(
@@ -186,10 +199,21 @@ CORE_MEMORY_LINE_NUMBER_WARNING = (
 # Constants to do with summarization / conversation length window
 # The max amount of tokens supported by the underlying model (eg 8k for gpt-4 and Mistral 7B)
 LLM_MAX_TOKENS = {
-    "DEFAULT": 8192,
+    "DEFAULT": 30000,
+    # deepseek
     "deepseek-chat": 64000,
     "deepseek-reasoner": 64000,
     ## OpenAI models: https://platform.openai.com/docs/models/overview
+    # reasoners
+    "o1": 200000,
+    # "o1-pro": 200000,  # responses API only
+    "o1-2024-12-17": 200000,
+    "o3": 200000,
+    "o3-2025-04-16": 200000,
+    "o3-mini": 200000,
+    "o3-mini-2025-01-31": 200000,
+    # "o3-pro": 200000,  # responses API only
+    # "o3-pro-2025-06-10": 200000,
     "gpt-4.1": 1047576,
     "gpt-4.1-2025-04-14": 1047576,
     "gpt-4.1-mini": 1047576,
@@ -203,6 +227,7 @@ LLM_MAX_TOKENS = {
     "chatgpt-4o-latest": 128000,
     # "o1-preview-2024-09-12
     "gpt-4o-2024-08-06": 128000,
+    "gpt-4o-2024-11-20": 128000,
     "gpt-4-turbo-preview": 128000,
     "gpt-4o": 128000,
     "gpt-3.5-turbo-instruct": 16385,
@@ -212,7 +237,7 @@ LLM_MAX_TOKENS = {
     # "davinci-002": 128000,
     "gpt-4-turbo-2024-04-09": 128000,
     # "gpt-4o-realtime-preview-2024-10-01
-    "gpt-4-turbo": 8192,
+    "gpt-4-turbo": 128000,
     "gpt-4o-2024-05-13": 128000,
     # "o1-mini
     # "o1-mini-2024-09-12
@@ -286,9 +311,6 @@ MESSAGE_SUMMARY_WARNING_STR = " ".join(
         # "Remember to pass request_heartbeat = true if you would like to send a message immediately after.",
     ]
 )
-DATA_SOURCE_ATTACH_ALERT = (
-    "[ALERT] New data was just uploaded to archival memory. You can view this data by calling the archival_memory_search tool."
-)
 
 # Throw an error message when a read-only block is edited
 READ_ONLY_BLOCK_EDIT_ERROR = f"{ERROR_MESSAGE_PREFIX} This block is read-only and cannot be edited."
@@ -331,6 +353,10 @@ WEB_SEARCH_CLIP_CONTENT = False
 WEB_SEARCH_INCLUDE_SCORE = False
 WEB_SEARCH_SEPARATOR = "\n" + "-" * 40 + "\n"
 
-REDIS_INCLUDE = "INCLUDE"
-REDIS_EXCLUDE = "EXCLUDE"
+REDIS_INCLUDE = "include"
+REDIS_EXCLUDE = "exclude"
 REDIS_SET_DEFAULT_VAL = "None"
+REDIS_DEFAULT_CACHE_PREFIX = "letta_cache"
+
+# TODO: This is temporary, eventually use token-based eviction
+MAX_FILES_OPEN = 5

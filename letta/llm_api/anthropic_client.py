@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 from typing import Dict, List, Optional, Union
 
@@ -20,9 +21,11 @@ from letta.errors import (
     LLMPermissionDeniedError,
     LLMRateLimitError,
     LLMServerError,
+    LLMTimeoutError,
     LLMUnprocessableEntityError,
 )
 from letta.helpers.datetime_helpers import get_utc_time_int
+from letta.helpers.decorators import deprecated
 from letta.llm_api.helpers import add_inner_thoughts_to_functions, unpack_all_inner_thoughts_from_kwargs
 from letta.llm_api.llm_client_base import LLMClientBase
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG, INNER_THOUGHTS_KWARG_DESCRIPTION
@@ -46,22 +49,23 @@ logger = get_logger(__name__)
 class AnthropicClient(LLMClientBase):
 
     @trace_method
+    @deprecated("Synchronous version of this is no longer valid. Will result in model_dump of coroutine")
     def request(self, request_data: dict, llm_config: LLMConfig) -> dict:
         client = self._get_anthropic_client(llm_config, async_client=False)
-        response = client.beta.messages.create(**request_data, betas=["tools-2024-04-04"])
+        response = client.beta.messages.create(**request_data)
         return response.model_dump()
 
     @trace_method
     async def request_async(self, request_data: dict, llm_config: LLMConfig) -> dict:
         client = await self._get_anthropic_client_async(llm_config, async_client=True)
-        response = await client.beta.messages.create(**request_data, betas=["tools-2024-04-04"])
+        response = await client.beta.messages.create(**request_data)
         return response.model_dump()
 
     @trace_method
     async def stream_async(self, request_data: dict, llm_config: LLMConfig) -> AsyncStream[BetaRawMessageStreamEvent]:
         client = await self._get_anthropic_client_async(llm_config, async_client=True)
         request_data["stream"] = True
-        return await client.beta.messages.create(**request_data, betas=["tools-2024-04-04"])
+        return await client.beta.messages.create(**request_data)
 
     @trace_method
     async def send_llm_batch_request_async(
@@ -201,7 +205,7 @@ class AnthropicClient(LLMClientBase):
             tool_choice = {"type": "auto", "disable_parallel_tool_use": True}
             tools_for_request = [OpenAITool(function=f) for f in tools]
         elif force_tool_call is not None:
-            tool_choice = {"type": "tool", "name": force_tool_call}
+            tool_choice = {"type": "tool", "name": force_tool_call, "disable_parallel_tool_use": True}
             tools_for_request = [OpenAITool(function=f) for f in tools if f["name"] == force_tool_call]
 
             # need to have this setting to be able to put inner thoughts in kwargs
@@ -242,7 +246,8 @@ class AnthropicClient(LLMClientBase):
         # Move 'system' to the top level
         if messages[0].role != "system":
             raise RuntimeError(f"First message is not a system message, instead has role {messages[0].role}")
-        data["system"] = messages[0].content if isinstance(messages[0].content, str) else messages[0].content[0].text
+        system_content = messages[0].content if isinstance(messages[0].content, str) else messages[0].content[0].text
+        data["system"] = self._add_cache_control_to_system_message(system_content)
         data["messages"] = [
             m.to_anthropic_dict(
                 inner_thoughts_xml_tag=inner_thoughts_xml_tag,
@@ -271,6 +276,8 @@ class AnthropicClient(LLMClientBase):
         return data
 
     async def count_tokens(self, messages: List[dict] = None, model: str = None, tools: List[OpenAITool] = None) -> int:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
         client = anthropic.AsyncAnthropic()
         if messages and len(messages) == 0:
             messages = None
@@ -286,9 +293,6 @@ class AnthropicClient(LLMClientBase):
                 tools=anthropic_tools or [],
             )
         except:
-            import ipdb
-
-            ipdb.set_trace()
             raise
 
         token_count = result.input_tokens
@@ -298,6 +302,14 @@ class AnthropicClient(LLMClientBase):
 
     @trace_method
     def handle_llm_error(self, e: Exception) -> Exception:
+        if isinstance(e, anthropic.APITimeoutError):
+            logger.warning(f"[Anthropic] Request timeout: {e}")
+            return LLMTimeoutError(
+                message=f"Request to Anthropic timed out: {str(e)}",
+                code=ErrorCode.TIMEOUT,
+                details={"cause": str(e.__cause__) if e.__cause__ else None},
+            )
+
         if isinstance(e, anthropic.APIConnectionError):
             logger.warning(f"[Anthropic] API connection error: {e.__cause__}")
             return LLMConnectionError(
@@ -315,9 +327,11 @@ class AnthropicClient(LLMClientBase):
 
         if isinstance(e, anthropic.BadRequestError):
             logger.warning(f"[Anthropic] Bad request: {str(e)}")
-            if "prompt is too long" in str(e).lower():
-                # If the context window is too large, we expect to receive:
+            error_str = str(e).lower()
+            if "prompt is too long" in error_str or "exceed context limit" in error_str:
+                # If the context window is too large, we expect to receive either:
                 # 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'prompt is too long: 200758 tokens > 200000 maximum'}}
+                # 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'input length and `max_tokens` exceed context limit: 173298 + 32000 > 200000, decrease input length or `max_tokens` and try again'}}
                 return ContextWindowExceededError(
                     message=f"Bad request to Anthropic (context window exceeded): {str(e)}",
                 )
@@ -489,6 +503,22 @@ class AnthropicClient(LLMClientBase):
             )
 
         return chat_completion_response
+
+    def _add_cache_control_to_system_message(self, system_content):
+        """Add cache control to system message content"""
+        if isinstance(system_content, str):
+            # For string content, convert to list format with cache control
+            return [{"type": "text", "text": system_content, "cache_control": {"type": "ephemeral"}}]
+        elif isinstance(system_content, list):
+            # For list content, add cache control to the last text block
+            cached_content = system_content.copy()
+            for i in range(len(cached_content) - 1, -1, -1):
+                if cached_content[i].get("type") == "text":
+                    cached_content[i]["cache_control"] = {"type": "ephemeral"}
+                    break
+            return cached_content
+
+        return system_content
 
 
 def convert_tools_to_anthropic_format(tools: List[OpenAITool]) -> List[dict]:

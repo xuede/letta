@@ -29,28 +29,32 @@ from letta.constants import (
     BASE_VOICE_SLEEPTIME_CHAT_TOOLS,
     BASE_VOICE_SLEEPTIME_TOOLS,
     BUILTIN_TOOLS,
+    DEFAULT_ORG_ID,
+    DEFAULT_ORG_NAME,
     FILES_TOOLS,
     LETTA_TOOL_EXECUTION_DIR,
     LETTA_TOOL_SET,
     MCP_TOOL_TAG_NAME_PREFIX,
     MULTI_AGENT_TOOLS,
 )
+from letta.data_sources.redis_client import NoopAsyncRedisClient, get_redis_client
 from letta.embeddings import embedding_model
 from letta.functions.functions import derive_openai_json_schema, parse_source_code
 from letta.functions.mcp_client.types import MCPTool
 from letta.helpers import ToolRulesSolver
+from letta.helpers.datetime_helpers import AsyncTimer
 from letta.jobs.types import ItemUpdateInfo, RequestStatusUpdateInfo, StepStatusUpdateInfo
 from letta.orm import Base, Block
 from letta.orm.block_history import BlockHistory
-from letta.orm.enums import ActorType, JobType, ToolType
+from letta.orm.enums import ToolType
 from letta.orm.errors import NoResultFound, UniqueConstraintViolationError
 from letta.orm.file import FileContent as FileContentModel
 from letta.orm.file import FileMetadata as FileMetadataModel
-from letta.schemas.agent import AgentStepState, CreateAgent, UpdateAgent
+from letta.schemas.agent import CreateAgent, UpdateAgent
 from letta.schemas.block import Block as PydanticBlock
 from letta.schemas.block import BlockUpdate, CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
-from letta.schemas.enums import AgentStepStatus, FileProcessingStatus, JobStatus, MessageRole, ProviderType
+from letta.schemas.enums import ActorType, AgentStepStatus, FileProcessingStatus, JobStatus, JobType, MessageRole, ProviderType
 from letta.schemas.environment_variables import SandboxEnvironmentVariableCreate, SandboxEnvironmentVariableUpdate
 from letta.schemas.file import FileMetadata as PydanticFileMetadata
 from letta.schemas.identity import IdentityCreate, IdentityProperty, IdentityPropertyType, IdentityType, IdentityUpdate, IdentityUpsert
@@ -60,7 +64,7 @@ from letta.schemas.job import Job as PydanticJob
 from letta.schemas.job import JobUpdate, LettaRequestConfig
 from letta.schemas.letta_message import UpdateAssistantMessage, UpdateReasoningMessage, UpdateSystemMessage, UpdateUserMessage
 from letta.schemas.letta_message_content import TextContent
-from letta.schemas.llm_batch_job import LLMBatchItem
+from letta.schemas.llm_batch_job import AgentStepState, LLMBatchItem
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.message import MessageCreate, MessageUpdate
@@ -69,6 +73,7 @@ from letta.schemas.organization import Organization
 from letta.schemas.organization import Organization as PydanticOrganization
 from letta.schemas.organization import OrganizationUpdate
 from letta.schemas.passage import Passage as PydanticPassage
+from letta.schemas.pip_requirement import PipRequirement
 from letta.schemas.run import Run as PydanticRun
 from letta.schemas.sandbox_config import E2BSandboxConfig, LocalSandboxConfig, SandboxConfigCreate, SandboxConfigUpdate, SandboxType
 from letta.schemas.source import Source as PydanticSource
@@ -81,7 +86,7 @@ from letta.schemas.user import UserUpdate
 from letta.server.db import db_registry
 from letta.server.server import SyncServer
 from letta.services.block_manager import BlockManager
-from letta.services.organization_manager import OrganizationManager
+from letta.services.helpers.agent_manager_helper import calculate_base_tools
 from letta.settings import tool_settings
 from tests.helpers.utils import comprehensive_agent_checks, validate_context_window_overview
 from tests.utils import random_string
@@ -183,7 +188,7 @@ async def other_source(server: SyncServer, default_user):
 
 @pytest.fixture
 async def default_file(server: SyncServer, default_source, default_user, default_organization):
-    file = await server.source_manager.create_file(
+    file = await server.file_manager.create_file(
         PydanticFileMetadata(file_name="test_file", organization_id=default_organization.id, source_id=default_source.id),
         actor=default_user,
     )
@@ -664,7 +669,7 @@ def event_loop(request):
 
 @pytest.fixture
 async def file_attachment(server, default_user, sarah_agent, default_file):
-    assoc = await server.file_agent_manager.attach_file(
+    assoc, closed_files = await server.file_agent_manager.attach_file(
         agent_id=sarah_agent.id,
         file_id=default_file.id,
         file_name=default_file.file_name,
@@ -681,7 +686,7 @@ async def another_file(server, default_source, default_user, default_organizatio
         organization_id=default_organization.id,
         source_id=default_source.id,
     )
-    return await server.source_manager.create_file(pf, actor=default_user)
+    return await server.file_manager.create_file(pf, actor=default_user)
 
 
 # ======================================================================================================================
@@ -712,6 +717,103 @@ async def test_create_get_list_agent(server: SyncServer, comprehensive_test_agen
     assert len(list_agents) == 0
 
 
+@pytest.mark.asyncio
+async def test_create_agent_include_base_tools(server: SyncServer, default_user, event_loop):
+    """Test agent creation with include_default_source=True"""
+    # Upsert base tools
+    server.tool_manager.upsert_base_tools(actor=default_user)
+
+    memory_blocks = [CreateBlock(label="human", value="TestUser"), CreateBlock(label="persona", value="I am a test assistant")]
+
+    create_agent_request = CreateAgent(
+        name="test_default_source_agent",
+        system="test system",
+        memory_blocks=memory_blocks,
+        llm_config=LLMConfig.default_config("gpt-4o-mini"),
+        embedding_config=EmbeddingConfig.default_config(provider="openai"),
+        include_base_tools=True,
+    )
+
+    # Create the agent
+    created_agent = await server.agent_manager.create_agent_async(
+        create_agent_request,
+        actor=default_user,
+    )
+
+    # Assert the tools exist
+    tool_names = [t.name for t in created_agent.tools]
+    expected_tools = calculate_base_tools(is_v2=False)
+    assert sorted(tool_names) == sorted(expected_tools)
+
+
+@pytest.mark.asyncio
+async def test_create_agent_with_default_source(server: SyncServer, default_user, print_tool, default_block, event_loop):
+    """Test agent creation with include_default_source=True"""
+    memory_blocks = [CreateBlock(label="human", value="TestUser"), CreateBlock(label="persona", value="I am a test assistant")]
+
+    create_agent_request = CreateAgent(
+        name="test_default_source_agent",
+        system="test system",
+        memory_blocks=memory_blocks,
+        llm_config=LLMConfig.default_config("gpt-4o-mini"),
+        embedding_config=EmbeddingConfig.default_config(provider="openai"),
+        block_ids=[default_block.id],
+        tool_ids=[print_tool.id],
+        include_default_source=True,  # This is the key field we're testing
+        include_base_tools=False,
+    )
+
+    # Create the agent
+    created_agent = await server.agent_manager.create_agent_async(
+        create_agent_request,
+        actor=default_user,
+    )
+
+    # Verify agent was created
+    assert created_agent is not None
+    assert created_agent.name == "test_default_source_agent"
+
+    # Verify that a default source was created and attached
+    attached_sources = await server.agent_manager.list_attached_sources_async(agent_id=created_agent.id, actor=default_user)
+
+    # Should have exactly one source (the default one)
+    assert len(attached_sources) == 1
+    auto_default_source = attached_sources[0]
+
+    # Verify the default source properties
+    assert created_agent.name in auto_default_source.name
+    assert auto_default_source.embedding_config.embedding_endpoint_type == "openai"
+
+    # Test with include_default_source=False
+    create_agent_request_no_source = CreateAgent(
+        name="test_no_default_source_agent",
+        system="test system",
+        memory_blocks=memory_blocks,
+        llm_config=LLMConfig.default_config("gpt-4o-mini"),
+        embedding_config=EmbeddingConfig.default_config(provider="openai"),
+        block_ids=[default_block.id],
+        tool_ids=[print_tool.id],
+        include_default_source=False,  # Explicitly set to False
+        include_base_tools=False,
+    )
+
+    created_agent_no_source = await server.agent_manager.create_agent_async(
+        create_agent_request_no_source,
+        actor=default_user,
+    )
+
+    # Verify no sources are attached
+    attached_sources_no_source = await server.agent_manager.list_attached_sources_async(
+        agent_id=created_agent_no_source.id, actor=default_user
+    )
+
+    assert len(attached_sources_no_source) == 0
+
+    # Clean up
+    server.agent_manager.delete_agent(created_agent.id, default_user)
+    server.agent_manager.delete_agent(created_agent_no_source.id, default_user)
+
+
 @pytest.fixture(params=["", "PRODUCTION"])
 def set_letta_environment(request):
     original = os.environ.get("LETTA_ENVIRONMENT")
@@ -732,7 +834,7 @@ async def test_get_context_window_basic(
     created_agent, create_agent_request = comprehensive_test_agent_fixture
 
     # Attach a file
-    assoc = await server.file_agent_manager.attach_file(
+    assoc, closed_files = await server.file_agent_manager.attach_file(
         agent_id=created_agent.id,
         file_id=default_file.id,
         file_name=default_file.file_name,
@@ -1588,14 +1690,13 @@ async def test_reset_messages_no_messages(server: SyncServer, sarah_agent, defau
     Test that resetting messages on an agent that has zero messages
     does not fail and clears out message_ids if somehow it's non-empty.
     """
-    # Force a weird scenario: Suppose the message_ids field was set non-empty (without actual messages).
-    await server.agent_manager.update_agent_async(sarah_agent.id, UpdateAgent(message_ids=["ghost-message-id"]), actor=default_user)
-    updated_agent = await server.agent_manager.get_agent_by_id_async(sarah_agent.id, default_user)
-    assert updated_agent.message_ids == ["ghost-message-id"]
+    assert len(sarah_agent.message_ids) == 4
+    og_message_ids = sarah_agent.message_ids
 
     # Reset messages
     reset_agent = await server.agent_manager.reset_messages_async(agent_id=sarah_agent.id, actor=default_user)
     assert len(reset_agent.message_ids) == 1
+    assert og_message_ids[0] == reset_agent.message_ids[0]
     # Double check that physically no messages exist
     assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 1
 
@@ -1606,16 +1707,18 @@ async def test_reset_messages_default_messages(server: SyncServer, sarah_agent, 
     Test that resetting messages on an agent that has zero messages
     does not fail and clears out message_ids if somehow it's non-empty.
     """
-    # Force a weird scenario: Suppose the message_ids field was set non-empty (without actual messages).
-    await server.agent_manager.update_agent_async(sarah_agent.id, UpdateAgent(message_ids=["ghost-message-id"]), actor=default_user)
-    updated_agent = await server.agent_manager.get_agent_by_id_async(sarah_agent.id, default_user)
-    assert updated_agent.message_ids == ["ghost-message-id"]
+    assert len(sarah_agent.message_ids) == 4
+    og_message_ids = sarah_agent.message_ids
 
     # Reset messages
     reset_agent = await server.agent_manager.reset_messages_async(
         agent_id=sarah_agent.id, actor=default_user, add_default_initial_messages=True
     )
     assert len(reset_agent.message_ids) == 4
+    assert og_message_ids[0] == reset_agent.message_ids[0]
+    assert og_message_ids[1] != reset_agent.message_ids[1]
+    assert og_message_ids[2] != reset_agent.message_ids[2]
+    assert og_message_ids[3] != reset_agent.message_ids[3]
     # Double check that physically no messages exist
     assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 4
 
@@ -1667,6 +1770,9 @@ async def test_reset_messages_idempotency(server: SyncServer, sarah_agent, defau
     """
     Test that calling reset_messages multiple times has no adverse effect.
     """
+    # Clear messages first
+    await server.message_manager.delete_messages_by_ids_async(message_ids=sarah_agent.message_ids[1:], actor=default_user)
+
     # Create a single message
     server.message_manager.create_message(
         PydanticMessage(
@@ -1686,6 +1792,72 @@ async def test_reset_messages_idempotency(server: SyncServer, sarah_agent, defau
     reset_agent_again = await server.agent_manager.reset_messages_async(agent_id=sarah_agent.id, actor=default_user)
     assert len(reset_agent.message_ids) == 1
     assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 1
+
+
+@pytest.mark.asyncio
+async def test_reset_messages_preserves_system_message_id(server: SyncServer, sarah_agent, default_user, event_loop):
+    """
+    Test that resetting messages preserves the original system message ID.
+    """
+    # Get the original system message ID
+    original_agent = await server.agent_manager.get_agent_by_id_async(sarah_agent.id, default_user)
+    original_system_message_id = original_agent.message_ids[0]
+
+    # Add some user messages
+    server.message_manager.create_message(
+        PydanticMessage(
+            agent_id=sarah_agent.id,
+            organization_id=default_user.organization_id,
+            role="user",
+            content=[TextContent(text="Hello!")],
+        ),
+        actor=default_user,
+    )
+
+    # Reset messages
+    reset_agent = await server.agent_manager.reset_messages_async(agent_id=sarah_agent.id, actor=default_user)
+
+    # Verify the system message ID is preserved
+    assert len(reset_agent.message_ids) == 1
+    assert reset_agent.message_ids[0] == original_system_message_id
+
+    # Verify the system message still exists in the database
+    system_message = await server.message_manager.get_message_by_id_async(message_id=original_system_message_id, actor=default_user)
+    assert system_message.role == "system"
+
+
+@pytest.mark.asyncio
+async def test_reset_messages_preserves_system_message_content(server: SyncServer, sarah_agent, default_user, event_loop):
+    """
+    Test that resetting messages preserves the original system message content.
+    """
+    # Get the original system message
+    original_agent = await server.agent_manager.get_agent_by_id_async(sarah_agent.id, default_user)
+    original_system_message = await server.message_manager.get_message_by_id_async(
+        message_id=original_agent.message_ids[0], actor=default_user
+    )
+
+    # Add some messages and reset
+    server.message_manager.create_message(
+        PydanticMessage(
+            agent_id=sarah_agent.id,
+            organization_id=default_user.organization_id,
+            role="user",
+            content=[TextContent(text="Hello!")],
+        ),
+        actor=default_user,
+    )
+
+    reset_agent = await server.agent_manager.reset_messages_async(agent_id=sarah_agent.id, actor=default_user)
+
+    # Verify the system message content is unchanged
+    preserved_system_message = await server.message_manager.get_message_by_id_async(
+        message_id=reset_agent.message_ids[0], actor=default_user
+    )
+
+    assert preserved_system_message.content == original_system_message.content
+    assert preserved_system_message.role == "system"
+    assert preserved_system_message.id == original_system_message.id
 
 
 @pytest.mark.asyncio
@@ -2141,7 +2313,7 @@ async def test_list_organizations(server: SyncServer, event_loop):
 async def test_create_default_organization(server: SyncServer, event_loop):
     await server.organization_manager.create_default_organization_async()
     retrieved = await server.organization_manager.get_default_organization_async()
-    assert retrieved.name == server.organization_manager.DEFAULT_ORG_NAME
+    assert retrieved.name == DEFAULT_ORG_NAME
 
 
 @pytest.mark.asyncio
@@ -2724,12 +2896,49 @@ async def test_update_user(server: SyncServer, event_loop):
     # Adjust name
     user = await server.user_manager.update_actor_async(UserUpdate(id=user.id, name=user_name_b))
     assert user.name == user_name_b
-    assert user.organization_id == OrganizationManager.DEFAULT_ORG_ID
+    assert user.organization_id == DEFAULT_ORG_ID
 
     # Adjust org id
     user = await server.user_manager.update_actor_async(UserUpdate(id=user.id, organization_id=test_org.id))
     assert user.name == user_name_b
     assert user.organization_id == test_org.id
+
+
+@pytest.mark.asyncio
+async def test_user_caching(server: SyncServer, event_loop, default_user, performance_pct=0.4):
+    if isinstance(await get_redis_client(), NoopAsyncRedisClient):
+        pytest.skip("redis not available")
+    # Invalidate previous cache behavior.
+    await server.user_manager._invalidate_actor_cache(default_user.id)
+    before_stats = server.user_manager.get_actor_by_id_async.cache_stats
+    before_cache_misses = before_stats.misses
+    before_cache_hits = before_stats.hits
+
+    # First call (expected to miss the cache)
+    async with AsyncTimer() as timer:
+        actor = await server.user_manager.get_actor_by_id_async(default_user.id)
+    duration_first = timer.elapsed_ns
+    print(f"Call 1: {duration_first:.2e}ns")
+    assert actor.id == default_user.id
+    assert duration_first > 0  # Sanity check: took non-zero time
+    cached_hits = 10
+    durations = []
+    for i in range(cached_hits):
+        async with AsyncTimer() as timer:
+            actor_cached = await server.user_manager.get_actor_by_id_async(default_user.id)
+        duration = timer.elapsed_ns
+        durations.append(duration)
+        print(f"Call {i+2}: {duration:.2e}ns")
+        assert actor_cached == actor
+    for d in durations:
+        assert d < duration_first * performance_pct
+    stats = server.user_manager.get_actor_by_id_async.cache_stats
+
+    print(f"Before calls: {before_stats}")
+    print(f"After calls: {stats}")
+    # Assert cache stats
+    assert stats.misses - before_cache_misses == 1
+    assert stats.hits - before_cache_hits == cached_hits
 
 
 # ======================================================================================================================
@@ -2801,7 +3010,7 @@ def test_get_tool_with_actor(server: SyncServer, print_tool, default_user):
 @pytest.mark.asyncio
 async def test_list_tools(server: SyncServer, print_tool, default_user, event_loop):
     # List tools (should include the one created by the fixture)
-    tools = await server.tool_manager.list_tools_async(actor=default_user)
+    tools = await server.tool_manager.list_tools_async(actor=default_user, upsert_base_tools=False)
 
     # Assertions to check that the created tool is listed
     assert len(tools) == 1
@@ -2930,7 +3139,7 @@ async def test_delete_tool_by_id(server: SyncServer, print_tool, default_user, e
     # Delete the print_tool using the manager method
     server.tool_manager.delete_tool_by_id(print_tool.id, actor=default_user)
 
-    tools = await server.tool_manager.list_tools_async(actor=default_user)
+    tools = await server.tool_manager.list_tools_async(actor=default_user, upsert_base_tools=False)
     assert len(tools) == 0
 
 
@@ -3006,6 +3215,175 @@ async def test_upsert_multiple_tool_types(server: SyncServer, default_user):
 async def test_upsert_base_tools_with_empty_type_filter(server: SyncServer, default_user):
     tools = await server.tool_manager.upsert_base_tools_async(actor=default_user, allowed_types=set())
     assert tools == []
+
+
+@pytest.mark.asyncio
+async def test_create_tool_with_pip_requirements(server: SyncServer, default_user, default_organization):
+    def test_tool_with_deps():
+        """
+        A test tool with pip dependencies.
+
+        Returns:
+            str: Hello message.
+        """
+        return "hello"
+
+    # Create pip requirements
+    pip_reqs = [
+        PipRequirement(name="requests", version="2.28.0"),
+        PipRequirement(name="numpy"),  # No version specified
+    ]
+
+    # Set up tool details
+    source_code = parse_source_code(test_tool_with_deps)
+    source_type = "python"
+    description = "A test tool with pip dependencies"
+    tags = ["test"]
+    metadata = {"test": "pip_requirements"}
+
+    tool = PydanticTool(
+        description=description, tags=tags, source_code=source_code, source_type=source_type, metadata_=metadata, pip_requirements=pip_reqs
+    )
+    derived_json_schema = derive_openai_json_schema(source_code=tool.source_code, name=tool.name)
+    derived_name = derived_json_schema["name"]
+    tool.json_schema = derived_json_schema
+    tool.name = derived_name
+
+    created_tool = await server.tool_manager.create_or_update_tool_async(tool, actor=default_user)
+
+    # Assertions
+    assert created_tool.pip_requirements is not None
+    assert len(created_tool.pip_requirements) == 2
+    assert created_tool.pip_requirements[0].name == "requests"
+    assert created_tool.pip_requirements[0].version == "2.28.0"
+    assert created_tool.pip_requirements[1].name == "numpy"
+    assert created_tool.pip_requirements[1].version is None
+
+
+@pytest.mark.asyncio
+async def test_create_tool_without_pip_requirements(server: SyncServer, print_tool):
+    # Verify that tools without pip_requirements have the field as None
+    assert print_tool.pip_requirements is None
+
+
+@pytest.mark.asyncio
+async def test_update_tool_pip_requirements(server: SyncServer, print_tool, default_user):
+    # Add pip requirements to existing tool
+    pip_reqs = [
+        PipRequirement(name="pandas", version="1.5.0"),
+        PipRequirement(name="matplotlib"),
+    ]
+
+    tool_update = ToolUpdate(pip_requirements=pip_reqs)
+    await server.tool_manager.update_tool_by_id_async(print_tool.id, tool_update, actor=default_user)
+
+    # Fetch the updated tool
+    updated_tool = await server.tool_manager.get_tool_by_id_async(print_tool.id, actor=default_user)
+
+    # Assertions
+    assert updated_tool.pip_requirements is not None
+    assert len(updated_tool.pip_requirements) == 2
+    assert updated_tool.pip_requirements[0].name == "pandas"
+    assert updated_tool.pip_requirements[0].version == "1.5.0"
+    assert updated_tool.pip_requirements[1].name == "matplotlib"
+    assert updated_tool.pip_requirements[1].version is None
+
+
+@pytest.mark.asyncio
+async def test_update_tool_clear_pip_requirements(server: SyncServer, default_user, default_organization):
+    def test_tool_clear_deps():
+        """
+        A test tool to clear dependencies.
+
+        Returns:
+            str: Hello message.
+        """
+        return "hello"
+
+    # Create a tool with pip requirements
+    pip_reqs = [PipRequirement(name="requests")]
+
+    # Set up tool details
+    source_code = parse_source_code(test_tool_clear_deps)
+    source_type = "python"
+    description = "A test tool to clear dependencies"
+    tags = ["test"]
+    metadata = {"test": "clear_deps"}
+
+    tool = PydanticTool(
+        description=description, tags=tags, source_code=source_code, source_type=source_type, metadata_=metadata, pip_requirements=pip_reqs
+    )
+    derived_json_schema = derive_openai_json_schema(source_code=tool.source_code, name=tool.name)
+    derived_name = derived_json_schema["name"]
+    tool.json_schema = derived_json_schema
+    tool.name = derived_name
+
+    created_tool = await server.tool_manager.create_or_update_tool_async(tool, actor=default_user)
+
+    # Verify it has requirements
+    assert created_tool.pip_requirements is not None
+    assert len(created_tool.pip_requirements) == 1
+
+    # Clear the requirements
+    tool_update = ToolUpdate(pip_requirements=[])
+    await server.tool_manager.update_tool_by_id_async(created_tool.id, tool_update, actor=default_user)
+
+    # Fetch the updated tool
+    updated_tool = await server.tool_manager.get_tool_by_id_async(created_tool.id, actor=default_user)
+
+    # Assertions
+    assert updated_tool.pip_requirements == []
+
+
+@pytest.mark.asyncio
+async def test_pip_requirements_roundtrip(server: SyncServer, default_user, default_organization):
+    def roundtrip_test_tool():
+        """
+        Test pip requirements roundtrip.
+
+        Returns:
+            str: Test message.
+        """
+        return "test"
+
+    # Create pip requirements with various version formats
+    pip_reqs = [
+        PipRequirement(name="requests", version="2.28.0"),
+        PipRequirement(name="flask", version="2.0"),
+        PipRequirement(name="django", version="4.1.0-beta"),
+        PipRequirement(name="numpy"),  # No version
+    ]
+
+    # Set up tool details
+    source_code = parse_source_code(roundtrip_test_tool)
+    source_type = "python"
+    description = "Test pip requirements roundtrip"
+    tags = ["test"]
+    metadata = {"test": "roundtrip"}
+
+    tool = PydanticTool(
+        description=description, tags=tags, source_code=source_code, source_type=source_type, metadata_=metadata, pip_requirements=pip_reqs
+    )
+    derived_json_schema = derive_openai_json_schema(source_code=tool.source_code, name=tool.name)
+    derived_name = derived_json_schema["name"]
+    tool.json_schema = derived_json_schema
+    tool.name = derived_name
+
+    created_tool = await server.tool_manager.create_or_update_tool_async(tool, actor=default_user)
+
+    # Fetch by ID
+    fetched_tool = await server.tool_manager.get_tool_by_id_async(created_tool.id, actor=default_user)
+
+    # Verify all requirements match exactly
+    assert fetched_tool.pip_requirements is not None
+    assert len(fetched_tool.pip_requirements) == 4
+
+    # Check each requirement
+    reqs_dict = {req.name: req.version for req in fetched_tool.pip_requirements}
+    assert reqs_dict["requests"] == "2.28.0"
+    assert reqs_dict["flask"] == "2.0"
+    assert reqs_dict["django"] == "4.1.0-beta"
+    assert reqs_dict["numpy"] is None
 
 
 # ======================================================================================================================
@@ -4581,10 +4959,10 @@ async def test_get_file_by_id(server: SyncServer, default_user, default_source):
         file_size=2048,
         source_id=default_source.id,
     )
-    created_file = await server.source_manager.create_file(file_metadata=file_metadata, actor=default_user)
+    created_file = await server.file_manager.create_file(file_metadata=file_metadata, actor=default_user)
 
     # Retrieve the file by ID
-    retrieved_file = await server.source_manager.get_file_by_id(file_id=created_file.id, actor=default_user)
+    retrieved_file = await server.file_manager.get_file_by_id(file_id=created_file.id, actor=default_user)
 
     # Assertions to verify the retrieved file matches the created one
     assert retrieved_file.id == created_file.id
@@ -4605,7 +4983,7 @@ async def test_create_and_retrieve_file_with_content(server, default_user, defau
         source_id=default_source.id,
     )
 
-    created = await server.source_manager.create_file(
+    created = await server.file_manager.create_file(
         file_metadata=meta,
         actor=default_user,
         text=text_body,
@@ -4618,7 +4996,7 @@ async def test_create_and_retrieve_file_with_content(server, default_user, defau
     assert await _count_file_content_rows(async_session, created.id) == 1
 
     # -- now fetch WITH the body
-    loaded = await server.source_manager.get_file_by_id(created.id, actor=default_user, include_content=True)
+    loaded = await server.file_manager.get_file_by_id(created.id, actor=default_user, include_content=True)
     assert loaded.content == text_body
 
 
@@ -4631,13 +5009,13 @@ async def test_create_file_without_content(server, default_user, default_source,
         file_size=123,
         source_id=default_source.id,
     )
-    created = await server.source_manager.create_file(file_metadata=meta, actor=default_user)
+    created = await server.file_manager.create_file(file_metadata=meta, actor=default_user)
 
     # no content row
     assert await _count_file_content_rows(async_session, created.id) == 0
 
     # include_content=True still works, returns None
-    loaded = await server.source_manager.get_file_by_id(created.id, actor=default_user, include_content=True)
+    loaded = await server.file_manager.get_file_by_id(created.id, actor=default_user, include_content=True)
     assert loaded.content is None
 
 
@@ -4652,7 +5030,7 @@ async def test_lazy_raise_guard(server, default_user, default_source, async_sess
         file_size=len(text_body),
         source_id=default_source.id,
     )
-    created = await server.source_manager.create_file(file_metadata=meta, actor=default_user, text=text_body)
+    created = await server.file_manager.create_file(file_metadata=meta, actor=default_user, text=text_body)
 
     # Grab ORM instance WITHOUT selectinload(FileMetadata.content)
     orm = await async_session.get(FileMetadataModel, created.id)
@@ -4664,7 +5042,7 @@ async def test_lazy_raise_guard(server, default_user, default_source, async_sess
 
 @pytest.mark.asyncio
 async def test_list_files_content_none(server, default_user, default_source):
-    files = await server.source_manager.list_files(source_id=default_source.id, actor=default_user)
+    files = await server.file_manager.list_files(source_id=default_source.id, actor=default_user)
     assert all(f.content is None for f in files)
 
 
@@ -4678,13 +5056,13 @@ async def test_delete_cascades_to_content(server, default_user, default_source, 
         file_size=len(text_body),
         source_id=default_source.id,
     )
-    created = await server.source_manager.create_file(file_metadata=meta, actor=default_user, text=text_body)
+    created = await server.file_manager.create_file(file_metadata=meta, actor=default_user, text=text_body)
 
     # ensure row exists first
     assert await _count_file_content_rows(async_session, created.id) == 1
 
     # delete
-    await server.source_manager.delete_file(created.id, actor=default_user)
+    await server.file_manager.delete_file(created.id, actor=default_user)
 
     # content row gone
     assert await _count_file_content_rows(async_session, created.id) == 0
@@ -4694,29 +5072,27 @@ async def test_delete_cascades_to_content(server, default_user, default_source, 
 async def test_list_files(server: SyncServer, default_user, default_source):
     """Test listing files with pagination."""
     # Create multiple files
-    await server.source_manager.create_file(
+    await server.file_manager.create_file(
         PydanticFileMetadata(file_name="File 1", file_path="/path/to/file1.txt", file_type="text/plain", source_id=default_source.id),
         actor=default_user,
     )
     if USING_SQLITE:
         time.sleep(CREATE_DELAY_SQLITE)
-    await server.source_manager.create_file(
+    await server.file_manager.create_file(
         PydanticFileMetadata(file_name="File 2", file_path="/path/to/file2.txt", file_type="text/plain", source_id=default_source.id),
         actor=default_user,
     )
 
     # List files without pagination
-    files = await server.source_manager.list_files(source_id=default_source.id, actor=default_user)
+    files = await server.file_manager.list_files(source_id=default_source.id, actor=default_user)
     assert len(files) == 2
 
     # List files with pagination
-    paginated_files = await server.source_manager.list_files(source_id=default_source.id, actor=default_user, limit=1)
+    paginated_files = await server.file_manager.list_files(source_id=default_source.id, actor=default_user, limit=1)
     assert len(paginated_files) == 1
 
     # Ensure cursor-based pagination works
-    next_page = await server.source_manager.list_files(
-        source_id=default_source.id, actor=default_user, after=paginated_files[-1].id, limit=1
-    )
+    next_page = await server.file_manager.list_files(source_id=default_source.id, actor=default_user, after=paginated_files[-1].id, limit=1)
     assert len(next_page) == 1
     assert next_page[0].file_name != paginated_files[0].file_name
 
@@ -4727,16 +5103,16 @@ async def test_delete_file(server: SyncServer, default_user, default_source):
     file_metadata = PydanticFileMetadata(
         file_name="Delete File", file_path="/path/to/delete_file.txt", file_type="text/plain", source_id=default_source.id
     )
-    created_file = await server.source_manager.create_file(file_metadata=file_metadata, actor=default_user)
+    created_file = await server.file_manager.create_file(file_metadata=file_metadata, actor=default_user)
 
     # Delete the file
-    deleted_file = await server.source_manager.delete_file(file_id=created_file.id, actor=default_user)
+    deleted_file = await server.file_manager.delete_file(file_id=created_file.id, actor=default_user)
 
     # Assertions to verify deletion
     assert deleted_file.id == created_file.id
 
     # Verify that the file no longer appears in list_files
-    files = await server.source_manager.list_files(source_id=default_source.id, actor=default_user)
+    files = await server.file_manager.list_files(source_id=default_source.id, actor=default_user)
     assert len(files) == 0
 
 
@@ -4750,10 +5126,10 @@ async def test_update_file_status_basic(server, default_user, default_source):
         file_size=100,
         source_id=default_source.id,
     )
-    created = await server.source_manager.create_file(file_metadata=meta, actor=default_user)
+    created = await server.file_manager.create_file(file_metadata=meta, actor=default_user)
 
     # Update status only
-    updated = await server.source_manager.update_file_status(
+    updated = await server.file_manager.update_file_status(
         file_id=created.id,
         actor=default_user,
         processing_status=FileProcessingStatus.PARSING,
@@ -4762,7 +5138,7 @@ async def test_update_file_status_basic(server, default_user, default_source):
     assert updated.error_message is None
 
     # Update both status and error message
-    updated = await server.source_manager.update_file_status(
+    updated = await server.file_manager.update_file_status(
         file_id=created.id,
         actor=default_user,
         processing_status=FileProcessingStatus.ERROR,
@@ -4782,9 +5158,9 @@ async def test_update_file_status_error_only(server, default_user, default_sourc
         file_size=123,
         source_id=default_source.id,
     )
-    created = await server.source_manager.create_file(file_metadata=meta, actor=default_user)
+    created = await server.file_manager.create_file(file_metadata=meta, actor=default_user)
 
-    updated = await server.source_manager.update_file_status(
+    updated = await server.file_manager.update_file_status(
         file_id=created.id,
         actor=default_user,
         error_message="Timeout while embedding",
@@ -4807,11 +5183,11 @@ async def test_upsert_file_content_basic(server: SyncServer, default_user, defau
         file_size=len(initial_text),
         source_id=default_source.id,
     )
-    created = await server.source_manager.create_file(file_metadata=meta, actor=default_user)
+    created = await server.file_manager.create_file(file_metadata=meta, actor=default_user)
     assert created.content is None
 
     # Step 2: Insert new content
-    file_with_content = await server.source_manager.upsert_file_content(
+    file_with_content = await server.file_manager.upsert_file_content(
         file_id=created.id,
         text=initial_text,
         actor=default_user,
@@ -4823,7 +5199,7 @@ async def test_upsert_file_content_basic(server: SyncServer, default_user, defau
     assert count == 1
 
     # Step 3: Update existing content
-    file_with_updated_content = await server.source_manager.upsert_file_content(
+    file_with_updated_content = await server.file_manager.upsert_file_content(
         file_id=created.id,
         text=updated_text,
         actor=default_user,
@@ -5824,6 +6200,19 @@ async def test_job_usage_stats_add_multiple(server: SyncServer, sarah_agent, def
     steps = await step_manager.list_steps_async(agent_id=sarah_agent.id, actor=default_user)
     assert len(steps) == 2
 
+    # add step feedback
+    step_manager = server.step_manager
+
+    # Add feedback to first step
+    await step_manager.add_feedback_async(step_id=steps[0].id, feedback="positive", actor=default_user)
+
+    # Test has_feedback filtering
+    steps_with_feedback = await step_manager.list_steps_async(agent_id=sarah_agent.id, has_feedback=True, actor=default_user)
+    assert len(steps_with_feedback) == 1
+
+    steps_without_feedback = await step_manager.list_steps_async(agent_id=sarah_agent.id, actor=default_user)
+    assert len(steps_without_feedback) == 2
+
 
 def test_job_usage_stats_get_nonexistent_job(server: SyncServer, default_user):
     """Test getting usage statistics for a nonexistent job."""
@@ -6520,7 +6909,7 @@ async def test_create_mcp_server(server, default_user, event_loop):
 
 @pytest.mark.asyncio
 async def test_attach_creates_association(server, default_user, sarah_agent, default_file):
-    assoc = await server.file_agent_manager.attach_file(
+    assoc, closed_files = await server.file_agent_manager.attach_file(
         agent_id=sarah_agent.id,
         file_id=default_file.id,
         file_name=default_file.file_name,
@@ -6542,7 +6931,7 @@ async def test_attach_creates_association(server, default_user, sarah_agent, def
 
 @pytest.mark.asyncio
 async def test_attach_is_idempotent(server, default_user, sarah_agent, default_file):
-    a1 = await server.file_agent_manager.attach_file(
+    a1, closed_files = await server.file_agent_manager.attach_file(
         agent_id=sarah_agent.id,
         file_id=default_file.id,
         file_name=default_file.file_name,
@@ -6551,7 +6940,7 @@ async def test_attach_is_idempotent(server, default_user, sarah_agent, default_f
     )
 
     # second attach with different params
-    a2 = await server.file_agent_manager.attach_file(
+    a2, closed_files = await server.file_agent_manager.attach_file(
         agent_id=sarah_agent.id,
         file_id=default_file.id,
         file_name=default_file.file_name,
@@ -6693,3 +7082,287 @@ async def test_org_scoping(
     # other org should see nothing
     files = await server.file_agent_manager.list_files_for_agent(sarah_agent.id, actor=other_user_different_org)
     assert files == []
+
+
+# ======================================================================================================================
+# LRU File Management Tests
+# ======================================================================================================================
+
+
+@pytest.mark.asyncio
+async def test_mark_access_bulk(server, default_user, sarah_agent, default_source):
+    """Test that mark_access_bulk updates last_accessed_at for multiple files."""
+    import time
+
+    # Create multiple files and attach them
+    files = []
+    for i in range(3):
+        file_metadata = PydanticFileMetadata(
+            file_name=f"test_file_{i}.txt",
+            organization_id=default_user.organization_id,
+            source_id=default_source.id,
+        )
+        file = await server.file_manager.create_file(file_metadata=file_metadata, actor=default_user, text=f"test content {i}")
+        files.append(file)
+
+    # Attach all files (they'll be open by default)
+    attached_files = []
+    for file in files:
+        file_agent, closed_files = await server.file_agent_manager.attach_file(
+            agent_id=sarah_agent.id,
+            file_id=file.id,
+            file_name=file.file_name,
+            actor=default_user,
+            visible_content=f"content for {file.file_name}",
+        )
+        attached_files.append(file_agent)
+
+    # Get initial timestamps
+    initial_times = {}
+    for file_agent in attached_files:
+        fa = await server.file_agent_manager.get_file_agent_by_id(agent_id=sarah_agent.id, file_id=file_agent.file_id, actor=default_user)
+        initial_times[fa.file_name] = fa.last_accessed_at
+
+    # Wait a moment to ensure timestamp difference
+    time.sleep(1.1)
+
+    # Use mark_access_bulk on subset of files
+    file_names_to_mark = [files[0].file_name, files[2].file_name]
+    await server.file_agent_manager.mark_access_bulk(agent_id=sarah_agent.id, file_names=file_names_to_mark, actor=default_user)
+
+    # Check that only marked files have updated timestamps
+    for i, file in enumerate(files):
+        fa = await server.file_agent_manager.get_file_agent_by_id(agent_id=sarah_agent.id, file_id=file.id, actor=default_user)
+
+        if file.file_name in file_names_to_mark:
+            assert fa.last_accessed_at > initial_times[file.file_name], f"File {file.file_name} should have updated timestamp"
+        else:
+            assert fa.last_accessed_at == initial_times[file.file_name], f"File {file.file_name} should not have updated timestamp"
+
+
+@pytest.mark.asyncio
+async def test_lru_eviction_on_attach(server, default_user, sarah_agent, default_source):
+    """Test that attaching files beyond MAX_FILES_OPEN triggers LRU eviction."""
+    import time
+
+    from letta.constants import MAX_FILES_OPEN
+
+    # Create more files than the limit
+    files = []
+    for i in range(MAX_FILES_OPEN + 2):  # 7 files for MAX_FILES_OPEN=5
+        file_metadata = PydanticFileMetadata(
+            file_name=f"lru_test_file_{i}.txt",
+            organization_id=default_user.organization_id,
+            source_id=default_source.id,
+        )
+        file = await server.file_manager.create_file(file_metadata=file_metadata, actor=default_user, text=f"test content {i}")
+        files.append(file)
+
+    # Attach files one by one with small delays to ensure different timestamps
+    attached_files = []
+    all_closed_files = []
+
+    for i, file in enumerate(files):
+        if i > 0:
+            time.sleep(0.1)  # Small delay to ensure different timestamps
+
+        file_agent, closed_files = await server.file_agent_manager.attach_file(
+            agent_id=sarah_agent.id,
+            file_id=file.id,
+            file_name=file.file_name,
+            actor=default_user,
+            visible_content=f"content for {file.file_name}",
+        )
+        attached_files.append(file_agent)
+        all_closed_files.extend(closed_files)
+
+        # Check that we never exceed MAX_FILES_OPEN
+        open_files = await server.file_agent_manager.list_files_for_agent(sarah_agent.id, actor=default_user, is_open_only=True)
+        assert len(open_files) <= MAX_FILES_OPEN, f"Should never exceed {MAX_FILES_OPEN} open files"
+
+    # Should have closed exactly 2 files (7 - 5 = 2)
+    assert len(all_closed_files) == 2, f"Should have closed 2 files, but closed: {all_closed_files}"
+
+    # Check that the oldest files were closed (first 2 files attached)
+    expected_closed = [files[0].file_name, files[1].file_name]
+    assert set(all_closed_files) == set(expected_closed), f"Wrong files closed. Expected {expected_closed}, got {all_closed_files}"
+
+    # Check that exactly MAX_FILES_OPEN files are open
+    open_files = await server.file_agent_manager.list_files_for_agent(sarah_agent.id, actor=default_user, is_open_only=True)
+    assert len(open_files) == MAX_FILES_OPEN
+
+    # Check that the most recently attached files are still open
+    open_file_names = {f.file_name for f in open_files}
+    expected_open = {files[i].file_name for i in range(2, MAX_FILES_OPEN + 2)}  # files 2-6
+    assert open_file_names == expected_open
+
+
+@pytest.mark.asyncio
+async def test_lru_eviction_on_open_file(server, default_user, sarah_agent, default_source):
+    """Test that opening a file beyond MAX_FILES_OPEN triggers LRU eviction."""
+    import time
+
+    from letta.constants import MAX_FILES_OPEN
+
+    # Create files equal to the limit
+    files = []
+    for i in range(MAX_FILES_OPEN + 1):  # 6 files for MAX_FILES_OPEN=5
+        file_metadata = PydanticFileMetadata(
+            file_name=f"open_test_file_{i}.txt",
+            organization_id=default_user.organization_id,
+            source_id=default_source.id,
+        )
+        file = await server.file_manager.create_file(file_metadata=file_metadata, actor=default_user, text=f"test content {i}")
+        files.append(file)
+
+    # Attach first MAX_FILES_OPEN files
+    for i in range(MAX_FILES_OPEN):
+        time.sleep(0.1)  # Small delay for different timestamps
+        await server.file_agent_manager.attach_file(
+            agent_id=sarah_agent.id,
+            file_id=files[i].id,
+            file_name=files[i].file_name,
+            actor=default_user,
+            visible_content=f"content for {files[i].file_name}",
+        )
+
+    # Attach the last file as closed
+    await server.file_agent_manager.attach_file(
+        agent_id=sarah_agent.id,
+        file_id=files[-1].id,
+        file_name=files[-1].file_name,
+        actor=default_user,
+        is_open=False,
+        visible_content=f"content for {files[-1].file_name}",
+    )
+
+    # All files should be attached but only MAX_FILES_OPEN should be open
+    all_files = await server.file_agent_manager.list_files_for_agent(sarah_agent.id, actor=default_user)
+    open_files = await server.file_agent_manager.list_files_for_agent(sarah_agent.id, actor=default_user, is_open_only=True)
+    assert len(all_files) == MAX_FILES_OPEN + 1
+    assert len(open_files) == MAX_FILES_OPEN
+
+    # Wait a moment
+    time.sleep(0.1)
+
+    # Now "open" the last file using the efficient method
+    closed_files, was_already_open = await server.file_agent_manager.enforce_max_open_files_and_open(
+        agent_id=sarah_agent.id, file_id=files[-1].id, file_name=files[-1].file_name, actor=default_user, visible_content="updated content"
+    )
+
+    # Should have closed 1 file (the oldest one)
+    assert len(closed_files) == 1, f"Should have closed 1 file, got: {closed_files}"
+    assert closed_files[0] == files[0].file_name, f"Should have closed oldest file {files[0].file_name}"
+
+    # Check that exactly MAX_FILES_OPEN files are still open
+    open_files = await server.file_agent_manager.list_files_for_agent(sarah_agent.id, actor=default_user, is_open_only=True)
+    assert len(open_files) == MAX_FILES_OPEN
+
+    # Check that the newly opened file is open and the oldest is closed
+    last_file_agent = await server.file_agent_manager.get_file_agent_by_id(
+        agent_id=sarah_agent.id, file_id=files[-1].id, actor=default_user
+    )
+    first_file_agent = await server.file_agent_manager.get_file_agent_by_id(
+        agent_id=sarah_agent.id, file_id=files[0].id, actor=default_user
+    )
+
+    assert last_file_agent.is_open is True, "Last file should be open"
+    assert first_file_agent.is_open is False, "First file should be closed"
+
+
+@pytest.mark.asyncio
+async def test_lru_no_eviction_when_reopening_same_file(server, default_user, sarah_agent, default_source):
+    """Test that reopening an already open file doesn't trigger unnecessary eviction."""
+    import time
+
+    from letta.constants import MAX_FILES_OPEN
+
+    # Create files equal to the limit
+    files = []
+    for i in range(MAX_FILES_OPEN):
+        file_metadata = PydanticFileMetadata(
+            file_name=f"reopen_test_file_{i}.txt",
+            organization_id=default_user.organization_id,
+            source_id=default_source.id,
+        )
+        file = await server.file_manager.create_file(file_metadata=file_metadata, actor=default_user, text=f"test content {i}")
+        files.append(file)
+
+    # Attach all files (they'll be open)
+    for i, file in enumerate(files):
+        time.sleep(0.1)  # Small delay for different timestamps
+        await server.file_agent_manager.attach_file(
+            agent_id=sarah_agent.id,
+            file_id=file.id,
+            file_name=file.file_name,
+            actor=default_user,
+            visible_content=f"content for {file.file_name}",
+        )
+
+    # All files should be open
+    open_files = await server.file_agent_manager.list_files_for_agent(sarah_agent.id, actor=default_user, is_open_only=True)
+    assert len(open_files) == MAX_FILES_OPEN
+    initial_open_names = {f.file_name for f in open_files}
+
+    # Wait a moment
+    time.sleep(0.1)
+
+    # "Reopen" the last file (which is already open)
+    closed_files, was_already_open = await server.file_agent_manager.enforce_max_open_files_and_open(
+        agent_id=sarah_agent.id, file_id=files[-1].id, file_name=files[-1].file_name, actor=default_user, visible_content="updated content"
+    )
+
+    # Should not have closed any files since we're within the limit
+    assert len(closed_files) == 0, f"Should not have closed any files when reopening, got: {closed_files}"
+    assert was_already_open is True, "File should have been detected as already open"
+
+    # All the same files should still be open
+    open_files = await server.file_agent_manager.list_files_for_agent(sarah_agent.id, actor=default_user, is_open_only=True)
+    assert len(open_files) == MAX_FILES_OPEN
+    final_open_names = {f.file_name for f in open_files}
+    assert initial_open_names == final_open_names, "Same files should remain open"
+
+
+@pytest.mark.asyncio
+async def test_last_accessed_at_updates_correctly(server, default_user, sarah_agent, default_source):
+    """Test that last_accessed_at is updated in the correct scenarios."""
+    import time
+
+    # Create and attach a file
+    file_metadata = PydanticFileMetadata(
+        file_name="timestamp_test.txt",
+        organization_id=default_user.organization_id,
+        source_id=default_source.id,
+    )
+    file = await server.file_manager.create_file(file_metadata=file_metadata, actor=default_user, text="test content")
+
+    file_agent, closed_files = await server.file_agent_manager.attach_file(
+        agent_id=sarah_agent.id, file_id=file.id, file_name=file.file_name, actor=default_user, visible_content="initial content"
+    )
+
+    initial_time = file_agent.last_accessed_at
+    time.sleep(1.1)
+
+    # Test update_file_agent_by_id updates timestamp
+    updated_agent = await server.file_agent_manager.update_file_agent_by_id(
+        agent_id=sarah_agent.id, file_id=file.id, actor=default_user, visible_content="updated content"
+    )
+    assert updated_agent.last_accessed_at > initial_time, "update_file_agent_by_id should update timestamp"
+
+    time.sleep(1.1)
+    prev_time = updated_agent.last_accessed_at
+
+    # Test update_file_agent_by_name updates timestamp
+    updated_agent2 = await server.file_agent_manager.update_file_agent_by_name(
+        agent_id=sarah_agent.id, file_name=file.file_name, actor=default_user, is_open=False
+    )
+    assert updated_agent2.last_accessed_at > prev_time, "update_file_agent_by_name should update timestamp"
+
+    time.sleep(1.1)
+    prev_time = updated_agent2.last_accessed_at
+
+    # Test mark_access updates timestamp
+    await server.file_agent_manager.mark_access(agent_id=sarah_agent.id, file_id=file.id, actor=default_user)
+
+    final_agent = await server.file_agent_manager.get_file_agent_by_id(agent_id=sarah_agent.id, file_id=file.id, actor=default_user)
+    assert final_agent.last_accessed_at > prev_time, "mark_access should update timestamp"

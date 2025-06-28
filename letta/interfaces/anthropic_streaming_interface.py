@@ -26,6 +26,8 @@ from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
 from letta.helpers.datetime_helpers import get_utc_timestamp_ns, ns_to_ms
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG
 from letta.log import get_logger
+from letta.otel.context import get_ctx_attributes
+from letta.otel.metric_registry import MetricRegistry
 from letta.schemas.letta_message import (
     AssistantMessage,
     HiddenReasoningMessage,
@@ -35,6 +37,7 @@ from letta.schemas.letta_message import (
     ToolCallMessage,
 )
 from letta.schemas.letta_message_content import ReasoningContent, RedactedReasoningContent, TextContent
+from letta.schemas.letta_stop_reason import LettaStopReason, StopReasonType
 from letta.schemas.message import Message
 from letta.schemas.openai.chat_completion_response import FunctionCall, ToolCall
 from letta.server.rest_api.json_parser import JSONParser, PydanticJSONParser
@@ -90,8 +93,17 @@ class AnthropicStreamingInterface:
 
     def get_tool_call_object(self) -> ToolCall:
         """Useful for agent loop"""
+        if not self.tool_call_name:
+            raise ValueError("No tool call returned")
         # hack for tool rules
-        tool_input = json.loads(self.accumulated_tool_call_args)
+        try:
+            tool_input = json.loads(self.accumulated_tool_call_args)
+        except json.JSONDecodeError as e:
+            logger.warning(
+                f"Failed to decode tool call arguments for tool_call_id={self.tool_call_id}, "
+                f"name={self.tool_call_name}. Raw input: {self.accumulated_tool_call_args!r}. Error: {e}"
+            )
+            raise
         if "id" in tool_input and tool_input["id"].startswith("toolu_") and "function" in tool_input:
             arguments = str(json.dumps(tool_input["function"]["arguments"], indent=2))
         else:
@@ -133,6 +145,10 @@ class AnthropicStreamingInterface:
                         ttft_span.add_event(
                             name="anthropic_time_to_first_token_ms", attributes={"anthropic_time_to_first_token_ms": ns_to_ms(ttft_ns)}
                         )
+                        metric_attributes = get_ctx_attributes()
+                        if isinstance(event, BetaRawMessageStartEvent):
+                            metric_attributes["model.name"] = event.message.model
+                        MetricRegistry().ttft_ms_histogram.record(ns_to_ms(ttft_ns), metric_attributes)
                         first_chunk = False
 
                     # TODO: Support BetaThinkingBlock, BetaRedactedThinkingBlock
@@ -370,6 +386,8 @@ class AnthropicStreamingInterface:
                         self.anthropic_mode = None
         except Exception as e:
             logger.error("Error processing stream: %s", e)
+            stop_reason = LettaStopReason(stop_reason=StopReasonType.error.value)
+            yield stop_reason
             raise
         finally:
             logger.info("AnthropicStreamingInterface: Stream processing complete.")

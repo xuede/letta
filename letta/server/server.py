@@ -43,19 +43,21 @@ from letta.schemas.embedding_config import EmbeddingConfig
 # openai schemas
 from letta.schemas.enums import JobStatus, MessageStreamStatus, ProviderCategory, ProviderType
 from letta.schemas.environment_variables import SandboxEnvironmentVariableCreate
+from letta.schemas.file import FileMetadata
 from letta.schemas.group import GroupCreate, ManagerType, SleeptimeManager, VoiceSleeptimeManager
 from letta.schemas.job import Job, JobUpdate
 from letta.schemas.letta_message import LegacyLettaMessage, LettaMessage, MessageType, ToolReturnMessage
 from letta.schemas.letta_message_content import TextContent
 from letta.schemas.letta_response import LettaResponse
+from letta.schemas.letta_stop_reason import LettaStopReason, StopReasonType
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import ArchivalMemorySummary, Memory, RecallMemorySummary
 from letta.schemas.message import Message, MessageCreate, MessageUpdate
 from letta.schemas.passage import Passage, PassageUpdate
 from letta.schemas.providers import (
-    AnthropicBedrockProvider,
     AnthropicProvider,
     AzureProvider,
+    BedrockProvider,
     DeepSeekProvider,
     GoogleAIProvider,
     GoogleVertexProvider,
@@ -80,6 +82,8 @@ from letta.server.rest_api.interface import StreamingServerInterface
 from letta.server.rest_api.utils import sse_async_generator
 from letta.services.agent_manager import AgentManager
 from letta.services.block_manager import BlockManager
+from letta.services.file_manager import FileManager
+from letta.services.file_processor.chunker.line_chunker import LineChunker
 from letta.services.files_agents_manager import FileAgentManager
 from letta.services.group_manager import GroupManager
 from letta.services.helpers.tool_execution_helper import prepare_local_sandbox
@@ -219,6 +223,7 @@ class SyncServer(Server):
         self.batch_manager = LLMBatchManager()
         self.telemetry_manager = TelemetryManager()
         self.file_agent_manager = FileAgentManager()
+        self.file_manager = FileManager()
 
         # A resusable httpx client
         timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
@@ -362,11 +367,11 @@ class SyncServer(Server):
                     base_url=model_settings.vllm_api_base,
                 )
             )
-        if model_settings.aws_access_key and model_settings.aws_secret_access_key and model_settings.aws_region:
+        if model_settings.aws_access_key_id and model_settings.aws_secret_access_key and model_settings.aws_default_region:
             self._enabled_providers.append(
-                AnthropicBedrockProvider(
+                BedrockProvider(
                     name="bedrock",
-                    aws_region=model_settings.aws_region,
+                    region=model_settings.aws_default_region,
                 )
             )
         # Attempt to enable LM Studio by default
@@ -628,7 +633,7 @@ class SyncServer(Server):
 
             packaged_user_message = system.package_user_message(
                 user_message=message,
-                time=timestamp.isoformat() if timestamp else None,
+                timezone=agent.timezone,
             )
 
             # NOTE: eventually deprecate and only allow passing Message types
@@ -707,6 +712,7 @@ class SyncServer(Server):
         # Run the agent state forward
         return self._step(actor=actor, agent_id=agent_id, input_messages=message)
 
+    # TODO: Deprecate this
     def send_messages(
         self,
         actor: User,
@@ -823,8 +829,6 @@ class SyncServer(Server):
         self,
         request: CreateAgent,
         actor: User,
-        # interface
-        interface: Union[AgentInterface, None] = None,
     ) -> AgentState:
         if request.llm_config is None:
             if request.model is None:
@@ -863,6 +867,16 @@ class SyncServer(Server):
             actor=actor,
         )
         log_event(name="end create_agent db")
+
+        log_event(name="start insert_files_into_context_window db")
+        if request.source_ids:
+            for source_id in request.source_ids:
+                files = await self.file_manager.list_files(source_id, actor, include_content=True)
+                await self.insert_files_into_context_window(agent_state=main_agent, file_metadata_with_content=files, actor=actor)
+
+            main_agent = await self.agent_manager.refresh_file_blocks(agent_state=main_agent, actor=actor)
+            main_agent = await self.agent_manager.attach_missing_files_tools_async(agent_state=main_agent, actor=actor)
+        log_event(name="end insert_files_into_context_window db")
 
         if request.enable_sleeptime:
             if request.agent_type == AgentType.voice_convo_agent:
@@ -1352,6 +1366,7 @@ class SyncServer(Server):
             message_manager=self.message_manager,
             agent_manager=self.agent_manager,
             block_manager=self.block_manager,
+            job_manager=self.job_manager,
             passage_manager=self.passage_manager,
             actor=actor,
             step_manager=self.step_manager,
@@ -1366,13 +1381,25 @@ class SyncServer(Server):
             )
         await self.agent_manager.delete_agent_async(agent_id=sleeptime_agent_state.id, actor=actor)
 
-    async def _upsert_file_to_agent(self, agent_id: str, text: str, file_id: str, file_name: str, actor: User) -> None:
+    async def _upsert_file_to_agent(self, agent_id: str, file_metadata_with_content: FileMetadata, actor: User) -> List[str]:
         """
         Internal method to create or update a file <-> agent association
+
+        Returns:
+            List of file names that were closed due to LRU eviction
         """
-        await self.file_agent_manager.attach_file(
-            agent_id=agent_id, file_id=file_id, file_name=file_name, actor=actor, visible_content=text
+        # TODO: Maybe have LineChunker object be on the server level?
+        content_lines = LineChunker().chunk_text(file_metadata=file_metadata_with_content)
+        visible_content = "\n".join(content_lines)
+
+        file_agent, closed_files = await self.file_agent_manager.attach_file(
+            agent_id=agent_id,
+            file_id=file_metadata_with_content.id,
+            file_name=file_metadata_with_content.file_name,
+            actor=actor,
+            visible_content=visible_content,
         )
+        return closed_files
 
     async def _remove_file_from_agent(self, agent_id: str, file_id: str, actor: User) -> None:
         """
@@ -1388,7 +1415,7 @@ class SyncServer(Server):
             logger.info(f"File {file_id} already removed from agent {agent_id}, skipping...")
 
     async def insert_file_into_context_windows(
-        self, source_id: str, text: str, file_id: str, file_name: str, actor: User, agent_states: Optional[List[AgentState]] = None
+        self, source_id: str, file_metadata_with_content: FileMetadata, actor: User, agent_states: Optional[List[AgentState]] = None
     ) -> List[AgentState]:
         """
         Insert the uploaded document into the context window of all agents
@@ -1403,12 +1430,19 @@ class SyncServer(Server):
         logger.info(f"Inserting document into context window for source: {source_id}")
         logger.info(f"Attached agents: {[a.id for a in agent_states]}")
 
-        await asyncio.gather(*(self._upsert_file_to_agent(agent_state.id, text, file_id, file_name, actor) for agent_state in agent_states))
+        # Collect any files that were closed due to LRU eviction during bulk attach
+        all_closed_files = await asyncio.gather(
+            *(self._upsert_file_to_agent(agent_state.id, file_metadata_with_content, actor) for agent_state in agent_states)
+        )
+        # Flatten and log if any files were closed
+        closed_files = [file for closed_list in all_closed_files for file in closed_list]
+        if closed_files:
+            logger.info(f"LRU eviction closed {len(closed_files)} files during bulk attach: {closed_files}")
 
         return agent_states
 
     async def insert_files_into_context_window(
-        self, agent_state: AgentState, texts: List[str], file_ids: List[str], file_names: List[str], actor: User
+        self, agent_state: AgentState, file_metadata_with_content: List[FileMetadata], actor: User
     ) -> None:
         """
         Insert the uploaded documents into the context window of an agent
@@ -1416,15 +1450,14 @@ class SyncServer(Server):
         """
         logger.info(f"Inserting documents into context window for agent_state: {agent_state.id}")
 
-        if len(texts) != len(file_ids):
-            raise ValueError(f"Mismatch between number of texts ({len(texts)}) and file ids ({len(file_ids)})")
-
-        await asyncio.gather(
-            *(
-                self._upsert_file_to_agent(agent_state.id, text, file_id, file_name, actor)
-                for text, file_id, file_name in zip(texts, file_ids, file_names)
-            )
+        # Collect any files that were closed due to LRU eviction during bulk insert
+        all_closed_files = await asyncio.gather(
+            *(self._upsert_file_to_agent(agent_state.id, file_metadata, actor) for file_metadata in file_metadata_with_content)
         )
+        # Flatten and log if any files were closed
+        closed_files = [file for closed_list in all_closed_files for file in closed_list]
+        if closed_files:
+            logger.info(f"LRU eviction closed {len(closed_files)} files during bulk insert: {closed_files}")
 
     async def remove_file_from_context_windows(self, source_id: str, file_id: str, actor: User) -> None:
         """
@@ -1463,7 +1496,7 @@ class SyncServer(Server):
             await self.agent_manager.attach_block_async(agent_id=main_agent.id, block_id=block.id, actor=actor)
 
         if clear_history and block.value != "":
-            block = await self.block_manager.update_block_async(block_id=block.id, block=BlockUpdate(value=""))
+            block = await self.block_manager.update_block_async(block_id=block.id, block_update=BlockUpdate(value=""), actor=actor)
 
         request = CreateAgent(
             name=main_agent.name + "-doc-sleeptime",
@@ -1507,7 +1540,7 @@ class SyncServer(Server):
             raise ValueError(f"Data source {source_name} does not exist for user {user_id}")
 
         # load data into the document store
-        passage_count, document_count = await load_data(connector, source, self.passage_manager, self.source_manager, actor=actor)
+        passage_count, document_count = await load_data(connector, source, self.passage_manager, self.file_manager, actor=actor)
         return passage_count, document_count
 
     def list_data_source_passages(self, user_id: str, source_id: str) -> List[Passage]:
@@ -1993,6 +2026,7 @@ class SyncServer(Server):
                 message_manager=self.message_manager,
                 agent_manager=self.agent_manager,
                 block_manager=self.block_manager,
+                job_manager=self.job_manager,
                 passage_manager=self.passage_manager,
                 actor=actor,
                 sandbox_env_vars=tool_env_vars,
@@ -2026,7 +2060,8 @@ class SyncServer(Server):
             )
 
     # Composio wrappers
-    def get_composio_client(self, api_key: Optional[str] = None):
+    @staticmethod
+    def get_composio_client(api_key: Optional[str] = None):
         if api_key:
             return Composio(api_key=api_key)
         elif tool_settings.composio_api_key:
@@ -2034,9 +2069,10 @@ class SyncServer(Server):
         else:
             return Composio()
 
-    def get_composio_apps(self, api_key: Optional[str] = None) -> List["AppModel"]:
+    @staticmethod
+    def get_composio_apps(api_key: Optional[str] = None) -> List["AppModel"]:
         """Get a list of all Composio apps with actions"""
-        apps = self.get_composio_client(api_key=api_key).apps.get()
+        apps = SyncServer.get_composio_client(api_key=api_key).apps.get()
         apps_with_actions = []
         for app in apps:
             # A bit of hacky logic until composio patches this
@@ -2047,7 +2083,8 @@ class SyncServer(Server):
 
     def get_composio_actions_from_app_name(self, composio_app_name: str, api_key: Optional[str] = None) -> List["ActionModel"]:
         actions = self.get_composio_client(api_key=api_key).actions.get(apps=[composio_app_name])
-        return actions
+        # Filter out deprecated composio actions
+        return [action for action in actions if "deprecated" not in action.description.lower()]
 
     # MCP wrappers
     # TODO support both command + SSE servers (via config)
@@ -2354,7 +2391,11 @@ class SyncServer(Server):
                 # If we want to convert these to Message, we can use the attached IDs
                 # NOTE: we will need to de-duplicate the Messsage IDs though (since Assistant->Inner+Func_Call)
                 # TODO: eventually update the interface to use `Message` and `MessageChunk` (new) inside the deque instead
-                return LettaResponse(messages=filtered_stream, usage=usage)
+                return LettaResponse(
+                    messages=filtered_stream,
+                    stop_reason=LettaStopReason(stop_reason=StopReasonType.end_turn.value),
+                    usage=usage,
+                )
 
         except HTTPException:
             raise
@@ -2456,4 +2497,8 @@ class SyncServer(Server):
             # If we want to convert these to Message, we can use the attached IDs
             # NOTE: we will need to de-duplicate the Messsage IDs though (since Assistant->Inner+Func_Call)
             # TODO: eventually update the interface to use `Message` and `MessageChunk` (new) inside the deque instead
-            return LettaResponse(messages=filtered_stream, usage=usage)
+            return LettaResponse(
+                messages=filtered_stream,
+                stop_reason=LettaStopReason(stop_reason=StopReasonType.end_turn.value),
+                usage=usage,
+            )

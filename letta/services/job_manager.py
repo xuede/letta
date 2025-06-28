@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from letta.helpers.datetime_helpers import get_utc_time
-from letta.orm.enums import JobType
+from letta.log import get_logger
 from letta.orm.errors import NoResultFound
 from letta.orm.job import Job as JobModel
 from letta.orm.job_messages import JobMessage
@@ -15,7 +15,7 @@ from letta.orm.sqlalchemy_base import AccessType
 from letta.orm.step import Step
 from letta.orm.step import Step as StepModel
 from letta.otel.tracing import trace_method
-from letta.schemas.enums import JobStatus, MessageRole
+from letta.schemas.enums import JobStatus, JobType, MessageRole
 from letta.schemas.job import BatchJob as PydanticBatchJob
 from letta.schemas.job import Job as PydanticJob
 from letta.schemas.job import JobUpdate, LettaRequestConfig
@@ -27,6 +27,8 @@ from letta.schemas.usage import LettaUsageStatistics
 from letta.schemas.user import User as PydanticUser
 from letta.server.db import db_registry
 from letta.utils import enforce_types
+
+logger = get_logger(__name__)
 
 
 class JobManager:
@@ -67,18 +69,22 @@ class JobManager:
         with db_registry.session() as session:
             # Fetch the job by ID
             job = self._verify_job_access(session=session, job_id=job_id, actor=actor, access=["write"])
+            not_completed_before = not bool(job.completed_at)
 
             # Update job attributes with only the fields that were explicitly set
             update_data = job_update.model_dump(to_orm=True, exclude_unset=True, exclude_none=True)
 
             # Automatically update the completion timestamp if status is set to 'completed'
             for key, value in update_data.items():
+                # Ensure completed_at is timezone-naive for database compatibility
+                if key == "completed_at" and value is not None and hasattr(value, "replace"):
+                    value = value.replace(tzinfo=None)
                 setattr(job, key, value)
 
-            if update_data.get("status") == JobStatus.completed and not job.completed_at:
+            if job_update.status in {JobStatus.completed, JobStatus.failed} and not_completed_before:
                 job.completed_at = get_utc_time().replace(tzinfo=None)
                 if job.callback_url:
-                    self._dispatch_callback(session, job)
+                    self._dispatch_callback(job)
 
             # Save the updated job to the database
             job.update(db_session=session, actor=actor)
@@ -92,18 +98,22 @@ class JobManager:
         async with db_registry.async_session() as session:
             # Fetch the job by ID
             job = await self._verify_job_access_async(session=session, job_id=job_id, actor=actor, access=["write"])
+            not_completed_before = not bool(job.completed_at)
 
             # Update job attributes with only the fields that were explicitly set
             update_data = job_update.model_dump(to_orm=True, exclude_unset=True, exclude_none=True)
 
             # Automatically update the completion timestamp if status is set to 'completed'
             for key, value in update_data.items():
+                # Ensure completed_at is timezone-naive for database compatibility
+                if key == "completed_at" and value is not None and hasattr(value, "replace"):
+                    value = value.replace(tzinfo=None)
                 setattr(job, key, value)
 
-            if update_data.get("status") == JobStatus.completed and not job.completed_at:
+            if job_update.status in {JobStatus.completed, JobStatus.failed} and not_completed_before:
                 job.completed_at = get_utc_time().replace(tzinfo=None)
                 if job.callback_url:
-                    await self._dispatch_callback_async(session, job)
+                    await self._dispatch_callback_async(job)
 
             # Save the updated job to the database
             await job.update_async(db_session=session, actor=actor)
@@ -333,6 +343,33 @@ class JobManager:
 
     @enforce_types
     @trace_method
+    async def add_messages_to_job_async(self, job_id: str, message_ids: List[str], actor: PydanticUser) -> None:
+        """
+        Associate a message with a job by creating a JobMessage record.
+        Each message can only be associated with one job.
+
+        Args:
+            job_id: The ID of the job
+            message_id: The ID of the message to associate
+            actor: The user making the request
+
+        Raises:
+            NoResultFound: If the job does not exist or user does not have access
+        """
+        if not message_ids:
+            return
+
+        async with db_registry.async_session() as session:
+            # First verify job exists and user has access
+            await self._verify_job_access_async(session, job_id, actor, access=["write"])
+
+            # Create new JobMessage associations
+            job_messages = [JobMessage(job_id=job_id, message_id=message_id) for message_id in message_ids]
+            session.add_all(job_messages)
+            await session.commit()
+
+    @enforce_types
+    @trace_method
     def get_job_usage(self, job_id: str, actor: PydanticUser) -> LettaUsageStatistics:
         """
         Get usage statistics for a job.
@@ -452,13 +489,18 @@ class JobManager:
         )
 
         request_config = self._get_run_request_config(run_id)
+        print("request_config", request_config)
 
         messages = PydanticMessage.to_letta_messages_from_list(
             messages=messages,
             use_assistant_message=request_config["use_assistant_message"],
             assistant_message_tool_name=request_config["assistant_message_tool_name"],
             assistant_message_tool_kwarg=request_config["assistant_message_tool_kwarg"],
+            reverse=not ascending,
         )
+
+        if request_config["include_return_message_types"]:
+            messages = [msg for msg in messages if msg.message_type in request_config["include_return_message_types"]]
 
         return messages
 
@@ -586,7 +628,7 @@ class JobManager:
             request_config = job.request_config or LettaRequestConfig()
         return request_config
 
-    def _dispatch_callback(self, session: Session, job: JobModel) -> None:
+    def _dispatch_callback(self, job: JobModel) -> None:
         """
         POST a standard JSON payload to job.callback_url
         and record timestamp + HTTP status.
@@ -595,22 +637,25 @@ class JobManager:
         payload = {
             "job_id": job.id,
             "status": job.status,
-            "completed_at": job.completed_at.isoformat(),
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "metadata": job.metadata_,
         }
         try:
             import httpx
 
             resp = httpx.post(job.callback_url, json=payload, timeout=5.0)
-            job.callback_sent_at = get_utc_time()
+            job.callback_sent_at = get_utc_time().replace(tzinfo=None)
             job.callback_status_code = resp.status_code
 
-        except Exception:
-            return
+        except Exception as e:
+            error_message = f"Failed to dispatch callback for job {job.id} to {job.callback_url}: {str(e)}"
+            logger.error(error_message)
+            # Record the failed attempt
+            job.callback_sent_at = get_utc_time().replace(tzinfo=None)
+            job.callback_error = error_message
+            # Continue silently - callback failures should not affect job completion
 
-        session.add(job)
-        session.commit()
-
-    async def _dispatch_callback_async(self, session, job: JobModel) -> None:
+    async def _dispatch_callback_async(self, job: JobModel) -> None:
         """
         POST a standard JSON payload to job.callback_url and record timestamp + HTTP status asynchronously.
         """
@@ -618,6 +663,7 @@ class JobManager:
             "job_id": job.id,
             "status": job.status,
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "metadata": job.metadata_,
         }
 
         try:
@@ -628,7 +674,10 @@ class JobManager:
                 # Ensure timestamp is timezone-naive for DB compatibility
                 job.callback_sent_at = get_utc_time().replace(tzinfo=None)
                 job.callback_status_code = resp.status_code
-        except Exception:
-            # Silently fail on callback errors - job updates should still succeed
-            # In production, this would include proper error logging
-            pass
+        except Exception as e:
+            error_message = f"Failed to dispatch callback for job {job.id} to {job.callback_url}: {str(e)}"
+            logger.error(error_message)
+            # Record the failed attempt
+            job.callback_sent_at = get_utc_time().replace(tzinfo=None)
+            job.callback_error = error_message
+            # Continue silently - callback failures should not affect job completion

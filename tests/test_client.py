@@ -654,3 +654,66 @@ def test_initial_sequence(client: Letta):
     assert messages[0].message_type == "system_message"
     assert messages[1].message_type == "assistant_message"
     assert messages[2].message_type == "user_message"
+
+
+def test_timezone(client: Letta):
+    # create an agent
+    agent = client.agents.create(
+        memory_blocks=[{"label": "human", "value": ""}, {"label": "persona", "value": ""}],
+        model="letta/letta-free",
+        embedding="letta/letta-free",
+        timezone="America/Los_Angeles",
+    )
+
+    # get the timzone
+    agent = client.agents.retrieve(agent_id=agent.id)
+    assert agent.timezone == "America/Los_Angeles"
+
+    response = client.agents.messages.create(
+        agent_id=agent.id,
+        messages=[
+            MessageCreate(
+                role="user",
+                content="What timezone are you in?",
+            )
+        ],
+    )
+    # second message is assistant message
+    assert response.messages[1].message_type == "assistant_message"
+    # content is similar to current timezone
+    assert (
+        "America/Los_Angeles" in response.messages[1].content
+        or "PDT" in response.messages[1].content
+        or "PST" in response.messages[1].content
+    )
+
+
+def test_attach_sleeptime_block(client: Letta):
+
+    agent = client.agents.create(
+        memory_blocks=[{"label": "human", "value": ""}, {"label": "persona", "value": ""}],
+        model="letta/letta-free",
+        embedding="letta/letta-free",
+        enable_sleeptime=True,
+    )
+
+    # get the sleeptime agent
+    # get the multi-agent group
+    group_id = agent.multi_agent_group.id
+    group = client.groups.retrieve(group_id=group_id)
+    agent_ids = group.agent_ids
+    sleeptime_id = [id for id in agent_ids if id != agent.id][0]
+
+    # attach a new block
+    block = client.blocks.create(label="test", value="test")
+    client.agents.blocks.attach(agent_id=agent.id, block_id=block.id)
+
+    # verify block is attached to both agents
+    blocks = client.agents.blocks.list(agent_id=agent.id)
+    assert block.id in [b.id for b in blocks]
+
+    blocks = client.agents.blocks.list(agent_id=sleeptime_id)
+    assert block.id in [b.id for b in blocks]
+
+    # cleanup
+    client.agents.delete(agent.id)

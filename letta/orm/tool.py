@@ -4,9 +4,10 @@ from sqlalchemy import JSON, Index, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 # TODO everything in functions should live in this model
-from letta.orm.enums import ToolSourceType, ToolType
+from letta.orm.enums import ToolType
 from letta.orm.mixins import OrganizationMixin
 from letta.orm.sqlalchemy_base import SqlalchemyBase
+from letta.schemas.enums import ToolSourceType
 from letta.schemas.tool import Tool as PydanticTool
 
 if TYPE_CHECKING:
@@ -44,6 +45,9 @@ class Tool(SqlalchemyBase, OrganizationMixin):
     source_code: Mapped[Optional[str]] = mapped_column(String, doc="The source code of the function.")
     json_schema: Mapped[Optional[dict]] = mapped_column(JSON, default=lambda: {}, doc="The OAI compatable JSON schema of the function.")
     args_json_schema: Mapped[Optional[dict]] = mapped_column(JSON, default=lambda: {}, doc="The JSON schema of the function arguments.")
+    pip_requirements: Mapped[Optional[List]] = mapped_column(
+        JSON, nullable=True, doc="Optional list of pip packages required by this tool."
+    )
     metadata_: Mapped[Optional[dict]] = mapped_column(JSON, default=lambda: {}, doc="A dictionary of additional metadata for the tool.")
     # relationships
     organization: Mapped["Organization"] = relationship("Organization", back_populates="tools", lazy="selectin")

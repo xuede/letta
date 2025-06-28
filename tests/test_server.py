@@ -330,7 +330,7 @@ def agent_id(server, user_id, base_tools):
             tool_ids=[t.id for t in base_tools],
             memory_blocks=[],
             model="openai/gpt-4o-mini",
-            embedding="openai/text-embedding-ada-002",
+            embedding="openai/text-embedding-3-small",
         ),
         actor=actor,
     )
@@ -350,7 +350,7 @@ def other_agent_id(server, user_id, base_tools):
             tool_ids=[t.id for t in base_tools],
             memory_blocks=[],
             model="openai/gpt-4o-mini",
-            embedding="openai/text-embedding-ada-002",
+            embedding="openai/text-embedding-3-small",
         ),
         actor=actor,
     )
@@ -523,7 +523,7 @@ def test_delete_agent_same_org(server: SyncServer, org_id: str, user: User):
             name="nonexistent_tools_agent",
             memory_blocks=[],
             model="openai/gpt-4o-mini",
-            embedding="openai/text-embedding-ada-002",
+            embedding="openai/text-embedding-3-small",
         ),
         actor=user,
     )
@@ -577,7 +577,7 @@ async def test_read_local_llm_configs(server: SyncServer, user: User, event_loop
             request=CreateAgent(
                 model="caren/my-custom-model",
                 context_window_limit=context_window_override,
-                embedding="openai/text-embedding-ada-002",
+                embedding="openai/text-embedding-3-small",
             ),
             actor=user,
         )
@@ -901,18 +901,6 @@ async def test_tool_run_with_explicit_json_schema(server, disable_e2b_api_key, u
     assert not result.stderr
 
 
-def test_composio_client_simple(server):
-    apps = server.get_composio_apps()
-    # Assert there's some amount of apps returned
-    assert len(apps) > 0
-
-    app = apps[0]
-    actions = server.get_composio_actions_from_app_name(composio_app_name=app.name)
-
-    # Assert there's some amount of actions
-    assert len(actions) > 0
-
-
 async def test_memory_rebuild_count(server, user, disable_e2b_api_key, base_tools, base_memory_tools):
     """Test that the memory rebuild is generating the correct number of role=system messages"""
     actor = user
@@ -926,7 +914,7 @@ async def test_memory_rebuild_count(server, user, disable_e2b_api_key, base_tool
                 CreateBlock(label="persona", value="My name is Alice."),
             ],
             model="openai/gpt-4o-mini",
-            embedding="openai/text-embedding-ada-002",
+            embedding="openai/text-embedding-3-small",
         ),
         actor=actor,
     )
@@ -977,7 +965,7 @@ def test_add_nonexisting_tool(server: SyncServer, user_id: str, base_tools):
                     CreateBlock(label="persona", value="My name is Alice."),
                 ],
                 model="openai/gpt-4o-mini",
-                embedding="openai/text-embedding-ada-002",
+                embedding="openai/text-embedding-3-small",
                 include_base_tools=True,
             ),
             actor=actor,
@@ -994,7 +982,7 @@ def test_default_tool_rules(server: SyncServer, user_id: str, base_tools, base_m
             tool_ids=[t.id for t in base_tools + base_memory_tools],
             memory_blocks=[],
             model="openai/gpt-4o-mini",
-            embedding="openai/text-embedding-ada-002",
+            embedding="openai/text-embedding-3-small",
             include_base_tools=False,
         ),
         actor=actor,
@@ -1017,7 +1005,7 @@ def test_add_remove_tools_update_agent(server: SyncServer, user_id: str, base_to
                 CreateBlock(label="persona", value="My name is Alice."),
             ],
             model="openai/gpt-4o-mini",
-            embedding="openai/text-embedding-ada-002",
+            embedding="openai/text-embedding-3-small",
             include_base_tools=False,
         ),
         actor=actor,
@@ -1047,7 +1035,7 @@ def test_add_remove_tools_update_agent(server: SyncServer, user_id: str, base_to
             "embedding_config": {
                 "embedding_endpoint_type": "openai",
                 "embedding_endpoint": "https://api.openai.com/v1",
-                "embedding_model": "text-embedding-ada-002",
+                "embedding_model": "text-embedding-3-small",
                 "embedding_dim": 1536,
                 "embedding_chunk_size": 300,
                 "azure_endpoint": None,
@@ -1098,7 +1086,7 @@ async def test_messages_with_provider_override(server: SyncServer, user_id: str,
             memory_blocks=[],
             model="caren-anthropic/claude-3-5-sonnet-20240620",
             context_window_limit=100000,
-            embedding="openai/text-embedding-ada-002",
+            embedding="openai/text-embedding-3-small",
         ),
         actor=actor,
     )

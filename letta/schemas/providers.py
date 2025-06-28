@@ -2,6 +2,8 @@ import warnings
 from datetime import datetime
 from typing import List, Literal, Optional
 
+import aiohttp
+import requests
 from pydantic import BaseModel, Field, model_validator
 
 from letta.constants import DEFAULT_EMBEDDING_CHUNK_SIZE, LETTA_MODEL_ENDPOINT, LLM_MAX_TOKENS, MIN_CONTEXT_WINDOW
@@ -25,8 +27,10 @@ class Provider(ProviderBase):
     name: str = Field(..., description="The name of the provider")
     provider_type: ProviderType = Field(..., description="The type of the provider")
     provider_category: ProviderCategory = Field(..., description="The category of the provider (base or byok)")
-    api_key: Optional[str] = Field(None, description="API key used for requests to the provider.")
+    api_key: Optional[str] = Field(None, description="API key or secret key used for requests to the provider.")
     base_url: Optional[str] = Field(None, description="Base URL for the provider.")
+    access_key: Optional[str] = Field(None, description="Access key used for requests to the provider.")
+    region: Optional[str] = Field(None, description="Region used for requests to the provider.")
     organization_id: Optional[str] = Field(None, description="The organization id of the user")
     updated_at: Optional[datetime] = Field(None, description="The last update timestamp of the provider.")
 
@@ -93,8 +97,8 @@ class Provider(ProviderBase):
                 return OpenAIProvider(**self.model_dump(exclude_none=True))
             case ProviderType.anthropic:
                 return AnthropicProvider(**self.model_dump(exclude_none=True))
-            case ProviderType.anthropic_bedrock:
-                return AnthropicBedrockProvider(**self.model_dump(exclude_none=True))
+            case ProviderType.bedrock:
+                return BedrockProvider(**self.model_dump(exclude_none=True))
             case ProviderType.ollama:
                 return OllamaProvider(**self.model_dump(exclude_none=True))
             case ProviderType.google_ai:
@@ -120,16 +124,22 @@ class Provider(ProviderBase):
 class ProviderCreate(ProviderBase):
     name: str = Field(..., description="The name of the provider.")
     provider_type: ProviderType = Field(..., description="The type of the provider.")
-    api_key: str = Field(..., description="API key used for requests to the provider.")
+    api_key: str = Field(..., description="API key or secret key used for requests to the provider.")
+    access_key: Optional[str] = Field(None, description="Access key used for requests to the provider.")
+    region: Optional[str] = Field(None, description="Region used for requests to the provider.")
 
 
 class ProviderUpdate(ProviderBase):
-    api_key: str = Field(..., description="API key used for requests to the provider.")
+    api_key: str = Field(..., description="API key or secret key used for requests to the provider.")
+    access_key: Optional[str] = Field(None, description="Access key used for requests to the provider.")
+    region: Optional[str] = Field(None, description="Region used for requests to the provider.")
 
 
 class ProviderCheck(BaseModel):
     provider_type: ProviderType = Field(..., description="The type of the provider.")
-    api_key: str = Field(..., description="API key used for requests to the provider.")
+    api_key: str = Field(..., description="API key or secret key used for requests to the provider.")
+    access_key: Optional[str] = Field(None, description="Access key used for requests to the provider.")
+    region: Optional[str] = Field(None, description="Region used for requests to the provider.")
 
 
 class LettaProvider(Provider):
@@ -142,7 +152,7 @@ class LettaProvider(Provider):
                 model="letta-free",  # NOTE: renamed
                 model_endpoint_type="openai",
                 model_endpoint=LETTA_MODEL_ENDPOINT,
-                context_window=8192,
+                context_window=30000,
                 handle=self.get_handle("letta-free"),
                 provider_name=self.name,
                 provider_category=self.provider_category,
@@ -155,7 +165,7 @@ class LettaProvider(Provider):
                 model="letta-free",  # NOTE: renamed
                 model_endpoint_type="openai",
                 model_endpoint=LETTA_MODEL_ENDPOINT,
-                context_window=8192,
+                context_window=30000,
                 handle=self.get_handle("letta-free"),
                 provider_name=self.name,
                 provider_category=self.provider_category,
@@ -872,9 +882,6 @@ class OllamaProvider(OpenAIProvider):
     async def list_llm_models_async(self) -> List[LLMConfig]:
         """Async version of list_llm_models below"""
         endpoint = f"{self.base_url}/api/tags"
-
-        import aiohttp
-
         async with aiohttp.ClientSession() as session:
             async with session.get(endpoint) as response:
                 if response.status != 200:
@@ -903,8 +910,6 @@ class OllamaProvider(OpenAIProvider):
 
     def list_llm_models(self) -> List[LLMConfig]:
         # https://github.com/ollama/ollama/blob/main/docs/api.md#list-local-models
-        import requests
-
         response = requests.get(f"{self.base_url}/api/tags")
         if response.status_code != 200:
             raise Exception(f"Failed to list Ollama models: {response.text}")
@@ -931,9 +936,6 @@ class OllamaProvider(OpenAIProvider):
         return configs
 
     def get_model_context_window(self, model_name: str) -> Optional[int]:
-
-        import requests
-
         response = requests.post(f"{self.base_url}/api/show", json={"name": model_name, "verbose": True})
         response_json = response.json()
 
@@ -965,11 +967,19 @@ class OllamaProvider(OpenAIProvider):
                 return value
         return None
 
-    def get_model_embedding_dim(self, model_name: str):
-        import requests
-
+    def _get_model_embedding_dim(self, model_name: str):
         response = requests.post(f"{self.base_url}/api/show", json={"name": model_name, "verbose": True})
         response_json = response.json()
+        return self._get_model_embedding_dim_impl(response_json, model_name)
+
+    async def _get_model_embedding_dim_async(self, model_name: str):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{self.base_url}/api/show", json={"name": model_name, "verbose": True}) as response:
+                response_json = await response.json()
+            return self._get_model_embedding_dim_impl(response_json, model_name)
+
+    @staticmethod
+    def _get_model_embedding_dim_impl(response_json: dict, model_name: str):
         if "model_info" not in response_json:
             if "error" in response_json:
                 print(f"Ollama fetch model info error for {model_name}: {response_json['error']}")
@@ -979,10 +989,35 @@ class OllamaProvider(OpenAIProvider):
                 return value
         return None
 
+    async def list_embedding_models_async(self) -> List[EmbeddingConfig]:
+        """Async version of list_embedding_models below"""
+        endpoint = f"{self.base_url}/api/tags"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(endpoint) as response:
+                if response.status != 200:
+                    raise Exception(f"Failed to list Ollama models: {response.text}")
+                response_json = await response.json()
+
+        configs = []
+        for model in response_json["models"]:
+            embedding_dim = await self._get_model_embedding_dim_async(model["name"])
+            if not embedding_dim:
+                print(f"Ollama model {model['name']} has no embedding dimension")
+                continue
+            configs.append(
+                EmbeddingConfig(
+                    embedding_model=model["name"],
+                    embedding_endpoint_type="ollama",
+                    embedding_endpoint=self.base_url,
+                    embedding_dim=embedding_dim,
+                    embedding_chunk_size=300,
+                    handle=self.get_handle(model["name"], is_embedding=True),
+                )
+            )
+        return configs
+
     def list_embedding_models(self) -> List[EmbeddingConfig]:
         # https://github.com/ollama/ollama/blob/main/docs/api.md#list-local-models
-        import requests
-
         response = requests.get(f"{self.base_url}/api/tags")
         if response.status_code != 200:
             raise Exception(f"Failed to list Ollama models: {response.text}")
@@ -990,7 +1025,7 @@ class OllamaProvider(OpenAIProvider):
 
         configs = []
         for model in response_json["models"]:
-            embedding_dim = self.get_model_embedding_dim(model["name"])
+            embedding_dim = self._get_model_embedding_dim(model["name"])
             if not embedding_dim:
                 print(f"Ollama model {model['name']} has no embedding dimension")
                 continue
@@ -1478,15 +1513,15 @@ class CohereProvider(OpenAIProvider):
     pass
 
 
-class AnthropicBedrockProvider(Provider):
+class BedrockProvider(Provider):
     provider_type: Literal[ProviderType.bedrock] = Field(ProviderType.bedrock, description="The type of the provider.")
     provider_category: ProviderCategory = Field(ProviderCategory.base, description="The category of the provider (base or byok)")
-    aws_region: str = Field(..., description="AWS region for Bedrock")
+    region: str = Field(..., description="AWS region for Bedrock")
 
     def list_llm_models(self):
         from letta.llm_api.aws_bedrock import bedrock_get_model_list
 
-        models = bedrock_get_model_list(self.aws_region)
+        models = bedrock_get_model_list(self.region)
 
         configs = []
         for model_summary in models:
@@ -1504,6 +1539,32 @@ class AnthropicBedrockProvider(Provider):
             )
         return configs
 
+    async def list_llm_models_async(self) -> List[LLMConfig]:
+        from letta.llm_api.aws_bedrock import bedrock_get_model_list_async
+
+        models = await bedrock_get_model_list_async(
+            self.access_key,
+            self.api_key,
+            self.region,
+        )
+
+        configs = []
+        for model_summary in models:
+            model_arn = model_summary["inferenceProfileArn"]
+            configs.append(
+                LLMConfig(
+                    model=model_arn,
+                    model_endpoint_type=self.provider_type.value,
+                    model_endpoint=None,
+                    context_window=self.get_model_context_window(model_arn),
+                    handle=self.get_handle(model_arn),
+                    provider_name=self.name,
+                    provider_category=self.provider_category,
+                )
+            )
+
+        return configs
+
     def list_embedding_models(self):
         return []
 
@@ -1513,7 +1574,7 @@ class AnthropicBedrockProvider(Provider):
 
         return bedrock_get_model_context_window(model_name)
 
-    def get_handle(self, model_name: str) -> str:
+    def get_handle(self, model_name: str, is_embedding: bool = False, base_name: Optional[str] = None) -> str:
         print(model_name)
         model = model_name.split(".")[-1]
-        return f"bedrock/{model}"
+        return f"{self.name}/{model}"
